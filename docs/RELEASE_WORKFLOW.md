@@ -10,8 +10,9 @@ The supported flow is tag-driven:
 2. Push the commit to `kapabl/machgate`.
 3. Create and push an annotated version tag, for example `v0.3.53`.
 4. Let `.github/workflows/release.yml` run on `ubuntu-24.04-arm`.
-5. Wait for the workflow to finish and publish the GitHub release.
-6. Give the user the GitHub release URL and asset names.
+5. Actively watch the workflow until it finishes and publishes the GitHub
+   release.
+6. Notify the user immediately with the GitHub release URL and asset names.
 
 The workflow builds and tests the ARM64 release in Docker, stages the package,
 creates:
@@ -25,6 +26,13 @@ and uploads both as GitHub release assets through
 Local `dist/` artifacts are only smoke-test inputs. They are not downloadable by
 the user through `scripts/run-macho-docker.sh` unless they are uploaded by the
 GitHub release workflow.
+
+Do not make the user poll for release status. After pushing the version tag,
+watch the release workflow with `gh run watch` or repeated `gh run view` checks.
+When it succeeds, report the workflow URL, release URL, and uploaded asset
+names. When it fails, report the failed workflow URL and the failing step or log
+summary; do not describe the release as available until GitHub has published the
+assets.
 
 Useful commands:
 
