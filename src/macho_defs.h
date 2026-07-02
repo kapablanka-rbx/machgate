@@ -362,6 +362,10 @@ struct nlist_64 {
 #define N_SECT  0xe     /* defined in section */
 #define N_INDR  0xa     /* indirect */
 
+/* n_desc flags */
+#define N_WEAK_REF 0x0040
+#define N_WEAK_DEF 0x0080
+
 /* Compatibility: Darling's loader.c expects MAP_32BIT on non-64bit */
 #ifndef MAP_32BIT
 #define MAP_32BIT 0

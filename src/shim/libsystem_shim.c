@@ -11521,7 +11521,7 @@ static void shim_free_impl_at(void *ptr, void* caller)
 	if (!ptr) return;
 	known = lookup_allocation_size(ptr, &old_size);
 	shim_trace_alloc_event_at("free", ptr, old_size, old_size, caller, known);
-	if (!known)
+	if (!known && shim_alloc_mismatch_trace_enabled())
 		shim_dump_recent_alloc_events("free-unknown-pointer", ptr);
 	forget_allocation(ptr);
 	/* Don't free bootstrap allocations */
@@ -11586,7 +11586,7 @@ static void *shim_realloc_impl_at(void *ptr, size_t size, void* caller)
 
 	if (ptr) {
 		known = lookup_allocation_size(ptr, &old_size);
-		if (!known)
+		if (!known && shim_alloc_mismatch_trace_enabled())
 			shim_dump_recent_alloc_events("realloc-unknown-pointer", ptr);
 	}
 	if (!real_realloc) resolve_real_funcs();
@@ -12230,8 +12230,8 @@ void malloc_zone_free(void* zone, void* ptr)
 		size_t old_size = malloc_zone_size(effective_zone, ptr);
 		shim_trace_alloc_event_at("malloc_zone_free", ptr, old_size, old_size,
 		                          caller, old_size != 0);
-		forget_allocation(ptr);
 		machgate_zone->free(effective_zone, ptr);
+		forget_allocation(ptr);
 		return;
 	}
 	shim_free_impl_at(ptr, caller);
@@ -12337,9 +12337,10 @@ void malloc_zone_batch_free(void* zone, void** pointers,
 			shim_trace_alloc_event_at("malloc_zone_batch_free",
 			                          pointers[index], old_size, old_size,
 			                          caller, old_size != 0);
-			forget_allocation(pointers[index]);
 		}
 		machgate_zone->batch_free(zone, pointers, count);
+		for (unsigned index = 0; index < count; index++)
+			forget_allocation(pointers[index]);
 		return;
 	}
 
@@ -12379,8 +12380,8 @@ void malloc_zone_free_definite_size(void* zone, void* ptr, size_t size)
 	if (machgate_zone && machgate_zone->free_definite_size) {
 		shim_trace_alloc_event_at("malloc_zone_free_definite_size", ptr, size, size,
 		                          caller, 1);
-		forget_allocation(ptr);
 		machgate_zone->free_definite_size(effective_zone, ptr, size);
+		forget_allocation(ptr);
 		return;
 	}
 	malloc_zone_free(effective_zone, ptr);

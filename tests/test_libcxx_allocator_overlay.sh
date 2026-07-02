@@ -23,6 +23,7 @@ check_library()
         nm -D --undefined-only "$path" |
             awk '
                 /@GLIBC/ && $NF ~ /(^|@)(malloc|free|calloc|realloc|posix_memalign|memalign|aligned_alloc|valloc)(@|$)/ { print }
+                /@GLIBC/ && $NF ~ /(^|@)(_Znwm|_Znam|_ZdlPv|_ZdaPv|_ZdlPvm|_ZdaPvm)(@|St|RK|$)/ { print }
             '
     )"
     if [ -n "$bad_refs" ]; then
@@ -77,7 +78,22 @@ check_overlay_object()
         return
     fi
 
-    for symbol in __wrap__Znwm __wrap__ZdlPv machgate_shim_guest_operator_new machgate_shim_guest_operator_delete; do
+    for symbol in __wrap__Znwm __wrap__ZdlPv; do
+        if ! nm "$object" | awk -v symbol="$symbol" '
+            {
+                name = $NF
+                sub(/@.*/, "", name)
+                if (name == symbol)
+                    found = 1
+            }
+            END { exit !found }
+        '; then
+            echo "$object does not define $symbol" >&2
+            exit 1
+        fi
+    done
+
+    for symbol in machgate_shim_guest_operator_new machgate_shim_guest_operator_delete; do
         if nm "$object" | awk -v symbol="$symbol" '
             {
                 name = $NF

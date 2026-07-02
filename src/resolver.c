@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 /*
  * Mach-O Chained Fixup Resolver for aarch64 Linux.
  *
@@ -26,10 +30,9 @@
 #include <unistd.h>
 
 /* macOS malloc returns zero-initialized pages for most allocations.
- * Game code depends on operator new returning zeroed memory.
  * Hook _Znwm/_Znam (operator new/new[]) in the Mach-O GOT so only
- * the game binary's allocations are zeroed — avoids the reentrancy
- * issues of globally interposing malloc. */
+ * guest allocations are zeroed, avoiding the reentrancy issues of
+ * globally interposing malloc. */
 static void *(*shim_malloc_fn)(size_t) = NULL;
 static void *(*shim_memalign_fn)(size_t, size_t) = NULL;
 static void (*shim_free_fn)(void *) = NULL;
@@ -112,6 +115,13 @@ static int is_operator_delete_symbol(const char *sym_name)
 	       strcmp(name, "_ZdaPvmSt11align_val_t") == 0 ||
 	       strcmp(name, "_ZdlPvSt11align_val_tRKSt9nothrow_t") == 0 ||
 	       strcmp(name, "_ZdaPvSt11align_val_tRKSt9nothrow_t") == 0;
+}
+
+static int is_cxx_operator_symbol(const char *sym_name)
+{
+	return is_operator_new_symbol(sym_name) ||
+	       is_operator_new_aligned_symbol(sym_name) ||
+	       is_operator_delete_symbol(sym_name);
 }
 
 static uintptr_t resolve_cxx_operator_hook(const char *sym_name)
@@ -1186,7 +1196,15 @@ static uintptr_t wrap_fixed_stack_arg_symbol(const char* lookup_name,
  * Resolves symbols defined in the Mach-O binary itself.
  * Used for lib_ordinal -1 (main executable) and -3 (weak lookup).
  */
-static uintptr_t lookup_macho_symbol(struct resolver_state* rs, const char* name)
+struct macho_symbol_result {
+	uintptr_t addr;
+	uint8_t type;
+	uint16_t desc;
+};
+
+static int lookup_macho_symbol_result(struct resolver_state* rs,
+                                      const char* name,
+                                      struct macho_symbol_result* result)
 {
 	struct mach_header_64* mh = rs->mh;
 	uint8_t* cmds = (uint8_t*)(mh + 1);
@@ -1229,33 +1247,88 @@ static uintptr_t lookup_macho_symbol(struct resolver_state* rs, const char* name
 		if (nl->n_strx >= symtab->strsize) continue;
 
 		const char* sym = &strtab[nl->n_strx];
-		if (strcmp(sym, name) == 0)
-			return nl->n_value + rs->slide;
+		if (strcmp(sym, name) == 0) {
+			if (result) {
+				result->addr = nl->n_value + rs->slide;
+				result->type = nl->n_type;
+				result->desc = nl->n_desc;
+			}
+			return 1;
+		}
 	}
 	return 0;
 }
 
-static uintptr_t resolve_cxx_operator_address(struct resolver_state* rs,
-                                              const char* sym_name,
-                                              int64_t addend,
-                                              const char** source_kind,
-                                              const char** source_path)
+static uintptr_t lookup_macho_symbol(struct resolver_state* rs, const char* name)
+{
+	struct macho_symbol_result result;
+
+	if (!lookup_macho_symbol_result(rs, name, &result))
+		return 0;
+	return result.addr;
+}
+
+static int macho_symbol_is_external_definition(const struct macho_symbol_result* result)
+{
+	if (!result)
+		return 0;
+	if (!(result->type & N_EXT))
+		return 0;
+	if (result->type & N_PEXT)
+		return 0;
+	return 1;
+}
+
+static int elf_symbol_is_weak(void* addr)
+{
+#ifdef RTLD_DL_SYMENT
+	Dl_info info;
+	ElfW(Sym)* sym = NULL;
+
+	if (!addr)
+		return 0;
+	if (!dladdr1(addr, &info, (void**)&sym, RTLD_DL_SYMENT) || !sym)
+		return 0;
+	return ELF64_ST_BIND(sym->st_info) == STB_WEAK;
+#else
+	(void)addr;
+	return 0;
+#endif
+}
+
+static uintptr_t resolve_main_cxx_operator_override(struct resolver_state* rs,
+                                                    const char* sym_name,
+                                                    void* provider_addr,
+                                                    int64_t addend,
+                                                    const char** source_kind,
+                                                    const char** source_path)
+{
+	struct macho_symbol_result result;
+
+	if (!rs || !rs->mh || !is_cxx_operator_symbol(sym_name))
+		return 0;
+	if (provider_addr && !elf_symbol_is_weak(provider_addr))
+		return 0;
+	if (!lookup_macho_symbol_result(rs, sym_name, &result))
+		return 0;
+	if (!macho_symbol_is_external_definition(&result))
+		return 0;
+
+	if (source_kind)
+		*source_kind = "main executable C++ allocator";
+	if (source_path)
+		*source_path = "main executable";
+	return result.addr + addend;
+}
+
+static uintptr_t resolve_cxx_operator_fallback(const char* sym_name,
+                                               const char** source_kind,
+                                               const char** source_path)
 {
 	uintptr_t addr;
 
-	if (!is_operator_new_symbol(sym_name) &&
-	    !is_operator_new_aligned_symbol(sym_name) &&
-	    !is_operator_delete_symbol(sym_name))
+	if (!is_cxx_operator_symbol(sym_name))
 		return 0;
-
-	addr = rs ? lookup_macho_symbol(rs, sym_name) : 0;
-	if (addr) {
-		if (source_kind)
-			*source_kind = "main executable";
-		if (source_path)
-			*source_path = "main executable";
-		return addr + addend;
-	}
 
 	addr = resolve_cxx_operator_hook(sym_name);
 	if (addr) {
@@ -1263,7 +1336,7 @@ static uintptr_t resolve_cxx_operator_address(struct resolver_state* rs,
 			*source_kind = "machgate c++ allocator hook";
 		if (source_path)
 			*source_path = "libsystem_shim";
-		return addr + addend;
+		return addr;
 	}
 
 	return 0;
@@ -2002,13 +2075,31 @@ static void resolver_complete_deferred(void)
 
 		const char* source_kind = "mapped dylib handle";
 		const char* source_path = de->so_path;
-		void* addr = (void*)resolve_cxx_operator_address(
-		    main_rs.mh ? &main_rs : NULL, db->sym_name, db->addend,
-		    &source_kind, &source_path);
-		if (!addr)
-			addr = dlsym(de->handle, lookup);
+		void* addr = dlsym(de->handle, lookup);
 		if (!addr && strncmp(lookup, "_ZN", 3) == 0)
 			addr = try_mangling_variants(de->handle, lookup);
+		uintptr_t main_override = resolve_main_cxx_operator_override(
+		    main_rs.mh ? &main_rs : NULL, db->sym_name, addr, db->addend,
+		    &source_kind, &source_path);
+		if (main_override) {
+			uintptr_t result = main_override;
+			if (is_ctor_or_dtor(db->sym_name) && !ctor_has_stack_params(db->sym_name))
+				result = wrap_ctor_for_apple_abi(result);
+
+			/* mprotect GOT page (permissions may have been restored) */
+			uintptr_t page = db->got_slot & ~(uintptr_t)(page_size - 1);
+			mprotect((void*)page, page_size, PROT_READ | PROT_WRITE);
+			*(uint64_t*)db->got_slot = result;
+			trace_target_binding("deferred-cxx-main-override", db->sym_name, lookup,
+			                     db->lib_ordinal, de, db->got_slot, result,
+			                     source_kind, source_path);
+			resolved++;
+			continue;
+		}
+		if (!addr) {
+			addr = (void*)resolve_cxx_operator_fallback(
+			    db->sym_name, &source_kind, &source_path);
+		}
 		if (!addr) {
 			addr = dlsym(RTLD_DEFAULT, lookup);
 			if (addr) {
@@ -2018,10 +2109,7 @@ static void resolver_complete_deferred(void)
 		}
 
 		if (addr) {
-			uintptr_t result = (uintptr_t)addr;
-			if (strcmp(source_kind, "main executable") != 0 &&
-			    strcmp(source_kind, "machgate c++ allocator hook") != 0)
-				result += db->addend;
+			uintptr_t result = (uintptr_t)addr + db->addend;
 			if (is_ctor_or_dtor(db->sym_name) && !ctor_has_stack_params(db->sym_name))
 				result = wrap_ctor_for_apple_abi(result);
 
@@ -2129,18 +2217,6 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 	if (strstr(sym_name, "registr") && strstr(sym_name, "s_instance") && !strstr(sym_name, "ZGV"))
 		fprintf(stderr, "resolver: TRACE s_instance: ordinal=%u lib_ordinal=%d weak=%d name='%s'\n",
 				ordinal, lib_ordinal, weak, sym_name);
-
-	const char* cxx_source_kind = NULL;
-	const char* cxx_source_path = NULL;
-	uintptr_t cxx_operator = resolve_cxx_operator_address(
-	    rs, sym_name, addend, &cxx_source_kind, &cxx_source_path);
-	if (cxx_operator) {
-		trace_target_binding("chained-cxx-operator", sym_name, lookup_name,
-		                     lib_ordinal, NULL, slot_addr, cxx_operator,
-		                     cxx_source_kind, cxx_source_path);
-		rs->binds_resolved++;
-		return cxx_operator;
-	}
 
 	/* Hook LuaJIT functions for profiler injection.
 	 * The game (via sol2) opens individual Lua libraries instead of calling
@@ -2303,6 +2379,18 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 		if (!addr && strncmp(lookup_name, "_ZN", 3) == 0)
 			addr = try_mangling_variants(de->handle, lookup_name);
 		if (addr) {
+			const char* cxx_source_kind = NULL;
+			const char* cxx_source_path = NULL;
+			uintptr_t cxx_override = resolve_main_cxx_operator_override(
+			    rs, sym_name, addr, addend, &cxx_source_kind, &cxx_source_path);
+			if (cxx_override) {
+				trace_target_binding("chained-map-cxx-main-override",
+				                     sym_name, lookup_name, lib_ordinal, de,
+				                     slot_addr, cxx_override,
+				                     cxx_source_kind, cxx_source_path);
+				rs->binds_resolved++;
+				return cxx_override;
+			}
 			uintptr_t result = (uintptr_t)addr + addend;
 			/* Wrap C++ ctors/dtors for Apple ARM64 ABI compatibility:
 			 * Apple ABI returns `this` in x0, Linux ABI returns void */
@@ -2339,6 +2427,28 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 			trace_target_binding("chained-map", sym_name, lookup_name,
 			                     lib_ordinal, de, slot_addr, result,
 			                     "mapped dylib handle", de->so_path);
+			rs->binds_resolved++;
+			return result;
+		}
+		const char* cxx_source_kind = NULL;
+		const char* cxx_source_path = NULL;
+		uintptr_t cxx_override = resolve_main_cxx_operator_override(
+		    rs, sym_name, NULL, addend, &cxx_source_kind, &cxx_source_path);
+		if (cxx_override) {
+			trace_target_binding("chained-map-cxx-main-override",
+			                     sym_name, lookup_name, lib_ordinal, de,
+			                     slot_addr, cxx_override,
+			                     cxx_source_kind, cxx_source_path);
+			rs->binds_resolved++;
+			return cxx_override;
+		}
+		uintptr_t cxx_operator = resolve_cxx_operator_fallback(
+		    sym_name, &cxx_source_kind, &cxx_source_path);
+		if (cxx_operator) {
+			uintptr_t result = cxx_operator + addend;
+			trace_target_binding("chained-map-cxx-fallback", sym_name, lookup_name,
+			                     lib_ordinal, de, slot_addr, result,
+			                     cxx_source_kind, cxx_source_path);
 			rs->binds_resolved++;
 			return result;
 		}
@@ -2524,18 +2634,6 @@ static uintptr_t resolve_bind_by_name(struct resolver_state* rs,
 		}
 	}
 
-	const char* cxx_source_kind = NULL;
-	const char* cxx_source_path = NULL;
-	uintptr_t cxx_operator = resolve_cxx_operator_address(
-	    rs, sym_name, addend, &cxx_source_kind, &cxx_source_path);
-	if (cxx_operator) {
-		trace_target_binding("dyld-info-cxx-operator", sym_name, lookup_name,
-		                     lib_ordinal, NULL, slot_addr, cxx_operator,
-		                     cxx_source_kind, cxx_source_path);
-		rs->binds_resolved++;
-		return cxx_operator;
-	}
-
 	/* Hook LuaJIT functions for profiler injection */
 	if (strcmp(sym_name, "_luaopen_jit") == 0) {
 		rs->binds_resolved++;
@@ -2673,6 +2771,18 @@ static uintptr_t resolve_bind_by_name(struct resolver_state* rs,
 		if (!addr && strncmp(lookup_name, "_ZN", 3) == 0)
 			addr = try_mangling_variants(de->handle, lookup_name);
 		if (addr) {
+			const char* cxx_source_kind = NULL;
+			const char* cxx_source_path = NULL;
+			uintptr_t cxx_override = resolve_main_cxx_operator_override(
+			    rs, sym_name, addr, addend, &cxx_source_kind, &cxx_source_path);
+			if (cxx_override) {
+				trace_target_binding("dyld-info-map-cxx-main-override",
+				                     sym_name, lookup_name, lib_ordinal, de,
+				                     slot_addr, cxx_override,
+				                     cxx_source_kind, cxx_source_path);
+				rs->binds_resolved++;
+				return cxx_override;
+			}
 			uintptr_t result = (uintptr_t)addr + addend;
 			if (is_ctor_or_dtor(sym_name)) {
 				if (!ctor_has_stack_params(sym_name))
@@ -2700,6 +2810,28 @@ static uintptr_t resolve_bind_by_name(struct resolver_state* rs,
 			trace_target_binding("dyld-info-map", sym_name, lookup_name,
 			                     lib_ordinal, de, slot_addr, result,
 			                     "mapped dylib handle", de->so_path);
+			rs->binds_resolved++;
+			return result;
+		}
+		const char* cxx_source_kind = NULL;
+		const char* cxx_source_path = NULL;
+		uintptr_t cxx_override = resolve_main_cxx_operator_override(
+		    rs, sym_name, NULL, addend, &cxx_source_kind, &cxx_source_path);
+		if (cxx_override) {
+			trace_target_binding("dyld-info-map-cxx-main-override",
+			                     sym_name, lookup_name, lib_ordinal, de,
+			                     slot_addr, cxx_override,
+			                     cxx_source_kind, cxx_source_path);
+			rs->binds_resolved++;
+			return cxx_override;
+		}
+		uintptr_t cxx_operator = resolve_cxx_operator_fallback(
+		    sym_name, &cxx_source_kind, &cxx_source_path);
+		if (cxx_operator) {
+			uintptr_t result = cxx_operator + addend;
+			trace_target_binding("dyld-info-map-cxx-fallback", sym_name, lookup_name,
+			                     lib_ordinal, de, slot_addr, result,
+			                     cxx_source_kind, cxx_source_path);
 			rs->binds_resolved++;
 			return result;
 		}

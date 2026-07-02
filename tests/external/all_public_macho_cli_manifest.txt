@@ -1,0 +1,60 @@
+# Unified external ARM64 macOS CLI corpus.
+#
+# Format:
+# name|url|sha256|binary path inside archive or "." for direct binary|argv
+#
+# This file is the public regression gate. Focused manifests are only local
+# diagnostics after this gate fails.
+ripgrep|https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-aarch64-apple-darwin.tar.gz|378e973289176ca0c6054054ee7f631a065874a352bf43f0fa60ef079b6ba715|ripgrep-15.1.0-aarch64-apple-darwin/rg|--version
+fd|https://github.com/sharkdp/fd/releases/download/v10.4.2/fd-v10.4.2-aarch64-apple-darwin.tar.gz|623dc0afc81b92e4d4606b380d7bc91916ba7b97814263e554d50923a39e480a|fd-v10.4.2-aarch64-apple-darwin/fd|--version
+hyperfine|https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-aarch64-apple-darwin.tar.gz|8ee7067016620447c9d2d6234ec9a4680f958b7ad983549b56334668f63075b5|hyperfine-v1.20.0-aarch64-apple-darwin/hyperfine|--version
+bat|https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-aarch64-apple-darwin.tar.gz|e30beff26779c9bf60bb541e1d79046250cb74378f2757f8eb250afddb19e114|bat-v0.26.1-aarch64-apple-darwin/bat|--version
+jq|https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-arm64|2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e|.|--version
+yq|https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_darwin_arm64.tar.gz|8415210a2c06e706e4037ccbbfc0d0e35c2518683da21a432d28258752567474|yq_darwin_arm64|--version
+starship|https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-apple-darwin.tar.gz|1062a2363489b9335529b83204472f02633c08fc3609f1b325be5eba36feb631|starship|--version
+delta|https://github.com/dandavison/delta/releases/download/0.19.2/delta-0.19.2-aarch64-apple-darwin.tar.gz|9be36612a5a13e9e386dc498fb8e50dc87c72ee42b63db0ea05b32f99a72a69a|delta-0.19.2-aarch64-apple-darwin/delta|--version
+bottom|https://github.com/ClementTsang/bottom/releases/download/0.14.1/bottom_aarch64-apple-darwin.tar.gz|1e7f03acb9189a4ad79c20fdef0bd7163265fa56ab75fc54b19f1dde5aaea5ae|btm|--version
+just|https://github.com/casey/just/releases/download/1.53.0/just-1.53.0-aarch64-apple-darwin.tar.gz|27f1361f2e4fb5d733837f1a9f80f85c237e5a36c75ee14961e59141713aa4ed|just|--version
+zoxide|https://github.com/ajeetdsouza/zoxide/releases/download/v0.9.9/zoxide-0.9.9-aarch64-apple-darwin.tar.gz|57e733d0436309dae2ed97e46bba43937209395298e1d88812d4e893900cb40a|zoxide|--version
+sd|https://github.com/chmln/sd/releases/download/v1.1.0/sd-v1.1.0-aarch64-apple-darwin.tar.gz|4bd3c09226376ca0a1d69589c91e86276fae36c5fbaaee669afce583f6682030|sd-v1.1.0-aarch64-apple-darwin/sd|--version
+git-cliff|https://github.com/orhun/git-cliff/releases/download/v2.13.1/git-cliff-2.13.1-aarch64-apple-darwin.tar.gz|21547ae4a0421164070ab75c2522864ea5565858a011fabc5f583061b20f1226|git-cliff-2.13.1/git-cliff|--version
+sccache|https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-apple-darwin.tar.gz|ded590cae2c72042c61178632906bef62d635fa20d45f8b22110a2241f430960|sccache-v0.16.0-aarch64-apple-darwin/sccache|--version
+cargo-binstall|https://github.com/cargo-bins/cargo-binstall/releases/download/v1.20.1/cargo-binstall-aarch64-apple-darwin.zip|691c4fda20d2e58920dc056e4eb7dacec6de448bb547aca17b0ae819716ebef6|cargo-binstall|-V
+hexyl|https://github.com/sharkdp/hexyl/releases/download/v0.17.0/hexyl-v0.17.0-aarch64-apple-darwin.tar.gz|d8c50f5ec688faf566ea4c13d6aa12a5681dc370dab3ffba0a9db935a5986630|hexyl-v0.17.0-aarch64-apple-darwin/hexyl|--version
+pastel|https://github.com/sharkdp/pastel/releases/download/v0.12.0/pastel-v0.12.0-aarch64-apple-darwin.tar.gz|7fd81518fac1dab7bd60e4759194a942c51bb911ef5de4513f4a9e3fb4b8ac1c|pastel-v0.12.0-aarch64-apple-darwin/pastel|--version
+atuin|https://github.com/atuinsh/atuin/releases/download/v18.16.1/atuin-aarch64-apple-darwin.tar.gz|0a3fdc4cfa18758d6a872950625f2042233df0412a0c10d0dadf30bfc3bc6d6b|atuin-aarch64-apple-darwin/atuin|--version
+ninja|https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-mac.zip|c99048673aa765960a99cf10c6ddb9f1fad506099ff0a0e137ad8960a88f321b|ninja|--version
+cmake|https://github.com/Kitware/CMake/releases/download/v4.3.3/cmake-4.3.3-macos-universal.tar.gz|5221a13450c7a0219a2a0d1b6c9085eb06489721fafd8488ccebc1584175d2fb|cmake-4.3.3-macos-universal/CMake.app/Contents/bin/cmake|--version
+ctest|https://github.com/Kitware/CMake/releases/download/v4.3.3/cmake-4.3.3-macos-universal.tar.gz|5221a13450c7a0219a2a0d1b6c9085eb06489721fafd8488ccebc1584175d2fb|cmake-4.3.3-macos-universal/CMake.app/Contents/bin/ctest|--version
+protoc|https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-osx-aarch_64.zip|193289af0470c6a1aada357d4fba0bbf8d78bfaac8b5e42ca30af2ef75583de2|bin/protoc|--version
+duckdb|https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-osx-arm64.zip|d6c35195683fd1378e5624b01ca390069d399f8341c38986b7e3dfa0b3470d10|duckdb|--version
+bitcoin-test|https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-arm64-apple-darwin.tar.gz|a2d7a13b4da53d4a3e4c517f3a0269e2429813417bb320d3b268993cfdc545d0|bitcoin-31.0/libexec/test_bitcoin|--help
+bitcoin-util|https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-arm64-apple-darwin.tar.gz|a2d7a13b4da53d4a3e4c517f3a0269e2429813417bb320d3b268993cfdc545d0|bitcoin-31.0/bin/bitcoin-util|--version
+bitcoin-30.2-test|https://bitcoincore.org/bin/bitcoin-core-30.2/bitcoin-30.2-arm64-apple-darwin.tar.gz|c2ecab62891de22228043815cb6211549a32272be3d5d052ff19847d3420bd10|bitcoin-30.2/libexec/test_bitcoin|--help
+bitcoin-29.2-test|https://bitcoincore.org/bin/bitcoin-core-29.2/bitcoin-29.2-arm64-apple-darwin.tar.gz|bd07450f76d149d094842feab58e6240673120c8a317a1c51d45ba30c34e85ef|bitcoin-29.2/bin/test_bitcoin|--help
+bitcoin-28.2-test|https://bitcoincore.org/bin/bitcoin-core-28.2/bitcoin-28.2-arm64-apple-darwin.tar.gz|c0270ed50effc174f7ff3332dba5183a8693999dac2ba78b37d8c8797b3ea2b2|bitcoin-28.2/bin/test_bitcoin|--help
+bitcoin-27.2-test|https://bitcoincore.org/bin/bitcoin-core-27.2/bitcoin-27.2-arm64-apple-darwin.tar.gz|8f2247f4786f3559d37189b58452c91623efc5fa6886c975fa9386f9ff3f1001|bitcoin-27.2/bin/test_bitcoin|--help
+bitcoin-26.2-test|https://bitcoincore.org/bin/bitcoin-core-26.2/bitcoin-26.2-arm64-apple-darwin.tar.gz|863960b4f78130ebb9a5e7f68e5cc021778892ff9b3f8b060056c485470640d5|bitcoin-26.2/bin/test_bitcoin|--help
+bitcoin-25.2-test|https://bitcoincore.org/bin/bitcoin-core-25.2/bitcoin-25.2-arm64-apple-darwin.tar.gz|f55b394eebaa11d4b717d68aad9f75b824aaf3a7841dac7c26b1ef3d6d2915f5|bitcoin-25.2/bin/test_bitcoin|--help
+knots-test|https://github.com/bitcoinknots/bitcoin/releases/download/v29.3.knots20260508/bitcoin-29.3.knots20260508-arm64-apple-darwin.tar.gz|494df758b90f1d5fde607716ef8200361e240a1e5887e3db87fc73e7783d911f|bitcoin-29.3.knots20260508/bin/test_bitcoin|--help
+knots-util|https://github.com/bitcoinknots/bitcoin/releases/download/v29.3.knots20260508/bitcoin-29.3.knots20260508-arm64-apple-darwin.tar.gz|494df758b90f1d5fde607716ef8200361e240a1e5887e3db87fc73e7783d911f|bitcoin-29.3.knots20260508/bin/bitcoin-util|--version
+elements-test|https://github.com/ElementsProject/elements/releases/download/elements-23.3.3/elements-23.3.3-arm64-apple-darwin.tar.gz|b23a495e191936ea50f2b3e78ff3613165dbea718bee68100cf3bb02cd46a1f8|elements-23.3.3/bin/test_bitcoin|--help
+elements-util|https://github.com/ElementsProject/elements/releases/download/elements-23.3.3/elements-23.3.3-arm64-apple-darwin.tar.gz|b23a495e191936ea50f2b3e78ff3613165dbea718bee68100cf3bb02cd46a1f8|elements-23.3.3/bin/elements-util|--version
+dash-test|https://github.com/dashpay/dash/releases/download/v23.1.4/dashcore-23.1.4-arm64-apple-darwin.tar.gz|ad1e527a2c883b31925ddbc0e88364cd30783a80edeef06ee7b888fbe2d6ceae|dashcore-23.1.4/bin/test_dash|--help
+dash-util|https://github.com/dashpay/dash/releases/download/v23.1.4/dashcore-23.1.4-arm64-apple-darwin.tar.gz|ad1e527a2c883b31925ddbc0e88364cd30783a80edeef06ee7b888fbe2d6ceae|dashcore-23.1.4/bin/dash-util|--version
+syscoin-cli|https://github.com/syscoin/syscoin/releases/download/v5.0.5/syscoin-5.0.5-arm64-apple-darwin.tar.gz|d0cca31ee34e8bb22e635604e3c282bb8d915b98d36667d5b2a369d11e7b26c2|syscoin-5.0.5/bin/syscoin-cli|--version
+qtum-test|https://github.com/qtumproject/qtum/releases/download/v29.1/qtum-29.1-arm64-apple-darwin-unsigned.tar.gz|fd571ca305c5cb76b802a004d301620d3def11da4f882ef543ef11fa8f0438ca|qtum-29.1/bin/test_qtum|--help
+groestlcoin-test|https://github.com/Groestlcoin/groestlcoin/releases/download/v31.0/groestlcoin-31.0-arm64-apple-darwin-unsigned.tar.gz|438d66162b2848f18b98462a4c4401d93c2de4a3c81a15269453f6e88bccc587|groestlcoin-31.0/libexec/test_groestlcoin|--help
+xh|https://github.com/ducaale/xh/releases/download/v0.26.1/xh-v0.26.1-aarch64-apple-darwin.tar.gz|c66e2f66cf0d486066f8bc6bb5e0b567fa62519b3cb9f68b4a2cfef8bce92892|xh-v0.26.1-aarch64-apple-darwin/xh|--version
+uv|https://github.com/astral-sh/uv/releases/download/0.11.24/uv-aarch64-apple-darwin.tar.gz|7578c6087c5cd76981732b1f5d126248101faebdf81016ba780a65ce03653cdf|uv-aarch64-apple-darwin/uv|--version
+mise|https://github.com/jdx/mise/releases/download/v2026.6.13/mise-v2026.6.13-macos-arm64.tar.gz|36478f14679e37ff38dfd3f238db6355dd5a90e1b3798b8a631d4574f46a280f|mise/bin/mise|--version
+yazi|https://github.com/sxyazi/yazi/releases/download/v26.5.6/yazi-aarch64-apple-darwin.zip|7abd71725e2fe27bed036becbf6ce79fa17964eb68491d34190011c94b8c7ca8|yazi-aarch64-apple-darwin/yazi|--version
+tealdeer|https://github.com/tealdeer-rs/tealdeer/releases/download/v1.8.1/tealdeer-macos-aarch64|4b3ecca53bdc41bc897c35f6457a6d2bb25aedc00816fdb3c28e947ef2900a34|.|--version
+gping|https://github.com/orf/gping/releases/download/gping-v1.20.2/gping-macOS-arm64.tar.gz|4f63da3376abdc9e8bf4e8a562f57de911330fc416488eeaade39f8100018d2e|gping|--version
+bandwhich|https://github.com/imsnif/bandwhich/releases/download/v0.23.1/bandwhich-v0.23.1-aarch64-apple-darwin.tar.gz|3b440e6a48c94c2ca7507d45f769d8e97fe9069bafa6f718b045a185addfad36|bandwhich|--version
+difftastic|https://github.com/Wilfred/difftastic/releases/download/0.69.0/difft-aarch64-apple-darwin.tar.gz|c958b87885a5825a356c5899ac7ecdd752a7942084199f2be4bc0bf8c9de8e33|difft|--version
+cargo-deny|https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-aarch64-apple-darwin.tar.gz|be6fd555e910ac360e25cbef4f16ead47d87d2545fa07aa27223ef0f9af1a02c|cargo-deny-0.19.9-aarch64-apple-darwin/cargo-deny|--version
+zellij|https://github.com/zellij-org/zellij/releases/download/v0.44.3/zellij-aarch64-apple-darwin.tar.gz|b6acf83a7739cf5f0f4e9bd47709642d4d98acbbf8c34d4a12c6e706f531da61|zellij|--version
+jj|https://github.com/jj-vcs/jj/releases/download/v0.42.0/jj-v0.42.0-aarch64-apple-darwin.tar.gz|98764966f22b599dc0b19bb9bd00d21df86156aeca5827f8274900356768db08|./jj|--version
+lsd|https://github.com/lsd-rs/lsd/releases/download/v1.2.0/lsd-v1.2.0-aarch64-apple-darwin.tar.gz|9e34a5d392ff913302098aad0543dafa1883c531eaf229b82f086c3fca675e3e|lsd-v1.2.0-aarch64-apple-darwin/lsd|--version
+cargo-nextest|https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.138/cargo-nextest-0.9.138-universal-apple-darwin.tar.gz|124baa34d160355fa8a8bed053856270cfcf132659e76a0bc8bbcdfc093266b7|cargo-nextest|--version

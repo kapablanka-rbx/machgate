@@ -300,6 +300,13 @@ def custom_valloc(zone, size):
 @ZONE_FREE
 def custom_free(zone, ptr):
     custom_counts['free'] += 1
+    expected_size = custom_sizes.get(ptr, 0)
+    if expected_size:
+        observed_size = lib.malloc_size(ptr)
+        assert observed_size >= expected_size, (
+            f'shim forgot custom-zone allocation before free callback: '
+            f'observed={observed_size}, expected>={expected_size}'
+        )
     custom_sizes.pop(ptr, None)
     host_libc.free(ptr)
 
@@ -477,7 +484,7 @@ guest_delete_observed_size = ctypes.c_size_t(0)
 
 @GUEST_NEW
 def fake_guest_new(size):
-    guest_new_backing.value = lib.malloc(size)
+    guest_new_backing.value = host_libc.malloc(size)
     return guest_new_backing.value
 
 @GUEST_DELETE
@@ -500,6 +507,7 @@ assert lib.malloc_size(guest_bridge_ptr) >= 72, 'malloc_size returned 0 or too s
 lib.machgate_shim_guest_operator_delete(guest_bridge_ptr)
 assert guest_delete_calls.value == 1, 'guest deleter was not called'
 assert guest_delete_observed_size.value >= 72, f'malloc_size inside guest deleter was {guest_delete_observed_size.value}, expected >= 72'
+assert lib.malloc_size(guest_bridge_ptr) >= 72, 'shim retired guest ownership after forwarding to guest deleter'
 lib.machgate_shim_set_guest_cxx_allocators(None, None, None, None, None, None, None, None, None, None, None, None)
 
 print('All libsystem_shim symbol tests passed')

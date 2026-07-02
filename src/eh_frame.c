@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <dlfcn.h>
+#include <limits.h>
 
 /* ========== Compact Unwind Encoding Constants (ARM64) ========== */
 
@@ -134,6 +135,7 @@ struct unwind_info_regular_second_level_page_header {
 #define DW_EH_PE_sdata4    0x0b
 #define DW_EH_PE_sdata8    0x0c
 #define DW_EH_PE_pcrel     0x10
+#define DW_EH_PE_datarel   0x30
 #define DW_EH_PE_indirect  0x80
 #define DW_EH_PE_omit      0xff
 
@@ -142,7 +144,10 @@ struct unwind_info_regular_second_level_page_header {
 /* Entry for eh_frame_hdr sorted table */
 struct hdr_entry {
 	uint64_t initial_location;
+	uint64_t address_range;
 	uint64_t fde_ptr;
+	uint64_t cfi_ptr;
+	uint64_t cfi_size;
 };
 
 static int cmp_hdr_entry(const void* a, const void* b)
@@ -220,6 +225,37 @@ static uint64_t eh_read_encoded_ptr(const uint8_t** p, const uint8_t* end,
 	return value;
 }
 
+static uint64_t eh_read_encoded_value(const uint8_t** p, const uint8_t* end,
+                                      uint8_t encoding)
+{
+	uint64_t value = 0;
+	switch (encoding & 0x0F) {
+	case 0x00:
+		if (*p + 8 > end) return 0;
+		memcpy(&value, *p, 8); *p += 8; break;
+	case DW_EH_PE_udata2:
+		if (*p + 2 > end) return 0;
+		{ uint16_t v; memcpy(&v, *p, 2); value = v; } *p += 2; break;
+	case DW_EH_PE_udata4:
+		if (*p + 4 > end) return 0;
+		{ uint32_t v; memcpy(&v, *p, 4); value = v; } *p += 4; break;
+	case DW_EH_PE_udata8:
+		if (*p + 8 > end) return 0;
+		memcpy(&value, *p, 8); *p += 8; break;
+	case DW_EH_PE_sdata2:
+		if (*p + 2 > end) return 0;
+		{ int16_t v; memcpy(&v, *p, 2); value = (uint64_t)(int64_t)v; } *p += 2; break;
+	case DW_EH_PE_sdata4:
+		if (*p + 4 > end) return 0;
+		{ int32_t v; memcpy(&v, *p, 4); value = (uint64_t)(int64_t)v; } *p += 4; break;
+	case DW_EH_PE_sdata8:
+		if (*p + 8 > end) return 0;
+		{ int64_t v; memcpy(&v, *p, 8); value = (uint64_t)v; } *p += 8; break;
+	default: return 0;
+	}
+	return value;
+}
+
 /* Parse CIE augmentation to find the FDE pointer encoding ('R' byte). */
 static uint8_t parse_cie_fde_encoding(const uint8_t* cie_data, size_t cie_length)
 {
@@ -266,6 +302,19 @@ static uint8_t parse_cie_fde_encoding(const uint8_t* cie_data, size_t cie_length
 	return DW_EH_PE_absptr;
 }
 
+static int parse_cie_has_z_augmentation(const uint8_t* cie_data, size_t cie_length)
+{
+	const uint8_t* p = cie_data;
+	const uint8_t* end = cie_data + cie_length;
+
+	if (p + 5 > end) return 0;
+	p += 4;
+	p++;
+
+	if (p >= end) return 0;
+	return *p == 'z';
+}
+
 /* Parse native __eh_frame and extract FDE (initial_location, fde_ptr) pairs. */
 static int parse_native_eh_frame_fdes(const uint8_t* eh_frame, size_t eh_frame_size,
                                        struct hdr_entry** out_entries)
@@ -307,6 +356,16 @@ static int parse_native_eh_frame_fdes(const uint8_t* eh_frame, size_t eh_frame_s
 				const uint8_t* fde_p = eh_frame + data_start + 4;
 				const uint8_t* fde_end = eh_frame + data_end;
 				uint64_t init_loc = eh_read_encoded_ptr(&fde_p, fde_end, fde_enc);
+				uint64_t address_range = eh_read_encoded_value(&fde_p, fde_end, fde_enc);
+				int cie_has_z = parse_cie_has_z_augmentation(
+					eh_frame + cie_pos + 4, cie_len);
+				if (cie_has_z && fde_p < fde_end) {
+					uint64_t aug_len = eh_read_uleb128(&fde_p, fde_end);
+					if ((uint64_t)(fde_end - fde_p) >= aug_len)
+						fde_p += aug_len;
+					else
+						fde_p = fde_end;
+				}
 
 				if (init_loc != 0) {
 					if (count >= capacity) {
@@ -315,7 +374,10 @@ static int parse_native_eh_frame_fdes(const uint8_t* eh_frame, size_t eh_frame_s
 						if (!entries) return 0;
 					}
 					entries[count].initial_location = init_loc;
+					entries[count].address_range = address_range;
 					entries[count].fde_ptr = (uint64_t)(uintptr_t)(eh_frame + pos);
+					entries[count].cfi_ptr = (uint64_t)(uintptr_t)fde_p;
+					entries[count].cfi_size = (uint64_t)(fde_end - fde_p);
 					count++;
 				}
 			}
@@ -325,6 +387,32 @@ static int parse_native_eh_frame_fdes(const uint8_t* eh_frame, size_t eh_frame_s
 
 	*out_entries = entries;
 	return count;
+}
+
+static const struct hdr_entry* find_native_fde(const struct hdr_entry* entries,
+                                               int count,
+                                               uint64_t initial_location)
+{
+	for (int i = 0; i < count; i++) {
+		uint64_t end = entries[i].initial_location + entries[i].address_range;
+		if (entries[i].initial_location == initial_location)
+			return &entries[i];
+		if (entries[i].address_range != 0 &&
+		    initial_location > entries[i].initial_location &&
+		    initial_location < end)
+			return &entries[i];
+	}
+	return NULL;
+}
+
+static int has_entry_start(const struct hdr_entry* entries, int count,
+                           uint64_t initial_location)
+{
+	for (int i = 0; i < count; i++) {
+		if (entries[i].initial_location == initial_location)
+			return 1;
+	}
+	return 0;
 }
 
 /* ========== _dl_find_object Interposition ========== */
@@ -346,39 +434,63 @@ static void* macho_eh_frame = NULL;
 static size_t macho_eh_frame_size = 0;
 static void* macho_eh_frame_hdr = NULL;
 static size_t macho_eh_frame_hdr_size = 0;
-struct dl_find_object;
 static int (*real_dl_find_object)(void*, struct dl_find_object*) = NULL;
 
-/*
- * struct dl_find_object layout (glibc 2.35+):
- *   unsigned long long dlfo_flags;        // 0
- *   void* dlfo_map_start;                 // 8
- *   void* dlfo_map_end;                   // 16
- *   struct link_map* dlfo_link_map;       // 24
- *   void* dlfo_eh_frame;                  // 32
- */
-#define DLFO_FLAGS       0
-#define DLFO_MAP_START   8
-#define DLFO_MAP_END     16
-#define DLFO_LINK_MAP    24
-#define DLFO_EH_FRAME    32
-#define DLFO_SIZE        40
+static void* mmap_near_address(uintptr_t base, size_t size, int prot)
+{
+	const uintptr_t step = 0x02000000ULL;
+	const uintptr_t limit = 0x70000000ULL;
+	const uintptr_t page_mask = 0xfffULL;
+
+	for (uintptr_t delta = step; delta < limit; delta += step) {
+		uintptr_t candidates[2] = {
+			(base + delta) & ~page_mask,
+			(base > delta) ? ((base - delta) & ~page_mask) : 0
+		};
+
+		for (int i = 0; i < 2; i++) {
+			if (!candidates[i])
+				continue;
+
+			int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+			flags |= MAP_FIXED_NOREPLACE;
+#endif
+			void* result = mmap((void*)candidates[i], size, prot, flags, -1, 0);
+			if (result == MAP_FAILED)
+				continue;
+
+			int64_t distance = (int64_t)(uintptr_t)result - (int64_t)base;
+			if (distance > -INT32_MAX && distance < INT32_MAX)
+				return result;
+
+			munmap(result, size);
+		}
+	}
+
+	return MAP_FAILED;
+}
 
 /* Our interposed _dl_find_object.
  * Uses struct dl_find_object* to match glibc 2.35+ declaration in <dlfcn.h>.
- * The struct is forward-declared above for older glibc that lacks it. */
+ */
 int _dl_find_object(void* pc, struct dl_find_object* result_ptr)
 {
-	void *result = (void *)result_ptr;
 	uintptr_t addr = (uintptr_t)pc;
 
 	/* Check if address is in the Mach-O __TEXT range */
 	if (macho_eh_frame_hdr && addr >= macho_text_start && addr < macho_text_end) {
-		/* Fill in the result struct for the Mach-O */
-		memset(result, 0, DLFO_SIZE);
-		*(void**)((char*)result + DLFO_MAP_START) = (void*)macho_text_start;
-		*(void**)((char*)result + DLFO_MAP_END) = (void*)macho_text_end;
-		*(void**)((char*)result + DLFO_EH_FRAME) = macho_eh_frame_hdr;
+		memset(result_ptr, 0, sizeof(*result_ptr));
+		result_ptr->dlfo_map_start = (void*)macho_text_start;
+		result_ptr->dlfo_map_end = (void*)macho_text_end;
+		result_ptr->dlfo_eh_frame = macho_eh_frame_hdr;
+#if DLFO_STRUCT_HAS_EH_DBASE
+		result_ptr->dlfo_eh_dbase = (void*)macho_text_start;
+#endif
+#if DLFO_STRUCT_HAS_EH_COUNT
+		result_ptr->dlfo_eh_count = (int)(macho_eh_frame_hdr_size >= 12 ?
+			(macho_eh_frame_hdr_size - 12) / 8 : 0);
+#endif
 		return 0;  /* success */
 	}
 
@@ -679,11 +791,45 @@ static void emit_fde_frameless(size_t cie_offset, uintptr_t func_addr,
 		ehf_u8(DW_CFA_def_cfa_offset);
 		ehf_uleb128(stack_size);
 
-		/* LR is at top of frame: CFA - 8 = SP + stack_size - 8
-		 * In data_align units (-8): offset = 1 */
-		if (stack_size >= 8) {
-			ehf_u8(DW_CFA_offset | DWARF_REG_LR);
-			ehf_uleb128(1);
+		int slot = 0;
+		uint32_t x_pairs = encoding & 0x1F;
+		if (x_pairs & UNWIND_ARM64_FRAME_X19_X20_PAIR) {
+			ehf_u8(DW_CFA_offset | DWARF_REG_X19); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X20); ehf_uleb128(slot++);
+		}
+		if (x_pairs & UNWIND_ARM64_FRAME_X21_X22_PAIR) {
+			ehf_u8(DW_CFA_offset | DWARF_REG_X21); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X22); ehf_uleb128(slot++);
+		}
+		if (x_pairs & UNWIND_ARM64_FRAME_X23_X24_PAIR) {
+			ehf_u8(DW_CFA_offset | DWARF_REG_X23); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X24); ehf_uleb128(slot++);
+		}
+		if (x_pairs & UNWIND_ARM64_FRAME_X25_X26_PAIR) {
+			ehf_u8(DW_CFA_offset | DWARF_REG_X25); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X26); ehf_uleb128(slot++);
+		}
+		if (x_pairs & UNWIND_ARM64_FRAME_X27_X28_PAIR) {
+			ehf_u8(DW_CFA_offset | DWARF_REG_X27); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X28); ehf_uleb128(slot++);
+		}
+
+		uint32_t d_pairs = (encoding >> 8) & 0x0F;
+		if (d_pairs & (UNWIND_ARM64_FRAME_D8_D9_PAIR >> 8)) {
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D8); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D9); ehf_uleb128(slot++);
+		}
+		if (d_pairs & (UNWIND_ARM64_FRAME_D10_D11_PAIR >> 8)) {
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D10); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D11); ehf_uleb128(slot++);
+		}
+		if (d_pairs & (UNWIND_ARM64_FRAME_D12_D13_PAIR >> 8)) {
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D12); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D13); ehf_uleb128(slot++);
+		}
+		if (d_pairs & (UNWIND_ARM64_FRAME_D14_D15_PAIR >> 8)) {
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D14); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D15); ehf_uleb128(slot++);
 		}
 	}
 
@@ -718,6 +864,31 @@ static void emit_fde_minimal(size_t cie_offset, uintptr_t func_addr,
 	}
 
 	/* No CFI instructions — CFA stays as initial (SP + 0) */
+
+	ehf_align(8);
+
+	uint32_t length = (uint32_t)(ehf_pos - length_start);
+	memcpy(ehf_buf + fde_start, &length, 4);
+}
+
+static void emit_fde_with_native_cfi(size_t cie_offset, uintptr_t func_addr,
+                                     uint32_t func_size, uintptr_t lsda_addr,
+                                     const uint8_t* cfi, size_t cfi_size)
+{
+	size_t fde_start = ehf_pos;
+
+	ehf_u32(0);
+	size_t length_start = ehf_pos;
+
+	ehf_u32((uint32_t)(ehf_pos - cie_offset));
+	ehf_u64(func_addr);
+	ehf_u64(func_size);
+	ehf_uleb128(8);
+	ehf_u64(lsda_addr);
+
+	ehf_ensure(cfi_size);
+	memcpy(ehf_buf + ehf_pos, cfi, cfi_size);
+	ehf_pos += cfi_size;
 
 	ehf_align(8);
 
@@ -924,6 +1095,7 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 	const uint8_t* native_eh_frame = NULL;
 	size_t native_eh_frame_size = 0;
 	int native_fde_count = 0;
+	struct hdr_entry* native_entries = NULL;
 
 	for (uint32_t i = 0; i < header->ncmds; i++) {
 		struct load_command* lc = (struct load_command*)cmd_ptr;
@@ -1003,13 +1175,20 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 	fprintf(stderr, "eh_frame: %d entries: %d FRAME, %d FRAMELESS, %d DWARF, %d zero-enc, %d with LSDA\n",
 	        count, n_frame, n_frameless, n_dwarf, n_zero, n_lsda);
 
+	if (native_eh_frame && native_eh_frame_size > 0) {
+		native_fde_count = parse_native_eh_frame_fdes(native_eh_frame,
+			native_eh_frame_size, &native_entries);
+		fprintf(stderr, "eh_frame: parsed %d native FDEs from __eh_frame (%zu bytes)\n",
+		        native_fde_count, native_eh_frame_size);
+	}
+
 	/* Allocate buffer for synthetic .eh_frame.
 	 * Generous estimate: 80 bytes per FDE + CIE overhead. */
-	ehf_capacity = (size_t)count * 80 + 4096;
-	ehf_buf = mmap(NULL, ehf_capacity, PROT_READ | PROT_WRITE,
-	               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	ehf_capacity = (size_t)count * 128 + native_eh_frame_size + 4096;
+	ehf_buf = mmap_near_address(text_base + slide, ehf_capacity, PROT_READ | PROT_WRITE);
 	if (ehf_buf == MAP_FAILED) {
-		fprintf(stderr, "eh_frame: failed to allocate %zu bytes\n", ehf_capacity);
+		fprintf(stderr, "eh_frame: failed to allocate %zu bytes near Mach-O text\n", ehf_capacity);
+		free(native_entries);
 		free(entries);
 		return -1;
 	}
@@ -1038,9 +1217,24 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		/* Select CIE based on LSDA presence */
 		size_t cie = has_lsda ? cie_with_personality : cie_without_personality;
 
-		/* Skip DWARF-mode entries — they're already in existing .eh_frame */
-		if (mode == UNWIND_ARM64_MODE_DWARF)
+		if (lsda_addr) {
+			const struct hdr_entry* native_entry =
+				find_native_fde(native_entries, native_fde_count, func_addr);
+			if (native_entry && native_entry->cfi_ptr && native_entry->cfi_size) {
+				uint32_t range = native_entry->address_range ?
+					(uint32_t)native_entry->address_range : func_size;
+				emit_fde_with_native_cfi(cie_with_personality, func_addr,
+				                         range, lsda_addr,
+				                         (const uint8_t*)(uintptr_t)native_entry->cfi_ptr,
+				                         (size_t)native_entry->cfi_size);
+				fdes_emitted++;
+				continue;
+			}
+		}
+
+		if (mode == UNWIND_ARM64_MODE_DWARF) {
 			continue;
+		}
 
 		/* Skip NOT_FUNCTION_START continuations */
 		if (encoding & UNWIND_IS_NOT_FUNCTION_START)
@@ -1101,8 +1295,11 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 				memcpy(&cie_id, ehf_buf + pos + 4, 4);
 				if (cie_id != 0) {
 					uint64_t init_loc;
+					uint64_t address_range;
 					memcpy(&init_loc, ehf_buf + pos + 8, 8);
+					memcpy(&address_range, ehf_buf + pos + 16, 8);
 					syn_entries[syn_count].initial_location = init_loc;
+					syn_entries[syn_count].address_range = address_range;
 					syn_entries[syn_count].fde_ptr = (uint64_t)(uintptr_t)(ehf_buf + pos);
 					syn_count++;
 				}
@@ -1110,62 +1307,90 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 			}
 		}
 
-		/* Collect native FDE entries from __eh_frame */
-		int nat_count = 0;
-		struct hdr_entry* nat_entries = NULL;
-		if (native_eh_frame && native_eh_frame_size > 0) {
-			nat_count = parse_native_eh_frame_fdes(native_eh_frame,
-				native_eh_frame_size, &nat_entries);
-			native_fde_count = nat_count;
-			fprintf(stderr, "eh_frame: parsed %d native FDEs from __eh_frame (%zu bytes)\n",
-			        nat_count, native_eh_frame_size);
-		}
+		int nat_count = native_fde_count;
+		int nat_shadowed_count = 0;
+		struct hdr_entry* nat_entries = native_entries;
 
 		/* Merge and sort */
-		int total_count = syn_count + nat_count;
+		for (int i = 0; i < nat_count; i++) {
+			if (has_entry_start(syn_entries, syn_count, nat_entries[i].initial_location))
+				nat_shadowed_count++;
+		}
+
+		int total_count = syn_count + nat_count - nat_shadowed_count;
 		struct hdr_entry* all_entries = malloc((size_t)total_count * sizeof(struct hdr_entry));
 		if (syn_count > 0)
 			memcpy(all_entries, syn_entries, (size_t)syn_count * sizeof(struct hdr_entry));
-		if (nat_count > 0)
-			memcpy(all_entries + syn_count, nat_entries, (size_t)nat_count * sizeof(struct hdr_entry));
+		int all_count = syn_count;
+		for (int i = 0; i < nat_count; i++) {
+			if (has_entry_start(syn_entries, syn_count, nat_entries[i].initial_location))
+				continue;
+			all_entries[all_count++] = nat_entries[i];
+		}
 		qsort(all_entries, total_count, sizeof(struct hdr_entry), cmp_hdr_entry);
 
 		/* Build .eh_frame_hdr */
-		size_t hdr_size = 4 + 8 + 8 + (size_t)total_count * 16;
-		macho_eh_frame_hdr = mmap(NULL, hdr_size, PROT_READ | PROT_WRITE,
-		                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		size_t hdr_size = 4 + 4 + 4 + (size_t)total_count * 8;
+		macho_eh_frame_hdr = mmap_near_address(text_base + slide, hdr_size,
+		                                       PROT_READ | PROT_WRITE);
 		if (macho_eh_frame_hdr == MAP_FAILED) {
 			fprintf(stderr, "eh_frame: failed to allocate .eh_frame_hdr\n");
-			free(syn_entries); free(nat_entries); free(all_entries);
+			free(syn_entries); free(all_entries); free(native_entries);
 			return -1;
 		}
 
 		uint8_t* h = (uint8_t*)macho_eh_frame_hdr;
 		h[0] = 1;                 /* version */
-		h[1] = DW_EH_PE_absptr;  /* eh_frame_ptr encoding */
-		h[2] = DW_EH_PE_absptr;  /* fde_count encoding */
-		h[3] = DW_EH_PE_absptr;  /* table encoding */
+		h[1] = DW_EH_PE_pcrel | DW_EH_PE_sdata4;
+		h[2] = DW_EH_PE_udata4;
+		h[3] = DW_EH_PE_datarel | DW_EH_PE_sdata4;
 		size_t hp = 4;
 
-		/* eh_frame_ptr: pointer to synthetic .eh_frame section */
-		memcpy(h + hp, &macho_eh_frame, 8); hp += 8;
+		int64_t eh_frame_rel = (int64_t)(uintptr_t)macho_eh_frame -
+			(int64_t)(uintptr_t)(h + hp);
+		if (eh_frame_rel < INT32_MIN || eh_frame_rel > INT32_MAX) {
+			fprintf(stderr, "eh_frame: .eh_frame_hdr cannot encode eh_frame pointer\n");
+			free(syn_entries); free(all_entries); free(native_entries);
+			return -1;
+		}
+		int32_t eh_frame_rel32 = (int32_t)eh_frame_rel;
+		memcpy(h + hp, &eh_frame_rel32, 4); hp += 4;
 
-		/* fde_count */
-		uint64_t fde_count_val = total_count;
-		memcpy(h + hp, &fde_count_val, 8); hp += 8;
+		uint32_t fde_count_val = (uint32_t)total_count;
+		memcpy(h + hp, &fde_count_val, 4); hp += 4;
 
-		/* Sorted (initial_location, fde_ptr) table — both absptr */
+		int table_ok = 1;
+		uintptr_t datarel_base = (uintptr_t)macho_eh_frame_hdr;
 		for (int i = 0; i < total_count; i++) {
-			memcpy(h + hp, &all_entries[i].initial_location, 8); hp += 8;
-			memcpy(h + hp, &all_entries[i].fde_ptr, 8); hp += 8;
+			int64_t initial_rel = (int64_t)all_entries[i].initial_location -
+				(int64_t)datarel_base;
+			int64_t fde_rel = (int64_t)all_entries[i].fde_ptr -
+				(int64_t)datarel_base;
+			if (initial_rel < INT32_MIN || initial_rel > INT32_MAX ||
+			    fde_rel < INT32_MIN || fde_rel > INT32_MAX) {
+				table_ok = 0;
+				break;
+			}
+			int32_t initial_rel32 = (int32_t)initial_rel;
+			int32_t fde_rel32 = (int32_t)fde_rel;
+			memcpy(h + hp, &initial_rel32, 4); hp += 4;
+			memcpy(h + hp, &fde_rel32, 4); hp += 4;
+		}
+		if (!table_ok) {
+			fprintf(stderr, "eh_frame: .eh_frame_hdr cannot encode a table entry\n");
+			free(syn_entries); free(all_entries); free(native_entries);
+			return -1;
 		}
 
 		macho_eh_frame_hdr_size = hp;
 		fprintf(stderr, "eh_frame: built .eh_frame_hdr (%zu bytes, %d entries: %d synthetic + %d native)\n",
-		        hp, total_count, syn_count, nat_count);
+		        hp, total_count, syn_count, nat_count - nat_shadowed_count);
+		if (nat_shadowed_count > 0) {
+			fprintf(stderr, "eh_frame: suppressed %d native FDEs shadowed by synthetic FDEs\n",
+			        nat_shadowed_count);
+		}
 
 		free(syn_entries);
-		free(nat_entries);
 		free(all_entries);
 	}
 
@@ -1197,5 +1422,6 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		}
 	}
 
+	free(native_entries);
 	return 0;
 }

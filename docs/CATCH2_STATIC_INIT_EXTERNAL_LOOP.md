@@ -38,19 +38,19 @@ Catch2 test binaries usually register tests through global/static C++ objects. T
 | `bitcoin-test` | Bitcoin Core 31.0 public release | 254 init offsets | Real C++ test runner shipped in a macOS ARM64 release tarball | TIMEOUT |
 | `bitcoin-util` | Bitcoin Core 31.0 public release | 18 init offsets | Smaller C++ CLI from same release/runtime family | PASS |
 | `bitcoin-30.2-test` | Bitcoin Core 30.2 public release | 425 init offsets | Real C++ Boost.Test runner; larger initializer table than 31.0 | TIMEOUT |
-| `bitcoin-29.2-test` | Bitcoin Core 29.2 public release | 305 init offsets | Real C++ Boost.Test runner; version-diverse Bitcoin Core row | PASS |
+| `bitcoin-29.2-test` | Bitcoin Core 29.2 public release | 305 init offsets | Real C++ Boost.Test runner; version-diverse Bitcoin Core row | BOOST-NOTHING-TO-TEST-ABORT |
 | `bitcoin-28.2-test` | Bitcoin Core 28.2 public release | 296 init offsets | Real C++ Boost.Test runner; version-diverse Bitcoin Core row | TIMEOUT |
 | `bitcoin-27.2-test` | Bitcoin Core 27.2 public release | 276 init offsets | Real C++ Boost.Test runner; version-diverse Bitcoin Core row | TIMEOUT |
 | `bitcoin-26.2-test` | Bitcoin Core 26.2 public release | 270 init offsets | Real C++ Boost.Test runner; version-diverse Bitcoin Core row | BOOST-NOTHING-TO-TEST-ABORT |
 | `bitcoin-25.2-test` | Bitcoin Core 25.2 public release | 263 constructors | Real C++ Boost.Test runner using `__mod_init_func` rather than `__init_offsets` | TIMEOUT |
-| `knots-test` | Bitcoin Knots 29.3 public release | 319 init offsets | Bitcoin-Core-derived C++ test runner | PASS |
+| `knots-test` | Bitcoin Knots 29.3 public release | 319 init offsets | Bitcoin-Core-derived C++ test runner | BOOST-NOTHING-TO-TEST-ABORT |
 | `knots-util` | Bitcoin Knots 29.3 public release | 11 init offsets | Smaller C++ CLI from same release/runtime family | PASS |
 | `elements-test` | Elements 23.3.3 public release | 248 | Bitcoin-Core-derived C++ test runner | TIMEOUT |
 | `elements-util` | Elements 23.3.3 public release | 19 | Smaller C++ CLI from same release/runtime family | PASS |
 | `dash-test` | Dash Core 23.1.4 public release | 335 init offsets | Bitcoin-Core-derived C++ test runner | TIMEOUT |
 | `dash-util` | Dash Core 23.1.4 public release | 9 init offsets | Smaller C++ CLI from same release/runtime family | PASS |
 | `syscoin-cli` | Syscoin 5.0.5 public release | 11 init offsets | C++ control row; no test executable in release tarball | PASS |
-| `qtum-test` | Qtum 29.1 public release | 851 init offsets | Largest public C++ unit-test runner found so far | PASS |
+| `qtum-test` | Qtum 29.1 public release | 851 init offsets | Largest public C++ unit-test runner found so far | BOOST-NOTHING-TO-TEST-ABORT |
 | `groestlcoin-test` | Groestlcoin 31.0 public release | 254 init offsets | Bitcoin-Core-derived C++ test runner | TIMEOUT |
 | `cpp_many_ctors` | Generated local fixture | 707 | Exact constructor-count pressure fixture; no libc++ dependency | PASS |
 
@@ -301,7 +301,9 @@ docker run --rm --platform linux/arm64 \
     bash tests/test_external_macho_cli.sh'
 ```
 
-Result: `bitcoin-29.2-test` PASS, `1/1`.
+Historical note: this single-row smoke was recorded as `bitcoin-29.2-test`
+PASS, `1/1`, but it is superseded by the saved bucket logs below. Do not use it
+as current clean-exit evidence.
 
 Bucket test after attempt 1:
 
@@ -325,10 +327,13 @@ docker run --rm --platform linux/arm64 \
     bash tests/test_external_macho_cli.sh'
 ```
 
-Result: `3/4` PASS. `bitcoin-29.2-test`, `knots-test`, and `qtum-test` pass.
-`bitcoin-26.2-test` still aborts with status `134`, but the error changed:
-the `auto_start_dbg` invalid-name exception is gone; it now prints Boost help
-and aborts after uncaught `boost::unit_test::framework::nothing_to_test`.
+Result: the old `auto_start_dbg` invalid-name exception was cleared for
+`bitcoin-29.2-test`, `knots-test`, and `qtum-test`, but the bucket did not pass
+cleanly. The saved logs under
+`tests/external/logs/cpp-static-init-boost-auto-start-dbg-attempt1/` show
+`0/3` clean exits, all status `134`. `bitcoin-26.2-test` also still aborts with
+status `134`; after the ctype fix it prints Boost help and aborts after uncaught
+`boost::unit_test::framework::nothing_to_test`.
 
 Attempt 2, missing `___fpclassifyd` bind in `bitcoin-26.2-test`:
 
@@ -389,7 +394,7 @@ docker run --rm --platform linux/arm64 \
     bash tests/test_external_macho_cli.sh'
 ```
 
-Result: `3/4` PASS. Current status:
+Result: `0/4` clean exits. Current status:
 
 | Name | Status | Evidence |
 |---|---|---|
