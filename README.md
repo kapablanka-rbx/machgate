@@ -167,6 +167,17 @@ docker run --rm --platform linux/arm64 \
   '
 ```
 
+### Publishing a release
+
+MachGate releases are published by the GitHub Actions release workflow, not by
+hand-copying a local `dist/` tarball. When cutting a release, commit the intended
+changes, push them to `kapabl/machgate`, push an annotated `vX.Y.Z` tag, then
+wait for `.github/workflows/release.yml` to build, test, package, and publish
+the GitHub release assets.
+
+See [docs/RELEASE_WORKFLOW.md](docs/RELEASE_WORKFLOW.md) for the exact release
+checklist.
+
 ## Usage
 
 ```bash
