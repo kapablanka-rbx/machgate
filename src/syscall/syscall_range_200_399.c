@@ -4101,7 +4101,7 @@ static void handle_psynch_wait_probe(struct syscall_gate_state* state)
 
 #ifdef SYS_futex
 	errno = 0;
-	long result = syscall(SYS_futex, address, FUTEX_WAIT, expected,
+	long result = syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected,
 	                      &timeout, NULL, 0);
 	if (result < 0) {
 		int err = errno ? errno : EIO;
@@ -4129,7 +4129,7 @@ static void handle_psynch_wake(struct syscall_gate_state* state, int wake_all)
 
 #ifdef SYS_futex
 	errno = 0;
-	long result = syscall(SYS_futex, address, FUTEX_WAKE, wake_count,
+	long result = syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, wake_count,
 	                      NULL, NULL, 0);
 	finish_syscall_result(state, result);
 #else

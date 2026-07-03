@@ -25,6 +25,7 @@ Optional environment:
   MACHGATE_VERBOSE    Set to 1 to run MachGate with -v.
   MACHGATE_TIMEOUT    Kill MachGate after this many seconds, default: disabled.
   MACHGATE_TRACE_*    Debug trace flags are passed through to the container.
+  QEMU_STRACE         Pass through to qemu-user when Docker uses binfmt.
 EOF
 }
 
@@ -72,6 +73,12 @@ while IFS='=' read -r env_name _; do
 done < <(env)
 
 for env_name in MACHGATE_EXTERNAL_MAP_LIBCXX; do
+    if [ -n "${!env_name:-}" ]; then
+        docker_args+=(-e "$env_name=${!env_name}")
+    fi
+done
+
+for env_name in QEMU_STRACE; do
     if [ -n "${!env_name:-}" ]; then
         docker_args+=(-e "$env_name=${!env_name}")
     fi

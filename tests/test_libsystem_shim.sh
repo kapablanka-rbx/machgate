@@ -285,6 +285,15 @@ for ptr in reused_ptrs:
 for ptr in host_reuse_ptrs:
     host_libc.free(ptr)
 
+for _ in range(6000):
+    churn_ptr = lib.malloc(25)
+    assert churn_ptr, 'churn malloc failed'
+    lib.free(churn_ptr)
+churn_ptr = lib.malloc(25)
+assert churn_ptr, 'post-churn malloc failed'
+assert lib.malloc_size(churn_ptr) >= 25, 'post-churn malloc_size returned too little'
+lib.free(churn_ptr)
+
 ZONE_SIZE = ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p)
 ZONE_MALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
 ZONE_CALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t)

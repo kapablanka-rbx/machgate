@@ -3865,7 +3865,7 @@ static void dispatch_ulock_wait(struct syscall_gate_state* state)
 
 	errno = 0;
 #ifdef SYS_futex
-	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT,
+	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT_PRIVATE,
 	                      (uint32_t)value, timeout_ptr, NULL, 0);
 	if (result < 0) {
 		set_errno_failure(state);
@@ -3923,7 +3923,7 @@ static void dispatch_ulock_wait2(struct syscall_gate_state* state)
 
 	errno = 0;
 #ifdef SYS_futex
-	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT,
+	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT_PRIVATE,
 	                      (uint32_t)value, timeout_ptr, NULL, 0);
 	if (result < 0) {
 		set_errno_failure(state);
@@ -3954,7 +3954,7 @@ static void dispatch_ulock_wake(struct syscall_gate_state* state)
 
 	errno = 0;
 #ifdef SYS_futex
-	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAKE,
+	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAKE_PRIVATE,
 	                      wake_count, NULL, NULL, 0);
 	if (result < 0) {
 		set_errno_failure(state);
