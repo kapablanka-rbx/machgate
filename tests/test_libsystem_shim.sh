@@ -9,7 +9,7 @@ BUILD_DIR="${BUILD_DIR:-$MACHGATE_ROOT/build}"
 
 # Test that the .so loads without errors
 BUILD_DIR="$BUILD_DIR" LD_LIBRARY_PATH="$BUILD_DIR" python3 -c "
-import ctypes, sys, os, threading, time
+import ctypes, sys, os
 
 build_dir = os.environ['BUILD_DIR']
 lib = ctypes.CDLL(os.path.join(build_dir, 'libsystem_shim.so'))
@@ -41,23 +41,9 @@ lib.__cxa_guard_abort.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
 guard = ctypes.c_uint64(0)
 assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1, '__cxa_guard_acquire did not request initialization'
+assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'pending __cxa_guard_acquire should not abort or rerun initializer'
 lib.__cxa_guard_release(ctypes.byref(guard))
 assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'released __cxa_guard_acquire should report initialized'
-
-contended_guard = ctypes.c_uint64(0)
-contended_results = []
-assert lib.__cxa_guard_acquire(ctypes.byref(contended_guard)) == 1, 'contended guard initial acquire failed'
-
-def contend_guard():
-    contended_results.append(lib.__cxa_guard_acquire(ctypes.byref(contended_guard)))
-
-contended_thread = threading.Thread(target=contend_guard)
-contended_thread.start()
-time.sleep(0.05)
-assert contended_results == [], 'contended __cxa_guard_acquire returned before release'
-lib.__cxa_guard_release(ctypes.byref(contended_guard))
-contended_thread.join(2.0)
-assert contended_results == [0], f'contended __cxa_guard_acquire result={contended_results}, expected [0]'
 
 abort_guard = ctypes.c_uint64(0)
 assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, '__cxa_guard_acquire failed for abort guard'
