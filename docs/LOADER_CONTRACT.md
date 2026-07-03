@@ -52,10 +52,11 @@ signal handler.
 - Signal diagnostics print initializer context and LR/LR-4 instruction windows
   for null-branch crashes during pre-main execution.
 - C++ static-local guards use the Darwin/libc++abi guard bytes directly:
-  byte 0 is complete and byte 1 is pending/complete state. The shim must not
-  block indefinitely inside `__cxa_guard_acquire`; a pending guard is treated
-  as already handled so recursive/static-init edge cases cannot wedge the
-  guest runtime.
+  byte 0 is complete, byte 1 carries pending/waiting/complete state, and
+  bytes 4..7 carry the initializing thread id while initialization is pending.
+  Same-thread recursive acquire is fatal. Other-thread contention waits for
+  release/abort and uses a bounded stall diagnostic so guard waits cannot wedge
+  silently.
 
 ## Known Remaining Gaps
 
