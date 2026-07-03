@@ -154,6 +154,13 @@ for requested_size in [1, 17, 57, 73, 169, 281, 1681, 4097, 56713]:
     )
     lib.free(sized_ptr)
 
+ledger_stress_ptrs = [lib.malloc(25) for _ in range(300000)]
+for ptr in ledger_stress_ptrs:
+    assert ptr, 'ledger stress malloc failed'
+    assert lib.malloc_size(ptr) >= 25, 'malloc_size failed during ledger stress'
+for ptr in ledger_stress_ptrs:
+    lib.free(ptr)
+
 heap_ptr = lib.malloc(72)
 assert heap_ptr, 'malloc failed'
 assert lib.malloc_size(heap_ptr) >= 72, 'malloc_size returned too little for malloc allocation'
