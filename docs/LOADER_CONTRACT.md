@@ -53,6 +53,9 @@ signal handler.
   function-local static initialization and cross-thread contention. A pending
   guard owned by another thread waits and re-checks completion; only same-thread
   re-entry is treated as recursive initialization.
+- The libSystem shim allocation ledger must preserve ownership information
+  under high live-allocation pressure; exhaustion must not change guest-visible
+  malloc-zone ownership or flood stderr.
 - Signal diagnostics print initializer context and LR/LR-4 instruction windows
   for null-branch crashes during pre-main execution.
 

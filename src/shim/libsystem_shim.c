@@ -11341,7 +11341,8 @@ static real_posix_memalign_fn real_posix_memalign = NULL;
 static char bootstrap_buf[4096];
 static int bootstrap_pos = 0;
 
-#define MACHGATE_ALLOCATION_TABLE_SIZE 262144
+#define MACHGATE_ALLOCATION_INITIAL_TABLE_SIZE 262144
+#define MACHGATE_ALLOCATION_MAX_TABLE_SIZE 4194304
 
 struct machgate_allocation_record {
 	void* ptr;
@@ -11350,8 +11351,11 @@ struct machgate_allocation_record {
 	unsigned flags;
 };
 
-static struct machgate_allocation_record allocation_records[MACHGATE_ALLOCATION_TABLE_SIZE];
+static struct machgate_allocation_record allocation_records_static[MACHGATE_ALLOCATION_INITIAL_TABLE_SIZE];
+static struct machgate_allocation_record* allocation_records = allocation_records_static;
+static size_t allocation_records_capacity = MACHGATE_ALLOCATION_INITIAL_TABLE_SIZE;
 static volatile int allocation_records_lock;
+static int allocation_records_full_warned;
 
 #define MACHGATE_ALLOCATION_GUEST_CXX 1u
 
@@ -11366,37 +11370,33 @@ static void unlock_allocation_records(void)
 	__sync_lock_release(&allocation_records_lock);
 }
 
-static size_t allocation_record_index(const void* ptr)
+static size_t allocation_record_index(const void* ptr, size_t capacity)
 {
 	uintptr_t value = (uintptr_t)ptr;
 
 	value >>= 4;
 	value ^= value >> 17;
 	value ^= value >> 31;
-	return value & (MACHGATE_ALLOCATION_TABLE_SIZE - 1);
+	return value & (capacity - 1);
 }
 
-static void record_allocation_with_zone(void* ptr, size_t size, void* zone)
+static int insert_allocation_record(struct machgate_allocation_record* records,
+                                    size_t capacity, void* ptr, size_t size,
+                                    void* zone, unsigned flags)
 {
-	size_t index;
+	size_t index = allocation_record_index(ptr, capacity);
 	struct machgate_allocation_record* reusable_record = NULL;
 
-	if (!ptr)
-		return;
-
-	index = allocation_record_index(ptr);
-	lock_allocation_records();
-	for (size_t probe = 0; probe < MACHGATE_ALLOCATION_TABLE_SIZE; probe++) {
+	for (size_t probe = 0; probe < capacity; probe++) {
 		struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (MACHGATE_ALLOCATION_TABLE_SIZE - 1)];
+		    &records[(index + probe) & (capacity - 1)];
 
 		if (record->ptr == ptr) {
 			record->ptr = ptr;
 			record->size = size;
 			record->zone = zone;
-			record->flags = 0;
-			unlock_allocation_records();
-			return;
+			record->flags = flags;
+			return 1;
 		}
 		if (record->ptr && record->size == 0 && !reusable_record)
 			reusable_record = record;
@@ -11406,22 +11406,93 @@ static void record_allocation_with_zone(void* ptr, size_t size, void* zone)
 			record->ptr = ptr;
 			record->size = size;
 			record->zone = zone;
-			record->flags = 0;
-			unlock_allocation_records();
-			return;
+			record->flags = flags;
+			return 1;
 		}
 	}
 	if (reusable_record) {
 		reusable_record->ptr = ptr;
 		reusable_record->size = size;
 		reusable_record->zone = zone;
-		reusable_record->flags = 0;
-		unlock_allocation_records();
+		reusable_record->flags = flags;
+		return 1;
+	}
+	return 0;
+}
+
+static int grow_allocation_records(void)
+{
+	size_t old_capacity = allocation_records_capacity;
+	size_t new_capacity = old_capacity * 2;
+	size_t new_bytes;
+	struct machgate_allocation_record* old_records = allocation_records;
+	struct machgate_allocation_record* new_records;
+
+	if (old_capacity >= MACHGATE_ALLOCATION_MAX_TABLE_SIZE)
+		return 0;
+	if (new_capacity > MACHGATE_ALLOCATION_MAX_TABLE_SIZE)
+		new_capacity = MACHGATE_ALLOCATION_MAX_TABLE_SIZE;
+	if (new_capacity <= old_capacity)
+		return 0;
+
+	new_bytes = new_capacity * sizeof(*new_records);
+	new_records = (struct machgate_allocation_record*)syscall(
+	    SYS_mmap, NULL, new_bytes, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (new_records == MAP_FAILED)
+		return 0;
+
+	for (size_t index = 0; index < old_capacity; index++) {
+		struct machgate_allocation_record* record = &old_records[index];
+		if (!record->ptr || record->size == 0)
+			continue;
+		if (!insert_allocation_record(new_records, new_capacity, record->ptr,
+		                              record->size, record->zone,
+		                              record->flags)) {
+			syscall(SYS_munmap, new_records, new_bytes);
+			return 0;
+		}
+	}
+
+	allocation_records = new_records;
+	allocation_records_capacity = new_capacity;
+	if (old_records != allocation_records_static)
+		syscall(SYS_munmap, old_records, old_capacity * sizeof(*old_records));
+	return 1;
+}
+
+static void warn_allocation_ledger_full_once(void* ptr, size_t size, void* zone,
+                                             size_t capacity)
+{
+	fprintf(stderr,
+	        "libsystem_shim: WARNING: allocation ledger full after %zu slots, suppressing further drops; first dropped ptr=%p size=%zu zone=%p\n",
+	        capacity, ptr, size, zone);
+}
+
+static void record_allocation_with_zone(void* ptr, size_t size, void* zone)
+{
+	int should_warn = 0;
+	size_t warning_capacity = 0;
+
+	if (!ptr)
 		return;
+
+	lock_allocation_records();
+	while (!insert_allocation_record(allocation_records,
+	                                 allocation_records_capacity, ptr, size,
+	                                 zone, 0)) {
+		if (grow_allocation_records())
+			continue;
+		if (!allocation_records_full_warned) {
+			allocation_records_full_warned = 1;
+			should_warn = 1;
+			warning_capacity = allocation_records_capacity;
+		}
+		break;
 	}
 	unlock_allocation_records();
-	fprintf(stderr, "libsystem_shim: WARNING: allocation ledger full, dropping ptr=%p size=%zu zone=%p\n",
-	        ptr, size, zone);
+	if (should_warn)
+		warn_allocation_ledger_full_once(ptr, size, zone, warning_capacity);
 }
 
 static void record_allocation(void* ptr, size_t size)
@@ -11437,11 +11508,11 @@ static int lookup_allocation(const void* ptr, size_t* size_out, void** zone_out,
 	if (!ptr)
 		return 0;
 
-	index = allocation_record_index(ptr);
 	lock_allocation_records();
-	for (size_t probe = 0; probe < MACHGATE_ALLOCATION_TABLE_SIZE; probe++) {
+	index = allocation_record_index(ptr, allocation_records_capacity);
+	for (size_t probe = 0; probe < allocation_records_capacity; probe++) {
 		const struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (MACHGATE_ALLOCATION_TABLE_SIZE - 1)];
+		    &allocation_records[(index + probe) & (allocation_records_capacity - 1)];
 
 		if (!record->ptr) {
 			unlock_allocation_records();
@@ -11483,11 +11554,11 @@ static void forget_allocation(const void* ptr)
 	if (!ptr)
 		return;
 
-	index = allocation_record_index(ptr);
 	lock_allocation_records();
-	for (size_t probe = 0; probe < MACHGATE_ALLOCATION_TABLE_SIZE; probe++) {
+	index = allocation_record_index(ptr, allocation_records_capacity);
+	for (size_t probe = 0; probe < allocation_records_capacity; probe++) {
 		struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (MACHGATE_ALLOCATION_TABLE_SIZE - 1)];
+		    &allocation_records[(index + probe) & (allocation_records_capacity - 1)];
 
 		if (!record->ptr) {
 			unlock_allocation_records();
@@ -11507,17 +11578,24 @@ static void forget_allocation(const void* ptr)
 static void mark_guest_cxx_allocation(void* ptr, size_t size)
 {
 	size_t index;
+	struct machgate_allocation_record* reusable_record = NULL;
+	int should_warn = 0;
+	size_t warning_capacity = 0;
 
 	if (!ptr)
 		return;
 
-	index = allocation_record_index(ptr);
 	lock_allocation_records();
-	for (size_t probe = 0; probe < MACHGATE_ALLOCATION_TABLE_SIZE; probe++) {
+retry:
+	index = allocation_record_index(ptr, allocation_records_capacity);
+	reusable_record = NULL;
+	for (size_t probe = 0; probe < allocation_records_capacity; probe++) {
 		struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (MACHGATE_ALLOCATION_TABLE_SIZE - 1)];
+		    &allocation_records[(index + probe) & (allocation_records_capacity - 1)];
 
 		if (!record->ptr) {
+			if (reusable_record)
+				record = reusable_record;
 			record->ptr = ptr;
 			record->size = recorded_allocation_size(ptr, size);
 			record->zone = NULL;
@@ -11525,6 +11603,8 @@ static void mark_guest_cxx_allocation(void* ptr, size_t size)
 			unlock_allocation_records();
 			return;
 		}
+		if (record->ptr && record->size == 0 && !reusable_record)
+			reusable_record = record;
 		if (record->ptr == ptr) {
 			if (record->size == 0)
 				record->size = recorded_allocation_size(ptr, size);
@@ -11533,7 +11613,24 @@ static void mark_guest_cxx_allocation(void* ptr, size_t size)
 			return;
 		}
 	}
+	if (reusable_record) {
+		reusable_record->ptr = ptr;
+		reusable_record->size = recorded_allocation_size(ptr, size);
+		reusable_record->zone = NULL;
+		reusable_record->flags = MACHGATE_ALLOCATION_GUEST_CXX;
+		unlock_allocation_records();
+		return;
+	}
+	if (grow_allocation_records())
+		goto retry;
+	if (!allocation_records_full_warned) {
+		allocation_records_full_warned = 1;
+		should_warn = 1;
+		warning_capacity = allocation_records_capacity;
+	}
 	unlock_allocation_records();
+	if (should_warn)
+		warn_allocation_ledger_full_once(ptr, size, NULL, warning_capacity);
 }
 
 static int should_forward_guest_cxx_delete(const void* ptr)

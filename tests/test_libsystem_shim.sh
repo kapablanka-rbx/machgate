@@ -408,10 +408,10 @@ lib.malloc_zone_register(custom_zone_ptr)
 assert lib.malloc_get_zone_name(custom_zone_ptr) == b'custom test zone', 'custom zone name not preserved'
 
 stress_free_start = custom_counts['free']
-stress_ptrs = [lib.malloc_zone_malloc(custom_zone_ptr, 72) for _ in range(20000)]
+stress_ptrs = [lib.malloc_zone_malloc(custom_zone_ptr, 25) for _ in range(270000)]
 assert all(stress_ptrs), 'custom zone stress allocation failed'
 for ptr in stress_ptrs:
-    assert lib.malloc_zone_size(custom_zone_ptr, ptr) == 72, 'custom zone stress size was not preserved'
+    assert lib.malloc_zone_size(custom_zone_ptr, ptr) == 25, 'custom zone stress size was not preserved'
 for ptr in stress_ptrs:
     lib.malloc_zone_free(None, ptr)
 assert custom_counts['free'] == stress_free_start + len(stress_ptrs), 'custom zone ownership was lost under allocation-table pressure'
