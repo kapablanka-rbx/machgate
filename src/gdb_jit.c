@@ -11,6 +11,7 @@
 
 #include "gdb_jit.h"
 #include "macho_defs.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -355,7 +356,7 @@ int gdb_jit_register_macho(void* mh, uintptr_t slide)
 	if (num_syms == 0) {
 		free(syms);
 		free(strtab.buf);
-		fprintf(stderr, "gdb_jit: no symbols to register\n");
+		machgate_log_startup("gdb_jit: no symbols to register\n");
 		return -1;
 	}
 
@@ -527,8 +528,9 @@ int gdb_jit_register_macho(void* mh, uintptr_t slide)
 	__jit_debug_descriptor.action_flag = JIT_REGISTER_FN;
 	__jit_debug_register_code();
 
-	fprintf(stderr, "gdb_jit: registered %d symbols (%d bytes ELF, code at %p-%p)\n",
-	        num_syms, w.pos, (void*)text_addr, (void*)(text_addr + text_size));
+	machgate_log_startup("gdb_jit: registered %d symbols (%d bytes ELF, code at %p-%p)\n",
+	                     num_syms, w.pos, (void*)text_addr,
+	                     (void*)(text_addr + text_size));
 
 	/* Keep syms + strtab for runtime symbol lookup (heap_trace, etc.)
 	 * w.buf is owned by entry (GDB JIT), shstrtab is no longer needed. */

@@ -38,6 +38,20 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+
+static int shim_startup_log_enabled(void)
+{
+	const char* value = getenv("MACHGATE_VERBOSE");
+	if (!value)
+		value = getenv("MACHISMO_VERBOSE");
+	if (!value)
+		value = getenv("MACHGATE_LOG_STARTUP");
+	if (!value)
+		value = getenv("MACHISMO_LOG_STARTUP");
+	return value && value[0] && strcmp(value, "0") != 0 &&
+	       strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0 &&
+	       strcmp(value, "no") != 0 && strcmp(value, "NO") != 0;
+}
 #include <linux/futex.h>
 #include <poll.h>
 #include <netdb.h>
@@ -6252,7 +6266,8 @@ static void init_fake_home(void)
 			snprintf(fake_home, sizeof(fake_home), "./userdata");
 	}
 
-	fprintf(stderr, "libsystem_shim: HOME rewritten to %s\n", fake_home);
+	if (shim_startup_log_enabled())
+		fprintf(stderr, "libsystem_shim: HOME rewritten to %s\n", fake_home);
 }
 
 static const char* get_fake_home(void)
@@ -6745,7 +6760,7 @@ static void init_pthread_wrappers(void)
 
 	if (!real_pthread_mutex_lock)
 		fprintf(stderr, "libsystem_shim: WARNING: could not resolve real pthread_mutex_lock\n");
-	else
+	else if (shim_startup_log_enabled())
 		fprintf(stderr, "libsystem_shim: pthread wrappers initialized (real=%p)\n", real_pthread_mutex_lock);
 }
 

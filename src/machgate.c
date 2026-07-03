@@ -43,6 +43,7 @@
 #include "isa_emul.h"
 #include "syscall/syscall_gate.h"
 #include "vm_interpose.h"
+#include "log.h"
 #include <sys/resource.h>
 #include <pthread.h>
 
@@ -689,8 +690,8 @@ static uint32_t* allocate_main_lse_pool(uintptr_t text_begin,
 				                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
 				                    -1, 0);
 				if (mapped != MAP_FAILED) {
-					fprintf(stderr, "machgate: LSE island pool at %p (before __TEXT, %zu KB)\n",
-					        mapped, aligned_size / 1024);
+					machgate_log_startup("machgate: LSE island pool at %p (before __TEXT, %zu KB)\n",
+					                      mapped, aligned_size / 1024);
 					return (uint32_t*)mapped;
 				}
 				if (preferred < PAGE_SIZE)
@@ -702,8 +703,8 @@ static uint32_t* allocate_main_lse_pool(uintptr_t text_begin,
 
 	uint32_t* result = (uint32_t*)machgate_pool_alloc(lr, pool_size);
 	if (result) {
-		fprintf(stderr, "machgate: LSE island pool at %p (adjacent to segments, %zu KB)\n",
-		        result, pool_size / 1024);
+		machgate_log_startup("machgate: LSE island pool at %p (adjacent to segments, %zu KB)\n",
+		                      result, pool_size / 1024);
 	}
 	return result;
 }
@@ -742,6 +743,11 @@ int main(int argc, char** argv, char** envp)
 		}
 		arg_idx++;
 	}
+
+	if (machgate_log_startup_enabled())
+		machgate_verbose = 1;
+	if (machgate_verbose)
+		setenv("MACHGATE_VERBOSE", "1", 0);
 
 	if (arg_idx >= argc)
 	{
@@ -812,7 +818,7 @@ int main(int argc, char** argv, char** envp)
 		}
 
 		if (cfg_loaded) {
-			fprintf(stderr, "machgate: loaded config from %s\n", cfg_path);
+			machgate_log_startup("machgate: loaded config from %s\n", cfg_path);
 		} else {
 			/* Fallback to env vars for backward compat */
 			const char* map = getenv_compat("MACHGATE_DYLIB_MAP", "MACHISMO_DYLIB_MAP");
@@ -943,11 +949,11 @@ int main(int argc, char** argv, char** envp)
 		if (lse_pool)
 			__builtin___clear_cache((char*)lse_pool, (char*)lse_pool + lse_pool_size);
 		if (rcpc_fixed > 0)
-			fprintf(stderr, "machgate: downgraded %d ARMv8.3 RCPC instructions to ARMv8.0\n", rcpc_fixed);
+			machgate_log_startup("machgate: downgraded %d ARMv8.3 RCPC instructions to ARMv8.0\n", rcpc_fixed);
 		if (tpidr_fixed > 0)
-			fprintf(stderr, "machgate: rewrote %d Darwin TPIDRRO reads to Linux TPIDR reads\n", tpidr_fixed);
+			machgate_log_startup("machgate: rewrote %d Darwin TPIDRRO reads to Linux TPIDR reads\n", tpidr_fixed);
 		if (lse_total > 0)
-			fprintf(stderr, "machgate: patched %d ARMv8.1 LSE atomics with LDXR/STXR islands\n", lse_total);
+			machgate_log_startup("machgate: patched %d ARMv8.1 LSE atomics with LDXR/STXR islands\n", lse_total);
 	}
 
 	/* Resolve chained fixups — patch GOT with native Linux .so addresses.
@@ -965,7 +971,7 @@ int main(int argc, char** argv, char** envp)
 		 * already loaded — the resolver finds them via MACHO: entries. */
 		for (int i = 0; i < g_num_macho_dylibs; i++) {
 			struct macho_dylib_info *mdi = &g_macho_dylibs[i];
-			fprintf(stderr, "machgate: resolving fixups for Mach-O dylib '%s'\n", mdi->path);
+			machgate_log_startup("machgate: resolving fixups for Mach-O dylib '%s'\n", mdi->path);
 			resolver_resolve_fixups((void*)mdi->mh, mdi->slide, cfg.dylib_map);
 		}
 
@@ -1059,14 +1065,14 @@ int main(int argc, char** argv, char** envp)
 				__builtin___clear_cache((char*)dylib_lse_pool,
 					(char*)dylib_lse_pool + dylib_pool_size);
 			if (dfix > 0)
-				fprintf(stderr, "machgate: downgraded %d RCPC instructions in dylib '%s'\n",
-				        dfix, mdi->path);
+				machgate_log_startup("machgate: downgraded %d RCPC instructions in dylib '%s'\n",
+				                      dfix, mdi->path);
 			if (dtpidr > 0)
-				fprintf(stderr, "machgate: rewrote %d Darwin TPIDRRO reads in dylib '%s'\n",
-				        dtpidr, mdi->path);
+				machgate_log_startup("machgate: rewrote %d Darwin TPIDRRO reads in dylib '%s'\n",
+				                      dtpidr, mdi->path);
 			if (dln > 0)
-				fprintf(stderr, "machgate: patched %d LSE atomics in dylib '%s' (pool at %p)\n",
-				        dln, mdi->path, dylib_lse_pool);
+				machgate_log_startup("machgate: patched %d LSE atomics in dylib '%s' (pool at %p)\n",
+				                      dln, mdi->path, dylib_lse_pool);
 		}
 
 		/* Runtime bootstrap must be complete before any image initializer runs.
@@ -1511,7 +1517,7 @@ static void fixup_darwin_pthread_data(struct load_results* lr) {
 	}
 
 	if (fixed > 0)
-		fprintf(stderr, "machgate: fixed %d macOS pthread objects in __DATA\n", fixed);
+		machgate_log_startup("machgate: fixed %d macOS pthread objects in __DATA\n", fixed);
 }
 
 static int write_pointer_slot(uintptr_t slot, uintptr_t value)
@@ -1553,8 +1559,8 @@ static int fixup_darwin_allocator_slot(struct load_results* lr,
 	if (!write_pointer_slot(slot, (uintptr_t)replacement))
 		return 0;
 
-	fprintf(stderr, "machgate: Darwin allocator default %s 0x%lx -> %p\n",
-	        slot_name, current, replacement);
+	machgate_log_startup("machgate: Darwin allocator default %s 0x%lx -> %p\n",
+	                     slot_name, current, replacement);
 	return 1;
 }
 
@@ -1582,8 +1588,8 @@ static void fixup_darwin_libc_allocator_defaults(struct load_results* lr)
 		                                     slots[index].shim_name);
 
 	if (fixed > 0)
-		fprintf(stderr, "machgate: initialized %d Darwin libc allocator defaults\n",
-		        fixed);
+		machgate_log_startup("machgate: initialized %d Darwin libc allocator defaults\n",
+		                      fixed);
 }
 
 typedef void (*shim_set_guest_cxx_allocators_fn)(void*, void*, void*, void*,
@@ -1723,8 +1729,8 @@ static void setup_tlv_image(struct load_results* lr)
 	}
 
 	if (tlv_image_size || tlv_bss_size) {
-		fprintf(stderr, "machgate: TLV image at %p, size %zu + %zu bss\n",
-		        tlv_image_base, tlv_image_size, tlv_bss_size);
+		machgate_log_startup("machgate: TLV image at %p, size %zu + %zu bss\n",
+		                      tlv_image_base, tlv_image_size, tlv_bss_size);
 	}
 
 	/* Set globals in libsystem_shim.so — try multiple paths since
@@ -1747,7 +1753,7 @@ static void setup_tlv_image(struct load_results* lr)
 		if (p_size) *p_size = tlv_image_size;
 		if (p_bss) *p_bss = tlv_bss_size;
 		dlclose(shim);
-		fprintf(stderr, "machgate: TLV info set in shim\n");
+		machgate_log_startup("machgate: TLV info set in shim\n");
 	} else {
 		fprintf(stderr, "machgate: WARNING: cannot find libsystem_shim.so for TLV (%s)\n",
 		        dlerror());
@@ -1793,12 +1799,12 @@ static void run_lc_routines_initializers(struct load_results* lr)
 		if (lc->cmd == LC_ROUTINES) {
 			struct routines_command* routines = (struct routines_command*)lc;
 			uintptr_t func_addr = (uintptr_t)routines->init_address + lr->slide;
-			fprintf(stderr, "machgate: running LC_ROUTINES initializer\n");
+			machgate_log_startup("machgate: running LC_ROUTINES initializer\n");
 			call_dyld_initializer(lr, "LC_ROUTINES", index++, 1, func_addr);
 		} else if (lc->cmd == LC_ROUTINES_64) {
 			struct routines_command_64* routines = (struct routines_command_64*)lc;
 			uintptr_t func_addr = (uintptr_t)routines->init_address + lr->slide;
-			fprintf(stderr, "machgate: running LC_ROUTINES_64 initializer\n");
+			machgate_log_startup("machgate: running LC_ROUTINES_64 initializer\n");
 			call_dyld_initializer(lr, "LC_ROUTINES_64", index++, 1, func_addr);
 		}
 		p += lc->cmdsize;
@@ -1820,11 +1826,11 @@ static void run_mod_init_func_initializers(struct load_results* lr)
 				if ((sect->flags & SECTION_TYPE) == S_MOD_INIT_FUNC_POINTERS) {
 					uintptr_t* funcs = (uintptr_t*)(sect->addr + lr->slide);
 					int count = sect->size / sizeof(uintptr_t);
-					fprintf(stderr, "machgate: running %d static constructors from __mod_init_func\n", count);
+					machgate_log_startup("machgate: running %d static constructors from __mod_init_func\n", count);
 					for (int j = 0; j < count; j++) {
 						call_dyld_initializer(lr, "__mod_init_func", j, count, funcs[j]);
 					}
-					fprintf(stderr, "machgate: __mod_init_func constructors complete\n");
+					machgate_log_startup("machgate: __mod_init_func constructors complete\n");
 				}
 			}
 		}
@@ -1847,12 +1853,12 @@ static void run_init_offset_initializers(struct load_results* lr)
 				if ((sect->flags & SECTION_TYPE) == S_INIT_FUNC_OFFSETS) {
 					uint32_t* offsets = (uint32_t*)(sect->addr + lr->slide);
 					int count = sect->size / sizeof(uint32_t);
-					fprintf(stderr, "machgate: running %d C++ static initializers from __init_offsets\n", count);
+					machgate_log_startup("machgate: running %d C++ static initializers from __init_offsets\n", count);
 					for (int j = 0; j < count; j++) {
 						uintptr_t func_addr = lr->mh + offsets[j];
 						call_dyld_initializer(lr, "__init_offsets", j, count, func_addr);
 					}
-					fprintf(stderr, "machgate: static initializers complete\n");
+					machgate_log_startup("machgate: static initializers complete\n");
 				}
 			}
 		}
@@ -1942,13 +1948,13 @@ static void start_thread(struct load_results* lr) {
 			if (slash) {
 				*slash = '\0';
 				if (chdir(binary_path) == 0)
-					fprintf(stderr, "machgate: chdir to '%s'\n", binary_path);
+					machgate_log_startup("machgate: chdir to '%s'\n", binary_path);
 			}
 			free(binary_path);
 		}
 
-		fprintf(stderr, "machgate: calling _main at %p (argc=%zu)\n",
-				(void*)lr->entry_point, lr->argc);
+		machgate_log_startup("machgate: calling _main at %p (argc=%zu)\n",
+		                      (void*)lr->entry_point, lr->argc);
 		trace_lc_main_abi(lr);
 
 #ifdef __aarch64__

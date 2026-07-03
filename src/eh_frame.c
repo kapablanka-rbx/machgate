@@ -15,6 +15,7 @@
 
 #include "eh_frame.h"
 #include "macho_defs.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1121,7 +1122,7 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 	}
 
 	if (!unwind_info) {
-		fprintf(stderr, "eh_frame: no __unwind_info section found\n");
+		machgate_log_startup("eh_frame: no __unwind_info section found\n");
 		return -1;
 	}
 
@@ -1129,9 +1130,9 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 	const struct unwind_info_section_header* hdr =
 		(const struct unwind_info_section_header*)unwind_info;
 
-	fprintf(stderr, "eh_frame: __unwind_info v%u: %u common encodings, %u personalities, %u index entries\n",
-	        hdr->version, hdr->commonEncodingsArrayCount,
-	        hdr->personalityArrayCount, hdr->indexCount);
+	machgate_log_startup("eh_frame: __unwind_info v%u: %u common encodings, %u personalities, %u index entries\n",
+	                     hdr->version, hdr->commonEncodingsArrayCount,
+	                     hdr->personalityArrayCount, hdr->indexCount);
 
 	/* Read common encodings */
 	const uint32_t* common_encodings =
@@ -1147,8 +1148,8 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		uintptr_t got_addr = text_base + slide + personality_arr[i];
 		uintptr_t* got_entry = (uintptr_t*)got_addr;
 		personalities[i] = *got_entry;
-		fprintf(stderr, "eh_frame: personality[%u]: GOT at %p → %p\n",
-		        i + 1, (void*)got_addr, (void*)personalities[i]);
+		machgate_log_startup("eh_frame: personality[%u]: GOT at %p → %p\n",
+		                      i + 1, (void*)got_addr, (void*)personalities[i]);
 	}
 
 	/* Collect all compact unwind entries */
@@ -1172,14 +1173,14 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		else n_zero++;
 		if (entries[i].encoding & UNWIND_HAS_LSDA) n_lsda++;
 	}
-	fprintf(stderr, "eh_frame: %d entries: %d FRAME, %d FRAMELESS, %d DWARF, %d zero-enc, %d with LSDA\n",
-	        count, n_frame, n_frameless, n_dwarf, n_zero, n_lsda);
+	machgate_log_startup("eh_frame: %d entries: %d FRAME, %d FRAMELESS, %d DWARF, %d zero-enc, %d with LSDA\n",
+	                     count, n_frame, n_frameless, n_dwarf, n_zero, n_lsda);
 
 	if (native_eh_frame && native_eh_frame_size > 0) {
 		native_fde_count = parse_native_eh_frame_fdes(native_eh_frame,
 			native_eh_frame_size, &native_entries);
-		fprintf(stderr, "eh_frame: parsed %d native FDEs from __eh_frame (%zu bytes)\n",
-		        native_fde_count, native_eh_frame_size);
+		machgate_log_startup("eh_frame: parsed %d native FDEs from __eh_frame (%zu bytes)\n",
+		                      native_fde_count, native_eh_frame_size);
 	}
 
 	/* Allocate buffer for synthetic .eh_frame.
@@ -1256,8 +1257,8 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 
 	free(entries);
 
-	fprintf(stderr, "eh_frame: generated %d FDEs (%zu bytes) in synthetic .eh_frame\n",
-	        fdes_emitted, ehf_pos);
+	machgate_log_startup("eh_frame: generated %d FDEs (%zu bytes) in synthetic .eh_frame\n",
+	                     fdes_emitted, ehf_pos);
 
 	/*
 	 * Hook _dl_find_object to make our .eh_frame visible to the unwinder.
@@ -1383,11 +1384,11 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		}
 
 		macho_eh_frame_hdr_size = hp;
-		fprintf(stderr, "eh_frame: built .eh_frame_hdr (%zu bytes, %d entries: %d synthetic + %d native)\n",
-		        hp, total_count, syn_count, nat_count - nat_shadowed_count);
+		machgate_log_startup("eh_frame: built .eh_frame_hdr (%zu bytes, %d entries: %d synthetic + %d native)\n",
+		                      hp, total_count, syn_count, nat_count - nat_shadowed_count);
 		if (nat_shadowed_count > 0) {
-			fprintf(stderr, "eh_frame: suppressed %d native FDEs shadowed by synthetic FDEs\n",
-			        nat_shadowed_count);
+			machgate_log_startup("eh_frame: suppressed %d native FDEs shadowed by synthetic FDEs\n",
+			                      nat_shadowed_count);
 		}
 
 		free(syn_entries);
@@ -1399,11 +1400,11 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		void (*reg_frame)(const void *) = dlsym(RTLD_DEFAULT, "__register_frame");
 		if (reg_frame) {
 			reg_frame(ehf_buf);
-			fprintf(stderr, "eh_frame: registered %d synthetic FDEs via __register_frame\n",
-			        fdes_emitted);
+			machgate_log_startup("eh_frame: registered %d synthetic FDEs via __register_frame\n",
+			                      fdes_emitted);
 			if (native_eh_frame && native_eh_frame_size > 0) {
-				fprintf(stderr, "eh_frame: native __eh_frame served by _dl_find_object hook (%zu bytes, %d FDEs)\n",
-				        native_eh_frame_size, native_fde_count);
+				machgate_log_startup("eh_frame: native __eh_frame served by _dl_find_object hook (%zu bytes, %d FDEs)\n",
+				                      native_eh_frame_size, native_fde_count);
 			}
 		} else {
 			fprintf(stderr, "eh_frame: WARNING: __register_frame not found\n");
@@ -1414,8 +1415,8 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 	{
 		real_dl_find_object = dlsym(RTLD_NEXT, "_dl_find_object");
 		if (real_dl_find_object) {
-			fprintf(stderr, "eh_frame: _dl_find_object hook active for %p..%p\n",
-			        (void*)macho_text_start, (void*)macho_text_end);
+			machgate_log_startup("eh_frame: _dl_find_object hook active for %p..%p\n",
+			                      (void*)macho_text_start, (void*)macho_text_end);
 		} else {
 			fprintf(stderr, "eh_frame: using __register_frame only "
 			        "(no _dl_find_object in this glibc)\n");

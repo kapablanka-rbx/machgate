@@ -16,6 +16,7 @@
 #include "trampoline.h"
 #include "macho_defs.h"
 #include "gdb_jit.h"
+#include "log.h"
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -67,8 +68,8 @@ void trampoline_set_pool(void* base, size_t size)
 	island_pool = (uint8_t*)base;
 	island_pool_size = size;
 	island_pool_used = 0;
-	fprintf(stderr, "trampoline: island pool at %p (%zu KB)\n",
-	        base, size / 1024);
+	machgate_log_startup("trampoline: island pool at %p (%zu KB)\n",
+	                     base, size / 1024);
 }
 
 static int init_island_pool(uintptr_t text_base, size_t text_size)

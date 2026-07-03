@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "loader.h"
+#include "log.h"
 
 static int native_prot(int prot);
 static void load(const char* path, cpu_type_t cpu, bool expect_dylinker, char** argv, struct load_results* lr);
@@ -259,7 +260,7 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				 * Just warn and continue — we'll handle linking ourselves. */
 				struct dylinker_command* dy = (struct dylinker_command*) lc;
 				const char* dylinker_name = ((char*) dy) + dy->name.offset;
-				fprintf(stderr, "machgate: LC_LOAD_DYLINKER found (%s) — ignored in standalone mode\n", dylinker_name);
+				machgate_log_startup("machgate: LC_LOAD_DYLINKER found (%s) — ignored in standalone mode\n", dylinker_name);
 				break;
 			}
 			case LC_MAIN:

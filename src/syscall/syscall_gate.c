@@ -7,6 +7,7 @@
 #include "syscall_range_400_plus.h"
 
 #include "guest_vm_dispatch.h"
+#include "log.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -656,6 +657,6 @@ int syscall_gate_patch(struct load_results* lr)
 		__builtin___clear_cache(base, base + gate_pools[i].size);
 	}
 	if (total > 0)
-		fprintf(stderr, "syscall_gate: patched %d Darwin syscalls\n", total);
+		machgate_log_startup("syscall_gate: patched %d Darwin syscalls\n", total);
 	return total;
 }

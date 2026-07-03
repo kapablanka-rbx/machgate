@@ -20,6 +20,7 @@
 #include "dylib_loader.h"
 #include "lua_entity_opt.h"
 #include "macho_defs.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <link.h>        /* struct link_map, ELF types, DT_* */
@@ -574,16 +575,16 @@ static void log_failed_bind(struct resolver_state* rs, const char* context,
 		return;
 
 	if (de) {
-		fprintf(stderr,
-		        "resolver: failed bind (%s): symbol '%s' lookup '%s' dylib[%d] '%s' action=%s target='%s'\n",
-		        context, sym_name, lookup_name, lib_ordinal, de->name,
-		        dylib_action_name(de->action), de->so_path);
+		machgate_log_startup(
+		    "resolver: failed bind (%s): symbol '%s' lookup '%s' dylib[%d] '%s' action=%s target='%s'\n",
+		    context, sym_name, lookup_name, lib_ordinal, de->name,
+		    dylib_action_name(de->action), de->so_path);
 		return;
 	}
 
-	fprintf(stderr,
-	        "resolver: failed bind (%s): symbol '%s' lookup '%s' lib_ordinal=%d\n",
-	        context, sym_name, lookup_name, lib_ordinal);
+	machgate_log_startup(
+	    "resolver: failed bind (%s): symbol '%s' lookup '%s' lib_ordinal=%d\n",
+	    context, sym_name, lookup_name, lib_ordinal);
 }
 
 static int trace_bindings_enabled(void)
@@ -1635,7 +1636,7 @@ int resolver_resolve_fixups(void* mh, uintptr_t slide, const char* map_file)
 	rs.slide = slide;
 	rs.mh_addr = (uintptr_t)mh;
 
-	fprintf(stderr, "resolver: mach header at %p, slide=0x%lx\n", mh, slide);
+	machgate_log_startup("resolver: mach header at %p, slide=0x%lx\n", mh, slide);
 
 	/* Step 1: Parse load commands to find dylibs, segments, fixup info */
 	if (parse_load_commands(&rs) < 0) {
@@ -1644,18 +1645,18 @@ int resolver_resolve_fixups(void* mh, uintptr_t slide, const char* map_file)
 	}
 
 	if (!rs.has_chained_fixups && !rs.has_dyld_info) {
-		fprintf(stderr, "resolver: no LC_DYLD_CHAINED_FIXUPS or LC_DYLD_INFO found — nothing to resolve\n");
+		machgate_log_startup("resolver: no LC_DYLD_CHAINED_FIXUPS or LC_DYLD_INFO found — nothing to resolve\n");
 		ret = 0;
 		goto out;
 	}
 
 	if (rs.has_chained_fixups)
-		fprintf(stderr, "resolver: found %d dylibs, chained fixups at file offset 0x%x (size %u)\n",
-				rs.ndylibs, rs.fixups_dataoff, rs.fixups_datasize);
+		machgate_log_startup("resolver: found %d dylibs, chained fixups at file offset 0x%x (size %u)\n",
+		                      rs.ndylibs, rs.fixups_dataoff, rs.fixups_datasize);
 	else
-		fprintf(stderr, "resolver: found %d dylibs, LC_DYLD_INFO (bind=%u rebase=%u weak=%u lazy=%u bytes)\n",
-				rs.ndylibs, rs.dyld_info_bind_size, rs.dyld_info_rebase_size,
-				rs.dyld_info_weak_bind_size, rs.dyld_info_lazy_bind_size);
+		machgate_log_startup("resolver: found %d dylibs, LC_DYLD_INFO (bind=%u rebase=%u weak=%u lazy=%u bytes)\n",
+		                      rs.ndylibs, rs.dyld_info_bind_size, rs.dyld_info_rebase_size,
+		                      rs.dyld_info_weak_bind_size, rs.dyld_info_lazy_bind_size);
 
 	/* Step 2: Load dylib mapping config */
 	if (load_mapping_config(&rs, map_file) < 0) {
@@ -1704,8 +1705,8 @@ int resolver_resolve_fixups(void* mh, uintptr_t slide, const char* map_file)
 		}
 	}
 
-	fprintf(stderr, "resolver: done — %d binds resolved, %d stubbed, %d failed, %d rebases, %d ctor/dtor ABI adapters, %d variadic thunks, %d stack-arg thunks\n",
-			rs.binds_resolved, rs.binds_stubbed, rs.binds_failed, rs.rebases_applied, ctor_tramp_count, variadic_thunk_count, stack_arg_thunk_count);
+	machgate_log_startup("resolver: done — %d binds resolved, %d stubbed, %d failed, %d rebases, %d ctor/dtor ABI adapters, %d variadic thunks, %d stack-arg thunks\n",
+	                      rs.binds_resolved, rs.binds_stubbed, rs.binds_failed, rs.rebases_applied, ctor_tramp_count, variadic_thunk_count, stack_arg_thunk_count);
 
 	/* Save dylib state for deferred completion (runs later from game thread) */
 	if (g_deferred.active && !g_deferred.resolved) {
@@ -1875,7 +1876,7 @@ static int load_mapping_config(struct resolver_state* rs, const char* path)
 	}
 
 	fclose(f);
-	fprintf(stderr, "resolver: loaded %d dylib mappings from %s\n", rs->nmappings, path);
+	machgate_log_startup("resolver: loaded %d dylib mappings from %s\n", rs->nmappings, path);
 	return 0;
 }
 
@@ -1901,22 +1902,22 @@ static int open_dylibs(struct resolver_state* rs)
 		const struct dylib_mapping* m = find_mapping(rs, de->name);
 
 		if (!m) {
-			fprintf(stderr, "resolver: dylib[%d] '%s' — no mapping, skipping\n",
-					de->ordinal, de->name);
+			machgate_log_startup("resolver: dylib[%d] '%s' — no mapping, skipping\n",
+			                      de->ordinal, de->name);
 			de->action = DYLIB_SKIP;
 			continue;
 		}
 
 		if (strcmp(m->so_path, "STUB") == 0) {
-			fprintf(stderr, "resolver: dylib[%d] '%s' — stubbed\n",
-					de->ordinal, de->name);
+			machgate_log_startup("resolver: dylib[%d] '%s' — stubbed\n",
+			                      de->ordinal, de->name);
 			de->action = DYLIB_STUB;
 			continue;
 		}
 
 		if (strcmp(m->so_path, "SKIP") == 0) {
-			fprintf(stderr, "resolver: dylib[%d] '%s' — skipped\n",
-					de->ordinal, de->name);
+			machgate_log_startup("resolver: dylib[%d] '%s' — skipped\n",
+			                      de->ordinal, de->name);
 			de->action = DYLIB_SKIP;
 			continue;
 		}
@@ -1934,8 +1935,8 @@ static int open_dylibs(struct resolver_state* rs)
 				de->macho_info = mdi;
 				de->action = DYLIB_MACHO;
 				strncpy(de->so_path, macho_path, MAX_NAME - 1);
-				fprintf(stderr, "resolver: dylib[%d] '%s' → MACHO '%s' — loaded (%u symbols)\n",
-						de->ordinal, de->name, macho_path, mdi->nsyms);
+				machgate_log_startup("resolver: dylib[%d] '%s' → MACHO '%s' — loaded (%u symbols)\n",
+				                      de->ordinal, de->name, macho_path, mdi->nsyms);
 			} else {
 				fprintf(stderr, "resolver: dylib[%d] '%s' → MACHO '%s' — load FAILED\n",
 						de->ordinal, de->name, macho_path);
@@ -1949,8 +1950,8 @@ static int open_dylibs(struct resolver_state* rs)
 			de->action = DYLIB_DEFERRED;
 			snprintf(de->so_path, MAX_NAME, "%s", m->so_path + 9);
 			g_deferred.active = true;
-			fprintf(stderr, "resolver: dylib[%d] '%s' → DEFERRED '%s'\n",
-					de->ordinal, de->name, de->so_path);
+			machgate_log_startup("resolver: dylib[%d] '%s' → DEFERRED '%s'\n",
+			                      de->ordinal, de->name, de->so_path);
 			continue;
 		}
 
@@ -1965,8 +1966,8 @@ static int open_dylibs(struct resolver_state* rs)
 
 		snprintf(de->so_path, MAX_NAME, "%s", m->so_path);
 		de->action = DYLIB_MAP;
-		fprintf(stderr, "resolver: dylib[%d] '%s' → '%s' — loaded\n",
-				de->ordinal, de->name, m->so_path);
+		machgate_log_startup("resolver: dylib[%d] '%s' → '%s' — loaded\n",
+		                      de->ordinal, de->name, m->so_path);
 	}
 
 	return 0;
