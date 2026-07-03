@@ -5956,37 +5956,128 @@ void __cxa_finalize(void* dso_handle)
 	(void)dso_handle;
 }
 
+struct shim_cxa_guard_owner {
+	uint64_t* guard;
+	pid_t tid;
+};
+
+#define SHIM_CXA_GUARD_OWNER_COUNT 256
+
+static volatile int shim_cxa_guard_owner_lock;
+static struct shim_cxa_guard_owner shim_cxa_guard_owners[SHIM_CXA_GUARD_OWNER_COUNT];
+
+static void shim_cxa_guard_lock_owners(void)
+{
+	while (__sync_lock_test_and_set(&shim_cxa_guard_owner_lock, 1))
+		sched_yield();
+}
+
+static void shim_cxa_guard_unlock_owners(void)
+{
+	__sync_lock_release(&shim_cxa_guard_owner_lock);
+}
+
+static pid_t shim_cxa_guard_current_tid(void)
+{
+	return (pid_t)syscall(SYS_gettid);
+}
+
+static void shim_cxa_guard_note_owner(uint64_t* guard)
+{
+	pid_t tid = shim_cxa_guard_current_tid();
+
+	shim_cxa_guard_lock_owners();
+	for (size_t index = 0; index < SHIM_CXA_GUARD_OWNER_COUNT; index++) {
+		if (!shim_cxa_guard_owners[index].guard ||
+		    shim_cxa_guard_owners[index].guard == guard) {
+			shim_cxa_guard_owners[index].guard = guard;
+			shim_cxa_guard_owners[index].tid = tid;
+			break;
+		}
+	}
+	shim_cxa_guard_unlock_owners();
+}
+
+static void shim_cxa_guard_clear_owner(uint64_t* guard)
+{
+	shim_cxa_guard_lock_owners();
+	for (size_t index = 0; index < SHIM_CXA_GUARD_OWNER_COUNT; index++) {
+		if (shim_cxa_guard_owners[index].guard == guard) {
+			shim_cxa_guard_owners[index].guard = NULL;
+			shim_cxa_guard_owners[index].tid = 0;
+			break;
+		}
+	}
+	shim_cxa_guard_unlock_owners();
+}
+
+static int shim_cxa_guard_owned_by_current_thread(uint64_t* guard)
+{
+	pid_t tid = shim_cxa_guard_current_tid();
+	int result = 0;
+
+	shim_cxa_guard_lock_owners();
+	for (size_t index = 0; index < SHIM_CXA_GUARD_OWNER_COUNT; index++) {
+		if (shim_cxa_guard_owners[index].guard == guard) {
+			result = shim_cxa_guard_owners[index].tid == tid;
+			break;
+		}
+	}
+	shim_cxa_guard_unlock_owners();
+	return result;
+}
+
 int __cxa_guard_acquire(uint64_t* guard)
 {
 	unsigned char* bytes = (unsigned char*)guard;
 	int initialized;
 	int in_use;
+	unsigned char expected;
+	unsigned int spins = 0;
 
 	if (!guard)
 		return 0;
-	initialized = __atomic_load_n(&bytes[0], __ATOMIC_ACQUIRE);
-	in_use = __atomic_load_n(&bytes[1], __ATOMIC_ACQUIRE);
-	if (shim_cxx_init_full_trace_enabled()) {
-		fprintf(stderr,
-		        "libsystem_shim: __cxa_guard_acquire guard=%p value=%#llx initialized=%d in_use=%#x caller=%p\n",
-		        guard, (unsigned long long)*guard, initialized, in_use,
-		        __builtin_return_address(0));
-		trace_guest_address_context("__cxa_guard_acquire.caller",
-		                            (uintptr_t)__builtin_return_address(0));
+
+	for (;;) {
+		initialized = __atomic_load_n(&bytes[0], __ATOMIC_ACQUIRE);
+		in_use = __atomic_load_n(&bytes[1], __ATOMIC_ACQUIRE);
+		if (shim_cxx_init_full_trace_enabled()) {
+			fprintf(stderr,
+			        "libsystem_shim: __cxa_guard_acquire guard=%p value=%#llx initialized=%d in_use=%#x caller=%p\n",
+			        guard, (unsigned long long)*guard, initialized, in_use,
+			        __builtin_return_address(0));
+			trace_guest_address_context("__cxa_guard_acquire.caller",
+			                            (uintptr_t)__builtin_return_address(0));
+		}
+		if (initialized)
+			return 0;
+
+		if ((in_use & 0x02) && shim_cxa_guard_owned_by_current_thread(guard)) {
+			fprintf(stderr, "libsystem_shim: recursive __cxa_guard_acquire(%p)\n",
+			        guard);
+			abort();
+		}
+
+		expected = (unsigned char)in_use;
+		if ((expected & 0x02) == 0 &&
+		    __atomic_compare_exchange_n(&bytes[1], &expected, 0x02, 0,
+		                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			shim_cxa_guard_note_owner(guard);
+			if (shim_cxx_init_full_trace_enabled())
+				fprintf(stderr, "libsystem_shim: __cxa_guard_acquire guard=%p -> run initializer\n",
+				        guard);
+			return 1;
+		}
+
+		if (++spins < 128) {
+			sched_yield();
+		} else {
+			struct timespec delay;
+			delay.tv_sec = 0;
+			delay.tv_nsec = 1000000L;
+			nanosleep(&delay, NULL);
+		}
 	}
-	if (initialized)
-		return 0;
-	if (in_use & 0x02) {
-		fprintf(stderr, "libsystem_shim: recursive __cxa_guard_acquire(%p)\n",
-		        guard);
-		abort();
-	}
-	bytes[1] = 0x02;
-	__sync_synchronize();
-	if (shim_cxx_init_full_trace_enabled())
-		fprintf(stderr, "libsystem_shim: __cxa_guard_acquire guard=%p -> run initializer\n",
-		        guard);
-	return 1;
 }
 
 void __cxa_guard_release(uint64_t* guard)
@@ -5997,6 +6088,7 @@ void __cxa_guard_release(uint64_t* guard)
 		return;
 	__atomic_store_n(&bytes[0], 0x01, __ATOMIC_RELEASE);
 	__atomic_store_n(&bytes[1], 0x01, __ATOMIC_RELEASE);
+	shim_cxa_guard_clear_owner(guard);
 	if (shim_cxx_init_full_trace_enabled())
 		fprintf(stderr, "libsystem_shim: __cxa_guard_release guard=%p value=%#llx caller=%p\n",
 		        guard, (unsigned long long)*guard,
@@ -6010,6 +6102,7 @@ void __cxa_guard_abort(uint64_t* guard)
 	if (!guard)
 		return;
 	__atomic_store_n(&bytes[1], 0x00, __ATOMIC_RELEASE);
+	shim_cxa_guard_clear_owner(guard);
 	if (shim_cxx_init_full_trace_enabled())
 		fprintf(stderr, "libsystem_shim: __cxa_guard_abort guard=%p value=%#llx caller=%p\n",
 		        guard, (unsigned long long)*guard,

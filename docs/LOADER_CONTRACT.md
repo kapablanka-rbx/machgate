@@ -49,6 +49,10 @@ signal handler.
 - Main executable and loaded Mach-O dylib initializers enter through an ARM64
   guest-call helper that switches to the guest stack, passes dyld initializer
   arguments, preserves host return state, and returns to the loader.
+- The libSystem shim's `__cxa_guard_*` implementation must support both
+  function-local static initialization and cross-thread contention. A pending
+  guard owned by another thread waits and re-checks completion; only same-thread
+  re-entry is treated as recursive initialization.
 - Signal diagnostics print initializer context and LR/LR-4 instruction windows
   for null-branch crashes during pre-main execution.
 
