@@ -433,6 +433,10 @@ GLIBC_2.17 {
         machgate_shim_guest_operator_new_array;
         machgate_shim_guest_operator_new_aligned;
         machgate_shim_guest_operator_new_array_aligned;
+        machgate_shim_guest_operator_new_nothrow;
+        machgate_shim_guest_operator_new_array_nothrow;
+        machgate_shim_guest_operator_new_aligned_nothrow;
+        machgate_shim_guest_operator_new_array_aligned_nothrow;
         machgate_shim_guest_operator_delete;
         machgate_shim_guest_operator_delete_array;
         machgate_shim_guest_operator_delete_sized;
@@ -441,6 +445,10 @@ GLIBC_2.17 {
         machgate_shim_guest_operator_delete_array_aligned;
         machgate_shim_guest_operator_delete_sized_aligned;
         machgate_shim_guest_operator_delete_array_sized_aligned;
+        machgate_shim_guest_operator_delete_nothrow;
+        machgate_shim_guest_operator_delete_array_nothrow;
+        machgate_shim_guest_operator_delete_aligned_nothrow;
+        machgate_shim_guest_operator_delete_array_aligned_nothrow;
         _Znwm;
         _Znam;
         _ZnwmRKSt9nothrow_t;

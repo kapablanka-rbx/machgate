@@ -120,6 +120,7 @@ cmake -G Ninja -S "$SRC_DIR/runtimes" -B "$BUILD_DIR" \
 
 echo ""
 echo "Building Apple-ABI libc++..."
+rm -f "$BUILD_DIR"/lib/libc++.so* "$BUILD_DIR"/lib/libc++abi.so*
 cmake --build "$BUILD_DIR" --target cxx cxxabi --parallel
 
 echo ""

@@ -31,6 +31,10 @@ for symbol in \
     machgate_shim_guest_operator_new machgate_shim_guest_operator_new_array \
     machgate_shim_guest_operator_new_aligned \
     machgate_shim_guest_operator_new_array_aligned \
+    machgate_shim_guest_operator_new_nothrow \
+    machgate_shim_guest_operator_new_array_nothrow \
+    machgate_shim_guest_operator_new_aligned_nothrow \
+    machgate_shim_guest_operator_new_array_aligned_nothrow \
     machgate_shim_guest_operator_delete machgate_shim_guest_operator_delete_array \
     machgate_shim_guest_operator_delete_sized \
     machgate_shim_guest_operator_delete_array_sized \
@@ -38,6 +42,10 @@ for symbol in \
     machgate_shim_guest_operator_delete_array_aligned \
     machgate_shim_guest_operator_delete_sized_aligned \
     machgate_shim_guest_operator_delete_array_sized_aligned \
+    machgate_shim_guest_operator_delete_nothrow \
+    machgate_shim_guest_operator_delete_array_nothrow \
+    machgate_shim_guest_operator_delete_aligned_nothrow \
+    machgate_shim_guest_operator_delete_array_aligned_nothrow \
     _Znwm _Znam _ZnwmRKSt9nothrow_t _ZnamRKSt9nothrow_t \
     _ZnwmSt11align_val_t _ZnamSt11align_val_t \
     _ZnwmSt11align_val_tRKSt9nothrow_t _ZnamSt11align_val_tRKSt9nothrow_t \

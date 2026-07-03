@@ -477,9 +477,12 @@ assert lib.pthread_mutex_destroy(ctypes.byref(mutex)) == 0, 'pthread_mutex_destr
 assert timedwait_result == 60, f'pthread_cond_timedwait returned {timedwait_result}, expected Darwin ETIMEDOUT 60'
 
 GUEST_NEW = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t)
+GUEST_NEW_NOTHROW = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 GUEST_DELETE = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
 guest_delete_calls = ctypes.c_int(0)
+guest_new_nothrow_calls = ctypes.c_int(0)
 guest_new_backing = ctypes.c_void_p()
+guest_new_nothrow_backing = ctypes.c_void_p()
 guest_delete_observed_size = ctypes.c_size_t(0)
 
 @GUEST_NEW
@@ -487,18 +490,30 @@ def fake_guest_new(size):
     guest_new_backing.value = host_libc.malloc(size)
     return guest_new_backing.value
 
+@GUEST_NEW_NOTHROW
+def fake_guest_new_nothrow(size, nothrow_arg):
+    guest_new_nothrow_calls.value += 1
+    guest_new_nothrow_backing.value = host_libc.malloc(size)
+    return guest_new_nothrow_backing.value
+
 @GUEST_DELETE
 def fake_guest_delete(ptr):
     guest_delete_calls.value += 1
-    guest_delete_observed_size.value = lib.malloc_size(ptr)
+    if ptr == guest_new_backing.value:
+        guest_delete_observed_size.value = lib.malloc_size(ptr)
 
-lib.machgate_shim_set_guest_cxx_allocators.argtypes = [ctypes.c_void_p] * 12
+lib.machgate_shim_set_guest_cxx_allocators.argtypes = [ctypes.c_void_p] * 20
 lib.machgate_shim_guest_operator_new.argtypes = [ctypes.c_size_t]
 lib.machgate_shim_guest_operator_new.restype = ctypes.c_void_p
+lib.machgate_shim_guest_operator_new_nothrow.argtypes = [ctypes.c_size_t, ctypes.c_void_p]
+lib.machgate_shim_guest_operator_new_nothrow.restype = ctypes.c_void_p
 lib.machgate_shim_guest_operator_delete.argtypes = [ctypes.c_void_p]
+lib.machgate_shim_guest_operator_delete_array.argtypes = [ctypes.c_void_p]
 lib.machgate_shim_set_guest_cxx_allocators(
     ctypes.cast(fake_guest_new, ctypes.c_void_p), None, None, None,
     ctypes.cast(fake_guest_delete, ctypes.c_void_p), None, None, None,
+    None, None, None, None,
+    ctypes.cast(fake_guest_new_nothrow, ctypes.c_void_p), None, None, None,
     None, None, None, None)
 
 guest_bridge_ptr = lib.machgate_shim_guest_operator_new(72)
@@ -508,7 +523,23 @@ lib.machgate_shim_guest_operator_delete(guest_bridge_ptr)
 assert guest_delete_calls.value == 1, 'guest deleter was not called'
 assert guest_delete_observed_size.value >= 72, f'malloc_size inside guest deleter was {guest_delete_observed_size.value}, expected >= 72'
 assert lib.malloc_size(guest_bridge_ptr) >= 72, 'shim retired guest ownership after forwarding to guest deleter'
-lib.machgate_shim_set_guest_cxx_allocators(None, None, None, None, None, None, None, None, None, None, None, None)
+
+guest_bridge_nothrow_ptr = lib.machgate_shim_guest_operator_new_nothrow(80, None)
+assert guest_bridge_nothrow_ptr == guest_new_nothrow_backing.value, 'guest nothrow C++ bridge did not call fake guest nothrow allocation'
+assert guest_new_nothrow_calls.value == 1, 'guest nothrow allocator was not called'
+lib.machgate_shim_guest_operator_delete(guest_bridge_nothrow_ptr)
+assert guest_delete_calls.value == 2, 'guest deleter was not called for nothrow allocation'
+
+direct_guest_buffer = ctypes.create_string_buffer(96)
+direct_guest_ptr = ctypes.addressof(direct_guest_buffer)
+lib.machgate_shim_guest_operator_delete(direct_guest_ptr)
+assert guest_delete_calls.value == 3, 'unknown direct guest C++ pointer did not route to guest deleter'
+
+array_fallback_buffer = ctypes.create_string_buffer(104)
+array_fallback_ptr = ctypes.addressof(array_fallback_buffer)
+lib.machgate_shim_guest_operator_delete_array(array_fallback_ptr)
+assert guest_delete_calls.value == 4, 'array delete did not fall back to scalar guest deleter'
+lib.machgate_shim_set_guest_cxx_allocators(None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 print('All libsystem_shim symbol tests passed')
 "

@@ -1200,6 +1200,7 @@ struct macho_symbol_result {
 	uintptr_t addr;
 	uint8_t type;
 	uint16_t desc;
+	uint8_t sect;
 };
 
 static int lookup_macho_symbol_result(struct resolver_state* rs,
@@ -1252,6 +1253,7 @@ static int lookup_macho_symbol_result(struct resolver_state* rs,
 				result->addr = nl->n_value + rs->slide;
 				result->type = nl->n_type;
 				result->desc = nl->n_desc;
+				result->sect = nl->n_sect;
 			}
 			return 1;
 		}
@@ -1277,6 +1279,40 @@ static int macho_symbol_is_external_definition(const struct macho_symbol_result*
 	if (result->type & N_PEXT)
 		return 0;
 	return 1;
+}
+
+static uint32_t macho_section_flags(struct mach_header_64* mh, uint8_t section_ordinal)
+{
+	uint8_t* cmds;
+	uint32_t p = 0;
+	uint8_t ordinal = 1;
+
+	if (!mh || !section_ordinal)
+		return 0;
+
+	cmds = (uint8_t*)(mh + 1);
+	for (uint32_t i = 0; i < mh->ncmds && p < mh->sizeofcmds; i++) {
+		struct load_command* lc = (struct load_command*)&cmds[p];
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64* seg = (struct segment_command_64*)lc;
+			struct section_64* sect = (struct section_64*)(seg + 1);
+			for (uint32_t j = 0; j < seg->nsects; j++, sect++, ordinal++) {
+				if (ordinal == section_ordinal)
+					return sect->flags;
+			}
+		}
+		p += lc->cmdsize;
+	}
+
+	return 0;
+}
+
+static int macho_symbol_is_stub_definition(struct mach_header_64* mh,
+                                           const struct macho_symbol_result* result)
+{
+	if (!result)
+		return 0;
+	return (macho_section_flags(mh, result->sect) & SECTION_TYPE) == S_SYMBOL_STUBS;
 }
 
 static int elf_symbol_is_weak(void* addr)
@@ -1312,6 +1348,8 @@ static uintptr_t resolve_main_cxx_operator_override(struct resolver_state* rs,
 	if (!lookup_macho_symbol_result(rs, sym_name, &result))
 		return 0;
 	if (!macho_symbol_is_external_definition(&result))
+		return 0;
+	if (macho_symbol_is_stub_definition(rs->mh, &result))
 		return 0;
 
 	if (source_kind)
@@ -1349,6 +1387,23 @@ uintptr_t resolver_lookup_symbol(void* mh_ptr, uintptr_t slide, const char* name
 	rs.mh = (struct mach_header_64*)mh_ptr;
 	rs.slide = slide;
 	return lookup_macho_symbol(&rs, name);
+}
+
+uintptr_t resolver_lookup_external_definition(void* mh_ptr, uintptr_t slide,
+                                              const char* name)
+{
+	struct resolver_state rs = {0};
+	struct macho_symbol_result result;
+
+	rs.mh = (struct mach_header_64*)mh_ptr;
+	rs.slide = slide;
+	if (!lookup_macho_symbol_result(&rs, name, &result))
+		return 0;
+	if (!macho_symbol_is_external_definition(&result))
+		return 0;
+	if (macho_symbol_is_stub_definition(rs.mh, &result))
+		return 0;
+	return result.addr;
 }
 
 /* ---- Symbol extent (sorted N_SECT cache) ---- */

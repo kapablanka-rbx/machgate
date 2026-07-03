@@ -1,10 +1,10 @@
 # Allocator Regression Loop State
 
-Last updated: 2026-06-29
+Last updated: 2026-07-02
 
 ## Current Problem
 
-`Core.UnitTest` previously progressed much further through Catch2 execution, but recent allocator/C++ ownership changes regressed it to an early Catch2 `RunContext::assertionEnded` null active-testcase crash while reporting `Memory.cpp:884`.
+The private C++ test runner previously progressed much further through Catch2 execution, but recent allocator/C++ ownership changes regressed it to an early Catch2 `RunContext::assertionEnded` null active-testcase crash while reporting `Memory.cpp:884`.
 
 The failure must be treated as a generic Darwin allocator/libc++ contract problem. MachGate must not contain workload-specific symbols, names, strings, or special cases for private binaries.
 
@@ -78,10 +78,22 @@ The intended direction is:
   their defined behavior, normal dylib ordinals must try the declared mapped
   provider before MachGate compatibility hooks, and C++ allocator hooks are
   last-resort fallbacks only;
-- guest-defined C++ operators may win only through the normal Mach-O binding
-  rules; they must not be found by an allocator-specific shortcut before the
-  declared import provider is tried;
-- mapped native libraries should not bypass shim allocator ownership;
+- guest-defined C++ operators may win normal Mach-O import binds only through
+  provider-first resolver order;
+- bundled Apple-ABI libc++/libc++abi C++ operator wrappers may call the guest
+  executable's public `operator new/delete` definitions when present, but the
+  lookup must reject local, private-external, undefined, and stub-section
+  symbols and must try the Mach-O double-underscore C++ nlist spelling;
+- the guest C++ bridge covers throwing, nothrow, aligned, array, sized-delete,
+  and sized-aligned-delete operator variants that the bundled libc++ overlay
+  wraps. Nothrow overlay wrappers must not collapse to the throwing bridge when
+  a guest nothrow operator is present;
+- bundled Apple-ABI libc++/libc++abi delete wrappers must treat unknown C++
+  delete pointers as possible direct guest C++ allocations when a guest deleter
+  is configured. Known shim-owned allocation records remain shim-owned; bridge-
+  marked guest records and unknown C++ pointers route to the guest deleter;
+- bundled Apple-ABI libc++/libc++abi C malloc/free wrappers stay in shim
+  ownership and must not bypass shim allocator tracking;
 - when a shim guest-operator wrapper forwards to a guest deleter, the guest
   allocator owns both the free and its own accounting retirement; the shim
   ledger must not call `forget_allocation` on that path. The shim ledger only
@@ -89,7 +101,7 @@ The intended direction is:
 
 This direction passed local allocator-surface tests and the unified public
 ARM64 corpus, with the one public EH failure documented below. It still needs
-private `Core.UnitTest` validation before release.
+private C++ test-runner validation before release.
 
 ## 2026-06-28 ARM64 Validation Snapshot
 
@@ -122,9 +134,9 @@ Log roots:
 
 ## Required Next Steps
 
-1. Compare `Core.UnitTest` behavior against the public validation above.
-2. If `Core.UnitTest` still regresses while public corpora pass, isolate the private-only allocator path without adding workload-specific code.
-3. If bisecting recent allocator tags, use the single public manifest before attempting `Core.UnitTest` again.
+1. Compare private C++ test-runner behavior against the public validation above.
+2. If the private runner still regresses while public corpora pass, isolate the private-only allocator path without adding workload-specific code.
+3. If bisecting recent allocator tags, use the single public manifest before attempting the private runner again.
 4. Do not ship another release until the ARM64 external corpus signal is understood.
 
 ## 2026-06-29 Agent Review
@@ -292,3 +304,61 @@ This rule is intentionally generic. It uses symbol metadata only:
 - mapped native provider: weak ELF binding detected with `dladdr1(...,
   RTLD_DL_SYMENT)`;
 - affected imports: replaceable C++ operator new/delete families only.
+
+## 2026-07-02 Guest C++ Bridge Completion
+
+The allocator bridge must follow the Darwin/libc++ ownership contract without
+any private-workload switches:
+
+- mapped Apple-ABI libc++ and libc++abi C allocator wrappers stay shim-owned;
+- mapped Apple-ABI libc++ and libc++abi C++ operator wrappers route through the
+  guest C++ bridge when the main Mach-O exports real public operator
+  definitions;
+- guest operator lookup must reject local, private-external, undefined, debug,
+  and stub-section symbols;
+- guest operator lookup must try both the ordinary mangled name and Mach-O
+  double-underscore C++ nlist spelling;
+- bridge coverage includes throwing, nothrow, aligned, array, sized-delete, and
+  sized-aligned-delete variants;
+- unknown C++ delete pointers route to the guest deleter when a guest deleter is
+  configured, because direct guest `operator new` calls are not necessarily
+  visible to the shim ledger;
+- known shim-owned pointers remain shim-owned and are not forwarded to guest
+  delete;
+- array delete may fall back to scalar guest delete when the binary only exports
+  the scalar replacement.
+
+Build and release packaging also has an explicit artifact contract now:
+
+- `scripts/build-libcxx.sh` removes existing libc++ and libc++abi shared-library
+  outputs before invoking Ninja so a changed overlay object cannot leave stale
+  linked libraries behind;
+- the GitHub release workflow extracts the final tarball and runs the libc++
+  overlay validation against `machgate/lib` from that tarball before publishing
+  the checksum.
+
+Validation on 2026-07-02:
+
+```sh
+cmake --build build --parallel
+BUILD_DIR=/home/kapablanka/repos/machgate/build bash tests/test_libsystem_shim.sh
+MACHGATE_ROOT=/home/kapablanka/repos/machgate \
+  BUILD_DIR=/home/kapablanka/repos/machgate/build \
+  LIBCXX_DIR=/home/kapablanka/repos/machgate/build-libcxx/lib \
+  MACHGATE_REQUIRE_LIBCXX_OVERLAY=1 \
+  bash tests/test_libcxx_allocator_overlay.sh
+bash tests/test_allocator_export_surface.sh
+bash tests/test_guest_cxx_allocator_bridge_config.sh
+```
+
+All focused tests passed.
+
+ARM64 Docker unified public corpus:
+
+```sh
+docker run --rm --platform linux/arm64 -v "$PWD:/work" -w /work machgate-arm64-toolchain ...
+```
+
+- `tests/external/all_public_macho_cli_manifest.txt`: `53 / 53` passed.
+- A second pass rebuilt the final resolver object after the stub-rejection
+  guard and also completed `53 / 53` with `0` failures.

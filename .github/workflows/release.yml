@@ -86,6 +86,12 @@ jobs:
             '
           version="${RELEASE_TAG#v}"
           tar -C package/opt -czf "dist/machgate-${version}-linux-arm64.tar.gz" machgate
+          tmpdir="$(mktemp -d)"
+          tar -C "$tmpdir" -xzf "dist/machgate-${version}-linux-arm64.tar.gz"
+          MACHGATE_REQUIRE_LIBCXX_OVERLAY=1 \
+            LIBCXX_DIR="$tmpdir/machgate/lib" \
+            bash tests/test_libcxx_allocator_overlay.sh
+          rm -rf "$tmpdir"
           sha256sum "dist/machgate-${version}-linux-arm64.tar.gz" > "dist/machgate-${version}-linux-arm64.tar.gz.sha256"
 
       - name: Upload workflow artifact

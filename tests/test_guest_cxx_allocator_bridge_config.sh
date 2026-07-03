@@ -8,13 +8,23 @@ RESOLVER="$ROOT/src/resolver.c"
 
 bridge_calls="$(grep -Fc "configure_guest_cxx_allocator_hooks(&machgate_load_results)" "$MACHGATE_C" || true)"
 
-if [ "$bridge_calls" -ne 0 ]; then
-    echo "guest C++ allocator bridge must not be wired into Mach-O bootstrap" >&2
+if [ "$bridge_calls" -lt 2 ]; then
+    echo "guest C++ allocator bridge must be configured for mapped and standalone runs" >&2
     exit 1
 fi
 
-if grep -Fq "machgate_shim_guest_operator_" "$OVERLAY"; then
-    echo "native libc++ allocator overlay must not call guest C++ operator hooks" >&2
+if ! grep -Fq "machgate_shim_guest_operator_" "$OVERLAY"; then
+    echo "native libc++ allocator overlay must route C++ operators through guest bridge" >&2
+    exit 1
+fi
+
+if ! grep -Fq "resolver_lookup_external_definition" "$MACHGATE_C"; then
+    echo "guest C++ allocator bridge must bind only public main Mach-O definitions" >&2
+    exit 1
+fi
+
+if ! grep -Fq '"_%s", name' "$MACHGATE_C"; then
+    echo "guest C++ allocator bridge must try Mach-O double-underscore operator names" >&2
     exit 1
 fi
 
@@ -40,6 +50,16 @@ fi
 
 if ! grep -Eq 'chained-map-cxx-main-override|dyld-info-map-cxx-main-override|deferred-cxx-main-override' "$RESOLVER"; then
     echo "C++ allocator main-executable override guard is missing" >&2
+    exit 1
+fi
+
+if ! awk '
+    /static uintptr_t resolve_main_cxx_operator_override/ { in_helper = 1 }
+    in_helper && /macho_symbol_is_stub_definition/ { found = 1 }
+    in_helper && /^}/ { in_helper = 0 }
+    END { exit found ? 0 : 1 }
+' "$RESOLVER"; then
+    echo "C++ allocator main executable override must reject symbol stubs" >&2
     exit 1
 fi
 

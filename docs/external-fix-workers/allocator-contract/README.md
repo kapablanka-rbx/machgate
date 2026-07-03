@@ -1,6 +1,6 @@
 # Allocator Runtime Contract Audit
 
-Purpose: close the private C++ `Core.UnitTest` post-`_main` allocator failure generically, not one crash at a time.
+Purpose: close the private C++ post-`_main` allocator failure generically, not one crash at a time.
 
 Current private failure shape:
 
@@ -54,5 +54,5 @@ Verification completed:
 - native libc++ allocator overlay test passes
 - ARM64 Docker suite passes `31 / 31`
 
-Next external validation target: private `Core.UnitTest` with the next release
+Next external validation target: private C++ test runner with the next release
 tarball.

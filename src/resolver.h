@@ -28,6 +28,14 @@ int resolver_resolve_fixups(void* mh, uintptr_t slide, const char* map_file);
 uintptr_t resolver_lookup_symbol(void* mh, uintptr_t slide, const char* name);
 
 /*
+ * Look up a public section-defined symbol in a loaded Mach-O binary's nlist
+ * symbol table. Local, private-external, undefined, debug, and stub-section
+ * symbols are ignored.
+ */
+uintptr_t resolver_lookup_external_definition(void* mh, uintptr_t slide,
+                                               const char* name);
+
+/*
  * Find the slid memory extent of a named symbol.
  * On success sets *out_start to the symbol's slid address and *out_end to
  * the slid address of the next N_SECT symbol in the text (or the end of

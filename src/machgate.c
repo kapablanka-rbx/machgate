@@ -63,6 +63,7 @@ static void load_fat(int fd, cpu_type_t cpu, bool expect_dylinker, char** argv, 
 static void load(const char* path, cpu_type_t cpu, bool expect_dylinker, char** argv, struct load_results* lr);
 static void fixup_darwin_pthread_data(struct load_results* lr);
 static void fixup_darwin_libc_allocator_defaults(struct load_results* lr);
+static void configure_guest_cxx_allocator_hooks(struct load_results* lr);
 static void setup_tlv_image(struct load_results* lr);
 static int native_prot(int prot);
 static void setup_space(struct load_results* lr, bool is_64_bit);
@@ -1074,6 +1075,7 @@ int main(int argc, char** argv, char** envp)
 		if (machgate_load_results.mh) {
 			fixup_darwin_pthread_data(&machgate_load_results);
 			fixup_darwin_libc_allocator_defaults(&machgate_load_results);
+			configure_guest_cxx_allocator_hooks(&machgate_load_results);
 			setup_tlv_image(&machgate_load_results);
 			eh_frame_register_macho((void*)machgate_load_results.mh,
 			                        machgate_load_results.slide);
@@ -1091,6 +1093,7 @@ int main(int argc, char** argv, char** envp)
 	if (machgate_load_results.mh && !cfg.dylib_map) {
 		fixup_darwin_pthread_data(&machgate_load_results);
 		fixup_darwin_libc_allocator_defaults(&machgate_load_results);
+		configure_guest_cxx_allocator_hooks(&machgate_load_results);
 		setup_tlv_image(&machgate_load_results);
 		eh_frame_register_macho((void*)machgate_load_results.mh,
 		                        machgate_load_results.slide);
@@ -1581,6 +1584,106 @@ static void fixup_darwin_libc_allocator_defaults(struct load_results* lr)
 	if (fixed > 0)
 		fprintf(stderr, "machgate: initialized %d Darwin libc allocator defaults\n",
 		        fixed);
+}
+
+typedef void (*shim_set_guest_cxx_allocators_fn)(void*, void*, void*, void*,
+                                                 void*, void*, void*, void*,
+                                                 void*, void*, void*, void*,
+                                                 void*, void*, void*, void*,
+                                                 void*, void*, void*, void*);
+
+static void* lookup_guest_cxx_operator(struct load_results* lr, const char* name)
+{
+	uintptr_t addr =
+	    resolver_lookup_external_definition((void*)lr->mh, lr->slide, name);
+	char prefixed_name[128];
+
+	if (addr)
+		return (void*)addr;
+	if (!name || name[0] != '_' || name[1] == '_')
+		return NULL;
+	if (snprintf(prefixed_name, sizeof(prefixed_name), "_%s", name) >=
+	    (int)sizeof(prefixed_name))
+		return NULL;
+	addr = resolver_lookup_external_definition((void*)lr->mh, lr->slide,
+	                                           prefixed_name);
+	return addr ? (void*)addr : NULL;
+}
+
+static void configure_guest_cxx_allocator_hooks(struct load_results* lr)
+{
+	shim_set_guest_cxx_allocators_fn set_allocators =
+	    (shim_set_guest_cxx_allocators_fn)dlsym(RTLD_DEFAULT,
+	                                            "machgate_shim_set_guest_cxx_allocators");
+	if (!set_allocators || !lr || !lr->mh)
+		return;
+
+	void* operator_new_fn = lookup_guest_cxx_operator(lr, "_Znwm");
+	void* operator_new_array_fn = lookup_guest_cxx_operator(lr, "_Znam");
+	void* operator_new_aligned_fn =
+	    lookup_guest_cxx_operator(lr, "_ZnwmSt11align_val_t");
+	void* operator_new_array_aligned_fn =
+	    lookup_guest_cxx_operator(lr, "_ZnamSt11align_val_t");
+	void* operator_new_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZnwmRKSt9nothrow_t");
+	void* operator_new_array_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZnamRKSt9nothrow_t");
+	void* operator_new_aligned_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZnwmSt11align_val_tRKSt9nothrow_t");
+	void* operator_new_array_aligned_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZnamSt11align_val_tRKSt9nothrow_t");
+	void* operator_delete_fn = lookup_guest_cxx_operator(lr, "_ZdlPv");
+	void* operator_delete_array_fn = lookup_guest_cxx_operator(lr, "_ZdaPv");
+	void* operator_delete_sized_fn = lookup_guest_cxx_operator(lr, "_ZdlPvm");
+	void* operator_delete_array_sized_fn = lookup_guest_cxx_operator(lr, "_ZdaPvm");
+	void* operator_delete_aligned_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdlPvSt11align_val_t");
+	void* operator_delete_array_aligned_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdaPvSt11align_val_t");
+	void* operator_delete_sized_aligned_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdlPvmSt11align_val_t");
+	void* operator_delete_array_sized_aligned_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdaPvmSt11align_val_t");
+	void* operator_delete_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdlPvRKSt9nothrow_t");
+	void* operator_delete_array_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdaPvRKSt9nothrow_t");
+	void* operator_delete_aligned_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdlPvSt11align_val_tRKSt9nothrow_t");
+	void* operator_delete_array_aligned_nothrow_fn =
+	    lookup_guest_cxx_operator(lr, "_ZdaPvSt11align_val_tRKSt9nothrow_t");
+
+	if (!operator_new_fn && !operator_new_array_fn && !operator_new_aligned_fn &&
+	    !operator_new_array_aligned_fn && !operator_new_nothrow_fn &&
+	    !operator_new_array_nothrow_fn && !operator_new_aligned_nothrow_fn &&
+	    !operator_new_array_aligned_nothrow_fn && !operator_delete_fn &&
+	    !operator_delete_array_fn && !operator_delete_sized_fn &&
+	    !operator_delete_array_sized_fn && !operator_delete_aligned_fn &&
+	    !operator_delete_array_aligned_fn && !operator_delete_sized_aligned_fn &&
+	    !operator_delete_array_sized_aligned_fn && !operator_delete_nothrow_fn &&
+	    !operator_delete_array_nothrow_fn && !operator_delete_aligned_nothrow_fn &&
+	    !operator_delete_array_aligned_nothrow_fn)
+		return;
+
+	set_allocators(operator_new_fn, operator_new_array_fn, operator_new_aligned_fn,
+	               operator_new_array_aligned_fn, operator_delete_fn,
+	               operator_delete_array_fn, operator_delete_sized_fn,
+	               operator_delete_array_sized_fn, operator_delete_aligned_fn,
+	               operator_delete_array_aligned_fn,
+	               operator_delete_sized_aligned_fn,
+	               operator_delete_array_sized_aligned_fn,
+	               operator_new_nothrow_fn, operator_new_array_nothrow_fn,
+	               operator_new_aligned_nothrow_fn,
+	               operator_new_array_aligned_nothrow_fn,
+	               operator_delete_nothrow_fn,
+	               operator_delete_array_nothrow_fn,
+	               operator_delete_aligned_nothrow_fn,
+	               operator_delete_array_aligned_nothrow_fn);
+
+	if (machgate_verbose)
+		fprintf(stderr,
+		        "machgate: configured guest C++ allocator bridge new=%p delete=%p\n",
+		        operator_new_fn, operator_delete_fn);
 }
 
 /*
