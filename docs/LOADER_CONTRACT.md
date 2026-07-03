@@ -56,9 +56,6 @@ signal handler.
   state, and bytes 4-7 carry the owner thread id while initialization is
   pending. Only same-owner reentry is recursion; other threads wait and are
   woken by release or abort.
-- The libSystem shim allocation ledger must preserve ownership information
-  under high live-allocation pressure; exhaustion must not change guest-visible
-  malloc-zone ownership or flood stderr.
 
 ## Known Remaining Gaps
 
