@@ -9,39 +9,10 @@ BUILD_DIR="${BUILD_DIR:-$MACHGATE_ROOT/build}"
 
 # Test that the .so loads without errors
 BUILD_DIR="$BUILD_DIR" LD_LIBRARY_PATH="$BUILD_DIR" python3 -c "
-import ctypes, sys, os, threading, time
+import ctypes, sys, os, subprocess, threading, time
 
 build_dir = os.environ['BUILD_DIR']
 lib = ctypes.CDLL(os.path.join(build_dir, 'libsystem_shim.so'))
-
-lib.__cxa_guard_acquire.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
-lib.__cxa_guard_acquire.restype = ctypes.c_int
-lib.__cxa_guard_release.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
-lib.__cxa_guard_abort.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
-
-guard = ctypes.c_uint64(0)
-assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1, 'first guard acquire should run initializer'
-
-guard_result = []
-
-def acquire_contended_guard():
-    guard_result.append(lib.__cxa_guard_acquire(ctypes.byref(guard)))
-
-guard_thread = threading.Thread(target=acquire_contended_guard)
-guard_thread.start()
-time.sleep(0.05)
-assert guard_thread.is_alive(), 'contended guard acquire returned before release'
-lib.__cxa_guard_release(ctypes.byref(guard))
-guard_thread.join(1.0)
-assert not guard_thread.is_alive(), 'contended guard acquire did not wake after release'
-assert guard_result == [0], f'contended guard acquire result {guard_result}, expected [0]'
-assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'released guard should be initialized'
-
-abort_guard = ctypes.c_uint64(0)
-assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, 'abort guard first acquire should run initializer'
-lib.__cxa_guard_abort(ctypes.byref(abort_guard))
-assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, 'aborted guard should be acquirable again'
-lib.__cxa_guard_release(ctypes.byref(abort_guard))
 
 # mach_absolute_time should return a nonzero nanosecond timestamp
 lib.mach_absolute_time.restype = ctypes.c_uint64
@@ -62,6 +33,49 @@ assert info.denom == 1, f'timebase denom={info.denom}, expected 1'
 lib.__error.restype = ctypes.POINTER(ctypes.c_int)
 p = lib.__error()
 assert p, '__error returned NULL'
+
+lib.__cxa_guard_acquire.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+lib.__cxa_guard_acquire.restype = ctypes.c_int
+lib.__cxa_guard_release.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+lib.__cxa_guard_abort.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+
+guard = ctypes.c_uint64(0)
+assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1, '__cxa_guard_acquire did not request initialization'
+assert ((guard.value >> 8) & 0xff) & 0x02, f'guard pending byte not set: {guard.value:#x}'
+contended_result = []
+
+def contend_guard():
+    contended_result.append(lib.__cxa_guard_acquire(ctypes.byref(guard)))
+
+thread = threading.Thread(target=contend_guard)
+thread.start()
+time.sleep(0.05)
+assert thread.is_alive(), 'contended __cxa_guard_acquire returned before release'
+lib.__cxa_guard_release(ctypes.byref(guard))
+thread.join(2.0)
+assert not thread.is_alive(), 'contended __cxa_guard_acquire did not wake after release'
+assert contended_result == [0], f'contended __cxa_guard_acquire result={contended_result}, expected [0]'
+assert guard.value & 0x01, f'guard complete byte not set after release: {guard.value:#x}'
+
+abort_guard = ctypes.c_uint64(0)
+assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, '__cxa_guard_acquire failed for abort guard'
+lib.__cxa_guard_abort(ctypes.byref(abort_guard))
+assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, '__cxa_guard_abort did not reset pending state'
+lib.__cxa_guard_release(ctypes.byref(abort_guard))
+
+recursive_script = '''
+import ctypes, os
+lib = ctypes.CDLL(os.path.join(os.environ['BUILD_DIR'], 'libsystem_shim.so'))
+lib.__cxa_guard_acquire.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+lib.__cxa_guard_acquire.restype = ctypes.c_int
+guard = ctypes.c_uint64(0)
+assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1
+lib.__cxa_guard_acquire(ctypes.byref(guard))
+'''
+recursive = subprocess.run([sys.executable, '-c', recursive_script],
+                           env=os.environ.copy(), capture_output=True, text=True)
+assert recursive.returncode != 0, 'same-thread recursive __cxa_guard_acquire did not abort'
+assert 'recursive __cxa_guard_acquire' in recursive.stderr, recursive.stderr
 
 # __sincosf_stret should compute sin/cos correctly
 class Float2(ctypes.Structure):
