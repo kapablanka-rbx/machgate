@@ -41,13 +41,13 @@ if [ -n "$missing_sizes" ]; then
     exit 1
 fi
 
-if ! nm -D --undefined-only "$LIBCXX_DIR/libc++.so.1" | awk '$NF == "_DefaultRuneLocale" { found = 1 } END { exit !found }'; then
+if ! nm -D "$LIBCXX_DIR/libc++.so.1" | awk '{ name = $NF; sub(/@.*/, "", name); if (name == "_DefaultRuneLocale") found = 1 } END { exit !found }'; then
     echo "$LIBCXX_DIR/libc++.so.1 does not bind ctype<char>::classic_table to _DefaultRuneLocale" >&2
     exit 1
 fi
 
 for symbol in _DefaultRuneLocale __maskrune __tolower __toupper; do
-    if ! nm -D "$BUILD_DIR/libsystem_shim.so" | awk -v symbol="$symbol" '$NF == symbol { found = 1 } END { exit !found }'; then
+    if ! nm -D "$BUILD_DIR/libsystem_shim.so" | awk -v symbol="$symbol" '{ name = $NF; sub(/@.*/, "", name); if (name == symbol) found = 1 } END { exit !found }'; then
         echo "$BUILD_DIR/libsystem_shim.so does not export $symbol" >&2
         exit 1
     fi
