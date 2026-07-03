@@ -6735,6 +6735,114 @@ static __thread void *darwin_tsd_values[DARWIN_TSD_KEY_COUNT];
 static pthread_t machgate_main_pthread;
 static int machgate_main_pthread_set;
 
+#define PTHREAD_ID_SLOT_COUNT 2048
+
+struct pthread_id_slot {
+	int used;
+	pthread_t thread;
+	uint32_t tid;
+	uint64_t identity;
+};
+
+struct shim_thread_start_context {
+	void* (*start_routine)(void*);
+	void* arg;
+	size_t map_size;
+};
+
+static struct pthread_id_slot pthread_id_slots[PTHREAD_ID_SLOT_COUNT];
+static volatile int pthread_id_slots_lock;
+static uint64_t pthread_next_identity = 1;
+
+static void lock_pthread_id_slots(void)
+{
+	while (__sync_lock_test_and_set(&pthread_id_slots_lock, 1))
+		sched_yield();
+}
+
+static void unlock_pthread_id_slots(void)
+{
+	__sync_lock_release(&pthread_id_slots_lock);
+}
+
+static uint64_t next_pthread_identity_unlocked(void)
+{
+	uint64_t result = pthread_next_identity++;
+	if (!result)
+		result = pthread_next_identity++;
+	return result;
+}
+
+static struct pthread_id_slot* find_pthread_id_slot_unlocked(pthread_t thread)
+{
+	for (int i = 0; i < PTHREAD_ID_SLOT_COUNT; i++) {
+		if (pthread_id_slots[i].used &&
+		    pthread_equal(pthread_id_slots[i].thread, thread))
+			return &pthread_id_slots[i];
+	}
+	return NULL;
+}
+
+static struct pthread_id_slot* alloc_pthread_id_slot_unlocked(pthread_t thread)
+{
+	struct pthread_id_slot* slot = find_pthread_id_slot_unlocked(thread);
+	if (slot)
+		return slot;
+
+	for (int i = 0; i < PTHREAD_ID_SLOT_COUNT; i++) {
+		if (!pthread_id_slots[i].used) {
+			pthread_id_slots[i].used = 1;
+			pthread_id_slots[i].thread = thread;
+			pthread_id_slots[i].identity = next_pthread_identity_unlocked();
+			return &pthread_id_slots[i];
+		}
+	}
+	return NULL;
+}
+
+static uint64_t register_current_pthread_identity(void)
+{
+	pthread_t thread = pthread_self();
+	uint32_t tid = (uint32_t)syscall(SYS_gettid);
+	uint64_t result;
+
+	lock_pthread_id_slots();
+	struct pthread_id_slot* slot = alloc_pthread_id_slot_unlocked(thread);
+	if (slot) {
+		slot->tid = tid;
+		result = slot->identity;
+	} else
+		result = tid;
+	unlock_pthread_id_slots();
+	return result;
+}
+
+static uint64_t pthread_identity_for_thread(pthread_t thread)
+{
+	uint64_t result;
+
+	if (!thread || pthread_equal(thread, pthread_self()))
+		return register_current_pthread_identity();
+
+	lock_pthread_id_slots();
+	struct pthread_id_slot* slot = alloc_pthread_id_slot_unlocked(thread);
+	if (slot)
+		result = slot->identity;
+	else
+		result = (uint64_t)(uintptr_t)thread;
+	unlock_pthread_id_slots();
+	return result;
+}
+
+static void forget_pthread_identity(pthread_t thread)
+{
+	lock_pthread_id_slots();
+	struct pthread_id_slot* slot = find_pthread_id_slot_unlocked(thread);
+	if (slot)
+		memset(slot, 0, sizeof(*slot));
+	unlock_pthread_id_slots();
+}
+
 static inline uintptr_t *darwin_tsd_mirror_base(void)
 {
 #if defined(__aarch64__)
@@ -6775,6 +6883,7 @@ static void init_pthread_wrappers(void)
 	real_pthread_rwlock_unlock = dlsym(RTLD_NEXT, "pthread_rwlock_unlock");
 	machgate_main_pthread = pthread_self();
 	machgate_main_pthread_set = 1;
+	register_current_pthread_identity();
 	get_fake_home();
 
 	if (!real_pthread_mutex_lock)
@@ -7731,22 +7840,82 @@ int pthread_attr_setdetachstate(pthread_attr_t* attr, int detach_state)
 	return real_pthread_attr_setdetachstate(slot ? &slot->native : attr, linux_state);
 }
 
+static struct shim_thread_start_context* alloc_thread_start_context(
+	void* (*start_routine)(void*), void* arg)
+{
+	size_t map_size = 4096;
+	struct shim_thread_start_context* context =
+		(struct shim_thread_start_context*)syscall(
+			SYS_mmap, NULL, map_size, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (context == MAP_FAILED)
+		return NULL;
+	context->start_routine = start_routine;
+	context->arg = arg;
+	context->map_size = map_size;
+	return context;
+}
+
+static void free_thread_start_context(struct shim_thread_start_context* context)
+{
+	if (context)
+		syscall(SYS_munmap, context, context->map_size);
+}
+
+static void* shim_pthread_start(void* raw_context)
+{
+	struct shim_thread_start_context* context =
+		(struct shim_thread_start_context*)raw_context;
+	void* (*start_routine)(void*) = context->start_routine;
+	void* arg = context->arg;
+
+	register_current_pthread_identity();
+	free_thread_start_context(context);
+	return start_routine(arg);
+}
+
 int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                    void* (*start_routine)(void*), void* arg)
 {
 	static int (*real_pthread_create)(pthread_t*, const pthread_attr_t*,
 	                                  void* (*)(void*), void*) = NULL;
 	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
+	struct shim_thread_start_context* context;
+	int result;
 
 	if (!real_pthread_create)
 		real_pthread_create = dlsym(RTLD_NEXT, "pthread_create");
 	if (!real_pthread_create)
 		return ENOSYS;
+	context = alloc_thread_start_context(start_routine, arg);
+	if (!context)
+		return EAGAIN;
 	if (shim_trace_enabled())
 		fprintf(stderr, "libsystem_shim: pthread_create(start=%p arg=%p attr=%p native=%p)\n",
 		        start_routine, arg, attr, slot ? (void*)&slot->native : NULL);
-	return real_pthread_create(thread, slot ? &slot->native : attr,
-	                           start_routine, arg);
+	result = real_pthread_create(thread, slot ? &slot->native : attr,
+	                             shim_pthread_start, context);
+	if (result != 0) {
+		free_thread_start_context(context);
+		return result;
+	}
+	pthread_identity_for_thread(*thread);
+	return 0;
+}
+
+int pthread_join(pthread_t thread, void** value_ptr)
+{
+	static int (*real_pthread_join)(pthread_t, void**) = NULL;
+
+	if (!real_pthread_join)
+		real_pthread_join = dlsym(RTLD_NEXT, "pthread_join");
+	if (!real_pthread_join)
+		return ENOSYS;
+	int result = real_pthread_join(thread, value_ptr);
+	if (result == 0)
+		forget_pthread_identity(thread);
+	return result;
 }
 
 int pthread_kill(pthread_t thread, int signum)
@@ -8517,16 +8686,14 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
  * We return the Linux TID as a reasonable approximation. */
 uint32_t pthread_mach_thread_np(pthread_t thread)
 {
-	(void)thread;
-	return (uint32_t)syscall(SYS_gettid);
+	return (uint32_t)pthread_identity_for_thread(thread);
 }
 
 /* pthread_threadid_np — get a unique 64-bit thread ID */
 int pthread_threadid_np(pthread_t thread, uint64_t *thread_id)
 {
-	(void)thread;
 	if (!thread_id) return EINVAL;
-	*thread_id = (uint64_t)syscall(SYS_gettid);
+	*thread_id = pthread_identity_for_thread(thread);
 	if (shim_trace_enabled())
 		fprintf(stderr, "libsystem_shim: pthread_threadid_np -> %llu\n",
 		        (unsigned long long)*thread_id);
@@ -9916,7 +10083,7 @@ static int ulock_result(int result, uint32_t operation)
 	if (result == 0)
 		return 0;
 	if (operation & DARWIN_ULF_NO_ERRNO)
-		return -errno;
+		return -shim_errno_from_linux(errno ? errno : EIO);
 	return -1;
 }
 

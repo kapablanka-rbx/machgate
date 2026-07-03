@@ -20,6 +20,7 @@ GLIBC_2.17 {
         pthread_rwlock_wrlock;
         pthread_rwlock_unlock;
         pthread_create;
+        pthread_join;
         pthread_once;
         pthread_mach_thread_np;
         pthread_threadid_np;

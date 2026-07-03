@@ -83,6 +83,59 @@ lib.__cxa_guard_abort(ctypes.byref(abort_guard))
 assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, '__cxa_guard_abort did not reset pending state'
 lib.__cxa_guard_release(ctypes.byref(abort_guard))
 
+pthread_t = ctypes.c_ulong
+PTHREAD_START = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)
+lib.pthread_create.argtypes = [ctypes.POINTER(pthread_t), ctypes.c_void_p, PTHREAD_START, ctypes.c_void_p]
+lib.pthread_create.restype = ctypes.c_int
+lib.pthread_threadid_np.argtypes = [pthread_t, ctypes.POINTER(ctypes.c_uint64)]
+lib.pthread_threadid_np.restype = ctypes.c_int
+lib.pthread_mach_thread_np.argtypes = [pthread_t]
+lib.pthread_mach_thread_np.restype = ctypes.c_uint32
+lib.pthread_join.argtypes = [pthread_t, ctypes.POINTER(ctypes.c_void_p)]
+lib.pthread_join.restype = ctypes.c_int
+parent_thread_id = ctypes.c_uint64()
+assert lib.pthread_threadid_np(pthread_t(0), ctypes.byref(parent_thread_id)) == 0
+child_thread_id = ctypes.c_uint64()
+child_registered = threading.Event()
+
+@PTHREAD_START
+def pthread_identity_start(arg):
+    assert lib.pthread_threadid_np(pthread_t(0), ctypes.byref(child_thread_id)) == 0
+    child_registered.set()
+    return None
+
+child_thread = pthread_t()
+assert lib.pthread_create(ctypes.byref(child_thread), None, pthread_identity_start, None) == 0
+initial_child_id = ctypes.c_uint64()
+assert lib.pthread_threadid_np(child_thread, ctypes.byref(initial_child_id)) == 0
+assert child_registered.wait(1.0), 'child pthread identity was not registered'
+queried_child_id = ctypes.c_uint64()
+assert lib.pthread_threadid_np(child_thread, ctypes.byref(queried_child_id)) == 0
+assert lib.pthread_mach_thread_np(child_thread) == (child_thread_id.value & 0xffffffff), (
+    'pthread_mach_thread_np(child) did not preserve child identity'
+)
+retval = ctypes.c_void_p()
+assert lib.pthread_join(child_thread, ctypes.byref(retval)) == 0
+assert initial_child_id.value == queried_child_id.value, (
+    f'pthread_threadid_np(child) changed from {initial_child_id.value} to {queried_child_id.value}'
+)
+assert queried_child_id.value == child_thread_id.value, (
+    f'pthread_threadid_np(child)={queried_child_id.value}, expected {child_thread_id.value}'
+)
+assert queried_child_id.value != parent_thread_id.value, 'child pthread_t resolved to parent thread id'
+
+lib.__ulock_wait2.argtypes = [
+    ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64
+]
+lib.__ulock_wait2.restype = ctypes.c_int
+DARWIN_UL_COMPARE_AND_WAIT = 1
+DARWIN_ULF_NO_ERRNO = 0x01000000
+ulock_word = ctypes.c_uint32(1)
+assert lib.__ulock_wait2(
+    DARWIN_UL_COMPARE_AND_WAIT | DARWIN_ULF_NO_ERRNO,
+    ctypes.byref(ulock_word), 2, 0, 0
+) == -35, '__ulock_wait2 did not return negative Darwin EAGAIN in no-errno mode'
+
 # __sincosf_stret should compute sin/cos correctly
 class Float2(ctypes.Structure):
     _fields_ = [('sinval', ctypes.c_float), ('cosval', ctypes.c_float)]

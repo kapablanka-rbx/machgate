@@ -237,6 +237,7 @@ struct darwin_rusage_range_400_plus {
 #define DARWIN_UL_COMPARE_AND_WAIT64_SHARED 6
 #define DARWIN_UL_OPCODE_MASK               0x000000ffu
 #define DARWIN_ULF_WAKE_ALL                 0x00000100u
+#define DARWIN_ULF_NO_ERRNO                 0x01000000u
 #define DARWIN_ULF_DEADLINE                 0x02000000u
 
 #define DARWIN_MEMORYSTATUS_CMD_GET_PRESSURE_STATUS     4
@@ -850,6 +851,16 @@ static int linux_errno_to_darwin(int err)
 static void set_errno_failure(struct syscall_gate_state* state)
 {
 	set_failure(state, linux_errno_to_darwin(errno ? errno : EIO));
+}
+
+static void set_ulock_error(struct syscall_gate_state* state,
+                            uint32_t operation, int linux_errno)
+{
+	int darwin_errno = linux_errno_to_darwin(linux_errno ? linux_errno : EIO);
+	if (operation & DARWIN_ULF_NO_ERRNO)
+		set_success(state, (uint64_t)(-(int64_t)darwin_errno));
+	else
+		set_failure(state, darwin_errno);
 }
 
 static int fd_is_valid(int fd);
@@ -3840,13 +3851,13 @@ static void dispatch_ulock_wait(struct syscall_gate_state* state)
 	struct timespec* timeout_ptr = NULL;
 
 	if (!address) {
-		set_failure(state, DARWIN_EFAULT);
+		set_ulock_error(state, operation, EFAULT);
 		return;
 	}
 
 	if (ulock_is_64bit_operation(operation)) {
 		if (*(uint64_t*)address != value) {
-			set_failure(state, linux_errno_to_darwin(EAGAIN));
+			set_ulock_error(state, operation, EAGAIN);
 			return;
 		}
 		set_deferred_enosys(state);
@@ -3854,7 +3865,7 @@ static void dispatch_ulock_wait(struct syscall_gate_state* state)
 	}
 
 	if (!ulock_is_32bit_operation(operation)) {
-		set_failure(state, DARWIN_EINVAL);
+		set_ulock_error(state, operation, EINVAL);
 		return;
 	}
 
@@ -3868,7 +3879,7 @@ static void dispatch_ulock_wait(struct syscall_gate_state* state)
 	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT_PRIVATE,
 	                      (uint32_t)value, timeout_ptr, NULL, 0);
 	if (result < 0) {
-		set_errno_failure(state);
+		set_ulock_error(state, operation, errno);
 		return;
 	}
 	set_success(state, 0);
@@ -3898,13 +3909,13 @@ static void dispatch_ulock_wait2(struct syscall_gate_state* state)
 	}
 
 	if (!address) {
-		set_failure(state, DARWIN_EFAULT);
+		set_ulock_error(state, operation, EFAULT);
 		return;
 	}
 
 	if (ulock_is_64bit_operation(operation)) {
 		if (*(uint64_t*)address != value) {
-			set_failure(state, linux_errno_to_darwin(EAGAIN));
+			set_ulock_error(state, operation, EAGAIN);
 			return;
 		}
 		set_deferred_enosys(state);
@@ -3912,7 +3923,7 @@ static void dispatch_ulock_wait2(struct syscall_gate_state* state)
 	}
 
 	if (!ulock_is_32bit_operation(operation)) {
-		set_failure(state, DARWIN_EINVAL);
+		set_ulock_error(state, operation, EINVAL);
 		return;
 	}
 
@@ -3926,7 +3937,7 @@ static void dispatch_ulock_wait2(struct syscall_gate_state* state)
 	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT_PRIVATE,
 	                      (uint32_t)value, timeout_ptr, NULL, 0);
 	if (result < 0) {
-		set_errno_failure(state);
+		set_ulock_error(state, operation, errno);
 		return;
 	}
 	set_success(state, 0);
@@ -3942,13 +3953,13 @@ static void dispatch_ulock_wake(struct syscall_gate_state* state)
 	int wake_count = (operation & DARWIN_ULF_WAKE_ALL) ? INT_MAX : 1;
 
 	if (!address) {
-		set_failure(state, DARWIN_EFAULT);
+		set_ulock_error(state, operation, EFAULT);
 		return;
 	}
 
 	if (!ulock_is_32bit_operation(operation) &&
 	    !ulock_is_64bit_operation(operation)) {
-		set_failure(state, DARWIN_EINVAL);
+		set_ulock_error(state, operation, EINVAL);
 		return;
 	}
 
@@ -3957,7 +3968,7 @@ static void dispatch_ulock_wake(struct syscall_gate_state* state)
 	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAKE_PRIVATE,
 	                      wake_count, NULL, NULL, 0);
 	if (result < 0) {
-		set_errno_failure(state);
+		set_ulock_error(state, operation, errno);
 		return;
 	}
 	set_success(state, 0);
