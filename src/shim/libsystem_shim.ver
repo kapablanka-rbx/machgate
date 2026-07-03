@@ -45,6 +45,10 @@ GLIBC_2.17 {
         freeaddrinfo;
         gai_strerror;
         strerror_r;
+        _DefaultRuneLocale;
+        __maskrune;
+        __tolower;
+        __toupper;
         __fpclassifyd;
         getaddrinfo;
         __CFConstantStringClassReference;

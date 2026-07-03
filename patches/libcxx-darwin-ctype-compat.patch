@@ -1,0 +1,43 @@
+diff --git a/libcxx/include/__config b/libcxx/include/__config
+index c97cbae96f..e599f4380d 100644
+--- a/libcxx/include/__config
++++ b/libcxx/include/__config
+@@ -755 +755 @@ _LIBCPP_BEGIN_NAMESPACE_STD _LIBCPP_END_NAMESPACE_STD
+-#  if defined(__APPLE__) || defined(__FreeBSD__)
++#  if defined(__APPLE__) || defined(__FreeBSD__) || defined(_LIBCPP_ABI_DARWIN_CTYPE_COMPAT)
+diff --git a/libcxx/include/__locale b/libcxx/include/__locale
+index 40f9a3ff57..19f8b8ebd4 100644
+--- a/libcxx/include/__locale
++++ b/libcxx/include/__locale
+@@ -423,0 +424,13 @@ public:
++#elif defined(_LIBCPP_ABI_DARWIN_CTYPE_COMPAT)
++    typedef __uint32_t mask;
++    static const mask space  = 0x00004000;
++    static const mask print  = 0x00040000;
++    static const mask cntrl  = 0x00000200;
++    static const mask upper  = 0x00008000;
++    static const mask lower  = 0x00001000;
++    static const mask alpha  = 0x00000100;
++    static const mask digit  = 0x00000400;
++    static const mask punct  = 0x00002000;
++    static const mask xdigit = 0x00010000;
++    static const mask blank  = 0x00020000;
++    static const mask __regex_word = 0x80;
+diff --git a/libcxx/src/locale.cpp b/libcxx/src/locale.cpp
+index 6b454274e1..a0b0c52c17 100644
+--- a/libcxx/src/locale.cpp
++++ b/libcxx/src/locale.cpp
+@@ -55,0 +56,10 @@ _LIBCPP_PUSH_MACROS
++#if defined(_LIBCPP_ABI_DARWIN_CTYPE_COMPAT)
++struct _RuneLocale {
++    char __pad[60];
++    unsigned int __runetype[256];
++    int __maplower[256];
++    int __mapupper[256];
++};
++extern "C" _RuneLocale _DefaultRuneLocale;
++#endif
++
+@@ -1193 +1203 @@ ctype<char>::classic_table() noexcept
+-#if defined(__APPLE__) || defined(__FreeBSD__)
++#if defined(_LIBCPP_ABI_DARWIN_CTYPE_COMPAT) || defined(__APPLE__) || defined(__FreeBSD__)

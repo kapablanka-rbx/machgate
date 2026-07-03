@@ -56,6 +56,12 @@ signal handler.
   4-7 carry the initializing owner thread id. Same-owner recursive acquisition
   aborts; other-owner pending acquisition waits for release or abort, with a
   bounded stall abort so the runtime fails loudly instead of wedging forever.
+- The mapped libc++ runtime must use the Darwin ctype ABI for macOS-built C++
+  code: `std::ctype_base::mask` is 32-bit, class masks use Darwin `_CTYPE_*`
+  values, and `std::ctype<char>::classic_table()` reads
+  `_DefaultRuneLocale.__runetype` from `libsystem_shim.so`. This protects
+  inlined `std::regex` and locale code from mixing Apple headers with glibc
+  ctype tables.
 
 ## Known Remaining Gaps
 

@@ -50,8 +50,14 @@ else
 fi
 
 # Verify this checkout has the Darwin ABI compatibility patches.
+if ! grep -q "_LIBCPP_ABI_DARWIN_CTYPE_COMPAT" "$SRC_DIR/libcxx/include/__locale"; then
+    echo "Applying Darwin ctype compatibility libc++ patch..."
+    git -C "$SRC_DIR" apply --unidiff-zero "$PWD/patches/libcxx-darwin-ctype-compat.patch"
+fi
+
 if ! grep -q "_LIBCPP_ABI_DARWIN_MBSTATE_COMPAT" "$SRC_DIR/libcxx/include/__ios/fpos.h" ||
-   ! grep -q "_LIBCPP_DARWIN_MUTEX_SIZE" "$SRC_DIR/libcxx/include/__threading_support"; then
+   ! grep -q "_LIBCPP_DARWIN_MUTEX_SIZE" "$SRC_DIR/libcxx/include/__threading_support" ||
+   ! grep -q "_LIBCPP_ABI_DARWIN_CTYPE_COMPAT" "$SRC_DIR/libcxx/include/__locale"; then
     echo "Error: $SRC_DIR does not have the Darwin ABI compatibility libc++ patches"
     echo "Run: git submodule update --init extern/llvm-project"
     exit 1
@@ -108,7 +114,7 @@ cmake -G Ninja -S "$SRC_DIR/runtimes" -B "$BUILD_DIR" \
     -DCMAKE_C_COMPILER="$CC_TO_USE" \
     -DCMAKE_CXX_COMPILER="$CXX_TO_USE" \
     -DLIBCXX_ABI_VERSION=1 \
-    -DLIBCXX_ABI_DEFINES="_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT;_LIBCPP_ABI_DARWIN_MBSTATE_COMPAT" \
+    -DLIBCXX_ABI_DEFINES="_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT;_LIBCPP_ABI_DARWIN_MBSTATE_COMPAT;_LIBCPP_ABI_DARWIN_CTYPE_COMPAT" \
     -DLIBCXX_ENABLE_SHARED=ON \
     -DLIBCXX_ENABLE_STATIC=OFF \
     -DLIBCXX_INCLUDE_TESTS=OFF \
