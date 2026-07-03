@@ -4,7 +4,7 @@ set -euo pipefail
 usage()
 {
     cat >&2 <<'EOF'
-Usage: scripts/run-macho-docker.sh /path/to/macos-arm64-binary [args...]
+Usage: bin/run-macho-docker.sh /path/to/macos-arm64-binary [args...]
 
 Runs an ARM64 macOS Mach-O CLI binary through the published MachGate release
 inside an ARM64 Ubuntu Docker container. Works on ARM64 hosts and on Intel

@@ -24,7 +24,7 @@ and uploads both as GitHub release assets through
 `softprops/action-gh-release`.
 
 Local `dist/` artifacts are only smoke-test inputs. They are not downloadable by
-the user through `scripts/run-macho-docker.sh` unless they are uploaded by the
+the user through `bin/run-macho-docker.sh` unless they are uploaded by the
 GitHub release workflow.
 
 Do not make the user poll for release status. After pushing the version tag,

@@ -1014,7 +1014,7 @@ The same run also showed:
 - The resolver ended with `3380 failed` binds.
 
 For this C++ workload, the next diagnostic run must use an updated
-`scripts/run-macho-docker.sh` plus an Apple-ABI libc++ mapping:
+`bin/run-macho-docker.sh` plus an Apple-ABI libc++ mapping:
 
 ```bash
 MACHGATE_TRACE_CXX_INIT=1 \
@@ -1024,7 +1024,7 @@ MACHGATE_VERBOSE=1 \
 MACHGATE_TIMEOUT=120 \
 MACHGATE_LIBCXX=/home/kapablanka/repos/machgate/build-libcxx/lib/libc++.so.1 \
 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz \
-scripts/run-macho-docker.sh /path/to/Core.UnitTest
+bin/run-macho-docker.sh /path/to/Core.UnitTest
 ```
 
 The runner now passes every `MACHGATE_TRACE_*` variable through dynamically and
@@ -1352,7 +1352,7 @@ MACHGATE_TRACE_ALLOC_SIZE=72 \
 MACHGATE_TRACE_SIGNALS=1 \
 MACHGATE_VERBOSE=1 \
 MACHGATE_TARBALL=/path/to/machgate-next-linux-arm64.tar.gz \
-scripts/run-macho-docker.sh /path/to/Core.UnitTest
+bin/run-macho-docker.sh /path/to/Core.UnitTest
 ```
 
 `MACHGATE_TRACE_ALLOC_MISMATCH=1` is not size-specific. It dumps the recent

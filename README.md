@@ -203,21 +203,21 @@ does not have ARM64 binfmt/QEMU execution registered yet. Run the same
 Run the published release against a local ARM64 macOS CLI binary:
 
 ```bash
-scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 By default the script downloads the latest GitHub release. To pin a specific
 release:
 
 ```bash
-MACHGATE_VERSION=0.3.17 scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_VERSION=0.3.17 bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 To run with a local Linux ARM64 MachGate build or unpacked release instead of
 downloading from GitHub:
 
 ```bash
-MACHGATE_LOCAL_DIR=/path/to/machgate-arm64-dir scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_LOCAL_DIR=/path/to/machgate-arm64-dir bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 `MACHGATE_LOCAL_DIR` may point to an unpacked release directory containing
@@ -227,20 +227,20 @@ MACHGATE_LOCAL_DIR=/path/to/machgate-arm64-dir scripts/run-macho-docker.sh /path
 To run with a local release tarball instead of downloading from GitHub:
 
 ```bash
-MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 To diagnose startup hangs in static constructors, enable LC_MAIN tracing:
 
 ```bash
-MACHGATE_VERBOSE=1 MACHGATE_TRACE_LCMAIN=1 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_VERBOSE=1 MACHGATE_TRACE_LCMAIN=1 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 To diagnose C++ static-initializer progress without flooding the terminal,
 enable the compact C++ initializer trace:
 
 ```bash
-MACHGATE_VERBOSE=1 MACHGATE_TRACE_LCMAIN=1 MACHGATE_TRACE_SIGNALS=1 MACHGATE_TRACE_CXX_INIT=1 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_VERBOSE=1 MACHGATE_TRACE_LCMAIN=1 MACHGATE_TRACE_SIGNALS=1 MACHGATE_TRACE_CXX_INIT=1 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 Use `MACHGATE_TRACE_CXX_INIT=full` only when you need per-initializer
@@ -250,19 +250,19 @@ To diagnose allocator accounting failures without dumping every allocation,
 filter the allocator trace to the failing size:
 
 ```bash
-MACHGATE_VERBOSE=1 MACHGATE_TRACE_ALLOC=1 MACHGATE_TRACE_ALLOC_SIZE=72 MACHGATE_TARBALL=/path/to/machgate-0.3.26-linux-arm64.tar.gz scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_VERBOSE=1 MACHGATE_TRACE_ALLOC=1 MACHGATE_TRACE_ALLOC_SIZE=72 MACHGATE_TARBALL=/path/to/machgate-0.3.26-linux-arm64.tar.gz bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 To stop a stuck guest after a fixed interval while keeping live logs:
 
 ```bash
-MACHGATE_TIMEOUT=120 MACHGATE_VERBOSE=1 MACHGATE_TRACE_LCMAIN=1 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz scripts/run-macho-docker.sh /path/to/macos-arm64-binary
+MACHGATE_TIMEOUT=120 MACHGATE_VERBOSE=1 MACHGATE_TRACE_LCMAIN=1 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz bin/run-macho-docker.sh /path/to/macos-arm64-binary
 ```
 
 Pass any guest arguments after the binary path:
 
 ```bash
-scripts/run-macho-docker.sh /path/to/macos-arm64-binary --version
+bin/run-macho-docker.sh /path/to/macos-arm64-binary --version
 ```
 
 The script:
@@ -289,7 +289,7 @@ libc++, pass a local libc++ build explicitly:
 ```bash
 MACHGATE_LIBCXX=/path/to/build-libcxx/lib/libc++.so.1 \
 MACHGATE_TARBALL=/path/to/machgate-0.3.17-linux-arm64.tar.gz \
-scripts/run-macho-docker.sh /path/to/macos-arm64-cxx-binary
+bin/run-macho-docker.sh /path/to/macos-arm64-cxx-binary
 ```
 
 MachGate config discovery:
