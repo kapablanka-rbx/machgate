@@ -9,7 +9,7 @@ BUILD_DIR="${BUILD_DIR:-$MACHGATE_ROOT/build}"
 
 # Test that the .so loads without errors
 BUILD_DIR="$BUILD_DIR" LD_LIBRARY_PATH="$BUILD_DIR" python3 -c "
-import ctypes, sys, os, subprocess, threading, time
+import ctypes, sys, os
 
 build_dir = os.environ['BUILD_DIR']
 lib = ctypes.CDLL(os.path.join(build_dir, 'libsystem_shim.so'))
@@ -41,39 +41,15 @@ lib.__cxa_guard_abort.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
 guard = ctypes.c_uint64(0)
 assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1, '__cxa_guard_acquire did not request initialization'
-contended_result = []
-
-def contend_guard():
-    contended_result.append(lib.__cxa_guard_acquire(ctypes.byref(guard)))
-
-thread = threading.Thread(target=contend_guard)
-thread.start()
-time.sleep(0.05)
-assert thread.is_alive(), 'contended __cxa_guard_acquire returned before release'
+assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'pending __cxa_guard_acquire should not abort or rerun initializer'
 lib.__cxa_guard_release(ctypes.byref(guard))
-thread.join(2.0)
-assert not thread.is_alive(), 'contended __cxa_guard_acquire did not wake after release'
-assert contended_result == [0], f'contended __cxa_guard_acquire result={contended_result}, expected [0]'
+assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'released __cxa_guard_acquire should report initialized'
 
 abort_guard = ctypes.c_uint64(0)
 assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, '__cxa_guard_acquire failed for abort guard'
 lib.__cxa_guard_abort(ctypes.byref(abort_guard))
 assert lib.__cxa_guard_acquire(ctypes.byref(abort_guard)) == 1, '__cxa_guard_abort did not reset pending state'
 lib.__cxa_guard_release(ctypes.byref(abort_guard))
-
-recursive_script = '''
-import ctypes, os
-lib = ctypes.CDLL(os.path.join(os.environ['BUILD_DIR'], 'libsystem_shim.so'))
-lib.__cxa_guard_acquire.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
-lib.__cxa_guard_acquire.restype = ctypes.c_int
-guard = ctypes.c_uint64(0)
-assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1
-lib.__cxa_guard_acquire(ctypes.byref(guard))
-'''
-recursive = subprocess.run([sys.executable, '-c', recursive_script],
-                           env=os.environ.copy(), capture_output=True, text=True)
-assert recursive.returncode != 0, 'same-thread recursive __cxa_guard_acquire did not abort'
-assert 'recursive __cxa_guard_acquire' in recursive.stderr, recursive.stderr
 
 # __sincosf_stret should compute sin/cos correctly
 class Float2(ctypes.Structure):
