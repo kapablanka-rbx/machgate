@@ -5972,47 +5972,127 @@ void __cxa_finalize(void* dso_handle)
 
 #define SHIM_CXA_GUARD_COMPLETE 0x01
 #define SHIM_CXA_GUARD_PENDING 0x02
+#define SHIM_CXA_GUARD_WAITING 0x04
+#define SHIM_CXA_GUARD_STATE_SHIFT 8
+#define SHIM_CXA_GUARD_STATE_MASK 0xff00U
+#define SHIM_CXA_GUARD_STALL_LIMIT 30000
+
+static uint32_t shim_cxa_guard_state_from_word(uint32_t word)
+{
+	return (word >> SHIM_CXA_GUARD_STATE_SHIFT) & 0xffU;
+}
+
+static uint32_t shim_cxa_guard_word_with_state(uint32_t word, uint32_t state)
+{
+	return (word & ~SHIM_CXA_GUARD_STATE_MASK) |
+	       ((state & 0xffU) << SHIM_CXA_GUARD_STATE_SHIFT);
+}
+
+static int shim_cxa_guard_futex_wait(uint32_t* word, uint32_t expected)
+{
+	struct timespec timeout;
+
+	timeout.tv_sec = 0;
+	timeout.tv_nsec = 1000000L;
+	return (int)syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, expected,
+	                    &timeout, NULL, 0);
+}
+
+static void shim_cxa_guard_futex_wake(uint32_t* word)
+{
+	syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL, NULL, 0);
+}
 
 int __cxa_guard_acquire(uint64_t* guard)
 {
-	unsigned char* bytes = (unsigned char*)guard;
-	unsigned char state;
+	uint32_t* words = (uint32_t*)guard;
+	uint32_t self;
+	int wait_count = 0;
 
 	if (!guard)
 		return 0;
 
-	state = __atomic_load_n(&bytes[1], __ATOMIC_ACQUIRE);
-	if (shim_cxx_init_full_trace_enabled()) {
-		fprintf(stderr,
-		        "libsystem_shim: __cxa_guard_acquire guard=%p value=%#llx initialized=%d state=%#x caller=%p\n",
-		        guard, (unsigned long long)*guard,
-		        __atomic_load_n(&bytes[0], __ATOMIC_ACQUIRE), state,
-		        __builtin_return_address(0));
-		trace_guest_address_context("__cxa_guard_acquire.caller",
-		                            (uintptr_t)__builtin_return_address(0));
+	self = (uint32_t)syscall(SYS_gettid);
+
+	for (;;) {
+		uint32_t word = __atomic_load_n(&words[0], __ATOMIC_ACQUIRE);
+		uint32_t state = shim_cxa_guard_state_from_word(word);
+
+		if (shim_cxx_init_full_trace_enabled()) {
+			fprintf(stderr,
+			        "libsystem_shim: __cxa_guard_acquire guard=%p value=%#llx initialized=%u state=%#x owner=%u caller=%p\n",
+			        guard, (unsigned long long)*guard, word & 0xffU, state,
+			        __atomic_load_n(&words[1], __ATOMIC_ACQUIRE),
+			        __builtin_return_address(0));
+			trace_guest_address_context("__cxa_guard_acquire.caller",
+			                            (uintptr_t)__builtin_return_address(0));
+		}
+
+		if ((word & SHIM_CXA_GUARD_COMPLETE) ||
+		    state == SHIM_CXA_GUARD_COMPLETE)
+			return 0;
+
+		if (state & SHIM_CXA_GUARD_PENDING) {
+			uint32_t owner = __atomic_load_n(&words[1], __ATOMIC_ACQUIRE);
+			uint32_t expected;
+			uint32_t desired;
+
+			if (owner == self) {
+				fprintf(stderr,
+				        "libsystem_shim: recursive __cxa_guard_acquire(%p)\n",
+				        guard);
+				abort();
+			}
+
+			expected = word;
+			desired = word | (SHIM_CXA_GUARD_WAITING <<
+			                  SHIM_CXA_GUARD_STATE_SHIFT);
+			if (!(state & SHIM_CXA_GUARD_WAITING))
+				__atomic_compare_exchange_n(&words[0], &expected, desired, 0,
+				                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+
+			if (++wait_count >= SHIM_CXA_GUARD_STALL_LIMIT) {
+				fprintf(stderr,
+				        "libsystem_shim: stalled __cxa_guard_acquire(%p) owner=%u state=%#x\n",
+				        guard, owner, state);
+				abort();
+			}
+
+			shim_cxa_guard_futex_wait(&words[0], __atomic_load_n(&words[0], __ATOMIC_ACQUIRE));
+			continue;
+		}
+
+		{
+			uint32_t expected = word;
+			uint32_t desired = shim_cxa_guard_word_with_state(
+			    word, SHIM_CXA_GUARD_PENDING);
+			if (__atomic_compare_exchange_n(&words[0], &expected, desired, 0,
+			                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+				__atomic_store_n(&words[1], self, __ATOMIC_RELEASE);
+				if (shim_cxx_init_full_trace_enabled())
+					fprintf(stderr,
+					        "libsystem_shim: __cxa_guard_acquire guard=%p -> run initializer owner=%u\n",
+					        guard, self);
+				return 1;
+			}
+		}
 	}
-	if (__atomic_load_n(&bytes[0], __ATOMIC_ACQUIRE) ||
-	    state == SHIM_CXA_GUARD_COMPLETE)
-		return 0;
-	if (state & SHIM_CXA_GUARD_PENDING)
-		return 0;
-	if (!__atomic_compare_exchange_n(&bytes[1], &state, SHIM_CXA_GUARD_PENDING,
-	                                 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-		return 0;
-	if (shim_cxx_init_full_trace_enabled())
-		fprintf(stderr, "libsystem_shim: __cxa_guard_acquire guard=%p -> run initializer\n",
-		        guard);
-	return 1;
 }
 
 void __cxa_guard_release(uint64_t* guard)
 {
+	uint32_t* words = (uint32_t*)guard;
 	unsigned char* bytes = (unsigned char*)guard;
+	unsigned char old_state;
 
 	if (!guard)
 		return;
 	__atomic_store_n(&bytes[0], SHIM_CXA_GUARD_COMPLETE, __ATOMIC_RELEASE);
-	__atomic_store_n(&bytes[1], SHIM_CXA_GUARD_COMPLETE, __ATOMIC_RELEASE);
+	old_state = __atomic_exchange_n(&bytes[1], SHIM_CXA_GUARD_COMPLETE,
+	                                __ATOMIC_ACQ_REL);
+	__atomic_store_n(&words[1], 0, __ATOMIC_RELEASE);
+	if (old_state & SHIM_CXA_GUARD_WAITING)
+		shim_cxa_guard_futex_wake(&words[0]);
 	if (shim_cxx_init_full_trace_enabled())
 		fprintf(stderr, "libsystem_shim: __cxa_guard_release guard=%p value=%#llx caller=%p\n",
 		        guard, (unsigned long long)*guard,
@@ -6021,11 +6101,16 @@ void __cxa_guard_release(uint64_t* guard)
 
 void __cxa_guard_abort(uint64_t* guard)
 {
+	uint32_t* words = (uint32_t*)guard;
 	unsigned char* bytes = (unsigned char*)guard;
+	unsigned char old_state;
 
 	if (!guard)
 		return;
-	__atomic_store_n(&bytes[1], 0x00, __ATOMIC_RELEASE);
+	__atomic_store_n(&words[1], 0, __ATOMIC_RELEASE);
+	old_state = __atomic_exchange_n(&bytes[1], 0x00, __ATOMIC_ACQ_REL);
+	if (old_state & SHIM_CXA_GUARD_WAITING)
+		shim_cxa_guard_futex_wake(&words[0]);
 	if (shim_cxx_init_full_trace_enabled())
 		fprintf(stderr, "libsystem_shim: __cxa_guard_abort guard=%p value=%#llx caller=%p\n",
 		        guard, (unsigned long long)*guard,

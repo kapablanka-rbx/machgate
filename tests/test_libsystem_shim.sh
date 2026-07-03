@@ -9,7 +9,7 @@ BUILD_DIR="${BUILD_DIR:-$MACHGATE_ROOT/build}"
 
 # Test that the .so loads without errors
 BUILD_DIR="$BUILD_DIR" LD_LIBRARY_PATH="$BUILD_DIR" python3 -c "
-import ctypes, sys, os
+import ctypes, os, signal, subprocess, sys, threading, time
 
 build_dir = os.environ['BUILD_DIR']
 lib = ctypes.CDLL(os.path.join(build_dir, 'libsystem_shim.so'))
@@ -41,7 +41,39 @@ lib.__cxa_guard_abort.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
 guard = ctypes.c_uint64(0)
 assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1, '__cxa_guard_acquire did not request initialization'
-assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'pending __cxa_guard_acquire should not abort or rerun initializer'
+
+recursive_script = f'''
+import ctypes, os
+lib = ctypes.CDLL(os.path.join({build_dir!r}, \"libsystem_shim.so\"))
+lib.__cxa_guard_acquire.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+lib.__cxa_guard_acquire.restype = ctypes.c_int
+guard = ctypes.c_uint64(0)
+assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 1
+lib.__cxa_guard_acquire(ctypes.byref(guard))
+'''
+recursive_result = subprocess.run([sys.executable, '-c', recursive_script])
+assert recursive_result.returncode == -signal.SIGABRT, (
+    f'recursive __cxa_guard_acquire returned {recursive_result.returncode}, expected SIGABRT'
+)
+
+wait_guard = ctypes.c_uint64(0)
+wait_result = []
+waiter_started = threading.Event()
+assert lib.__cxa_guard_acquire(ctypes.byref(wait_guard)) == 1, 'wait guard initial acquire failed'
+
+def wait_for_guard():
+    waiter_started.set()
+    wait_result.append(lib.__cxa_guard_acquire(ctypes.byref(wait_guard)))
+
+waiter = threading.Thread(target=wait_for_guard)
+waiter.start()
+assert waiter_started.wait(1.0), 'waiter did not start'
+time.sleep(0.05)
+assert not wait_result, 'contended __cxa_guard_acquire returned before release'
+lib.__cxa_guard_release(ctypes.byref(wait_guard))
+waiter.join(1.0)
+assert wait_result == [0], f'contended __cxa_guard_acquire result={wait_result}'
+
 lib.__cxa_guard_release(ctypes.byref(guard))
 assert lib.__cxa_guard_acquire(ctypes.byref(guard)) == 0, 'released __cxa_guard_acquire should report initialized'
 
