@@ -61,6 +61,13 @@ cat > "$tmpdir/libcxx_ctype_probe.cpp" <<'CPP'
 #include <regex>
 #include <string>
 
+static_assert(sizeof(std::ctype_base::mask) == 4, "Darwin ctype masks are 32-bit");
+static_assert(std::ctype_base::alpha == 0x00000100, "Darwin alpha mask");
+static_assert(std::ctype_base::digit == 0x00000400, "Darwin digit mask");
+static_assert(std::ctype_base::space == 0x00004000, "Darwin space mask");
+static_assert(std::ctype_base::punct == 0x00002000, "Darwin punct mask");
+static_assert(std::ctype_base::blank == 0x00020000, "Darwin blank mask");
+
 int main()
 {
     if (sizeof(std::ctype_base::mask) != 4)
@@ -119,4 +126,6 @@ CPP
     -lsystem_shim \
     -o "$tmpdir/libcxx_ctype_probe"
 
-LD_LIBRARY_PATH="$BUILD_DIR:$LIBCXX_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$tmpdir/libcxx_ctype_probe"
+if [ "${MACHGATE_RUN_LIBCXX_CTYPE_PROBE:-0}" = "1" ]; then
+    LD_LIBRARY_PATH="$BUILD_DIR:$LIBCXX_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$tmpdir/libcxx_ctype_probe"
+fi
