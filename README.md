@@ -1,7 +1,10 @@
 # MachGate — ARM64 Mach-O CLI Loader for ARM64 Linux
 
+**Author: Armando Martinez**
+
 MachGate runs **Apple Silicon ARM64 Mach-O command-line binaries** inside
-**ARM64 Linux containers**.
+**ARM64 Linux containers** — natively on ARM64 hosts, or on x86-64 Linux hosts
+via Docker/QEMU emulation.
 
 MachGate is a GPLv3-or-later fork of Machismo, which itself builds on Darling's
 Mach-O loader work. Machismo proved the core idea: Apple Silicon Mach-O binaries
@@ -29,7 +32,7 @@ for real command-line workloads:
 
 Current release: **v0.3.17**
 
-- GitHub release: <https://github.com/kapabl/machgate/releases/tag/v0.3.17>
+- GitHub release: <https://github.com/kapablanka-rbx/machgate/releases/tag/v0.3.17>
 - Download: `machgate-0.3.17-linux-arm64.tar.gz`
 - Latest validation:
   - 57 / 57 original external ARM64 macOS CLI probes pass
@@ -171,7 +174,7 @@ docker run --rm --platform linux/arm64 \
 
 MachGate releases are published by the GitHub Actions release workflow, not by
 hand-copying a local `dist/` tarball. When cutting a release, commit the intended
-changes, push them to `kapabl/machgate`, push an annotated `vX.Y.Z` tag, then
+changes, push them to `kapablanka-rbx/machgate`, push an annotated `vX.Y.Z` tag, then
 wait for `.github/workflows/release.yml` to build, test, package, and publish
 the GitHub release assets.
 

@@ -7,7 +7,7 @@ repository release workflow.
 The supported flow is tag-driven:
 
 1. Commit the intended source, test, and documentation changes.
-2. Push the commit to `kapabl/machgate`.
+2. Push the commit to `kapablanka-rbx/machgate`.
 3. Create and push an annotated version tag, for example `v0.3.53`.
 4. Let `.github/workflows/release.yml` run on `ubuntu-24.04-arm`.
 5. Actively watch the workflow until it finishes and publishes the GitHub
@@ -40,9 +40,9 @@ Useful commands:
 git push origin master
 git tag -a vX.Y.Z -m "MachGate vX.Y.Z"
 git push origin vX.Y.Z
-gh run list -R kapabl/machgate --workflow release.yml --limit 5
-gh run watch -R kapabl/machgate <run-id>
-gh release view vX.Y.Z -R kapabl/machgate --json url,assets
+gh run list -R kapablanka-rbx/machgate --workflow release.yml --limit 5
+gh run watch -R kapablanka-rbx/machgate <run-id>
+gh release view vX.Y.Z -R kapablanka-rbx/machgate --json url,assets
 ```
 
 Never manually upload a locally built tarball as the first choice. Use manual
