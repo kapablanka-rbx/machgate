@@ -163,6 +163,16 @@ Run tests:
 bash tests/fixtures/build_fixtures.sh
 bash tests/run_tests.sh
 
+## Building game-engine common-tests for macOS (cross-compilation on Linux)
+
+Run from the game-engine checkout:
+
+  Tools/Util/gobot run buck2/build common-tests/UnitTests macos/arm64 --preset ci xcode-toolchain=cross-compilation build-mode=remote materializations=all
+
+Prerequisites: gobot pkg sync --use xcode
+
+Available xcode versions: 16.2, 26.3 (default), 26.4 — override with xcode-version=N.N
+
 ## Development rules
 
 - Make small commits.
