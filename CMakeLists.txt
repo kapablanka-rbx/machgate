@@ -70,6 +70,7 @@ target_link_libraries(vm_interpose PRIVATE dl)
 add_library(system_shim SHARED
     src/shim/libsystem_shim.c
     src/syscall/execve_reexec.c
+    src/asan/asan_shim.c
 )
 set_target_properties(system_shim PROPERTIES
     OUTPUT_NAME "system_shim"
