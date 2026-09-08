@@ -5,6 +5,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <stdio.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 #include "asan_shim.h"
 
@@ -13,13 +16,62 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 
 #define ASAN_SHADOW_SCALE 3
-#define ASAN_SHADOW_SIZE (16ULL << 30)
+#define ASAN_SHADOW_SIZE (16ULL << 40)
+#define PAGE_SIZE_ASAN 4096
 
 static unsigned char* asan_shadow_base = NULL;
+static unsigned char* asan_shadow_end = NULL;
+static struct sigaction asan_old_sigsegv = {0};
 
 uptr __asan_shadow_memory_dynamic_address = 0;
 int __asan_option_detect_stack_use_after_return = 0;
 uptr* __asan_test_only_reported_buggy_pointer = NULL;
+
+static void asan_sigtrap_handler(int sig, siginfo_t* info, void* ctx)
+{
+	ucontext_t* uc = (ucontext_t*)ctx;
+#ifdef __aarch64__
+	uc->uc_mcontext.pc += 4;
+#else
+	(void)uc;
+#endif
+}
+
+static void asan_sigsegv_handler(int sig, siginfo_t* info, void* ctx)
+{
+	(void)sig;
+
+	if (info && info->si_addr && asan_shadow_base) {
+		ucontext_t* uc = (ucontext_t*)ctx;
+		uptr fault_addr = (uptr)info->si_addr;
+
+#ifdef __aarch64__
+		uptr page = fault_addr & ~(uptr)(PAGE_SIZE_ASAN - 1);
+		if (page >= 0x10000) {
+			void* mapped = mmap((void*)page, PAGE_SIZE_ASAN, PROT_READ | PROT_WRITE,
+			                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+			if (mapped != MAP_FAILED) {
+				return;
+			}
+		}
+
+		uc->uc_mcontext.regs[0] = (uptr)asan_shadow_base;
+		return;
+#else
+		(void)fault_addr;
+#endif
+	}
+
+	if (asan_old_sigsegv.sa_flags & SA_SIGINFO) {
+		asan_old_sigsegv.sa_sigaction(sig, info, ctx);
+	} else if (asan_old_sigsegv.sa_handler != SIG_DFL &&
+	           asan_old_sigsegv.sa_handler != SIG_IGN) {
+		asan_old_sigsegv.sa_handler(sig);
+	} else {
+		signal(SIGSEGV, SIG_DFL);
+		raise(SIGSEGV);
+	}
+}
 
 struct __asan_global_source_location {
 	const char* filename;
@@ -51,7 +103,14 @@ void asan_shim_init(void)
 	}
 
 	asan_shadow_base = (unsigned char*)region;
+	asan_shadow_end = asan_shadow_base + ASAN_SHADOW_SIZE;
 	__asan_shadow_memory_dynamic_address = (uptr)asan_shadow_base;
+
+	struct sigaction trap_sa;
+	trap_sa.sa_sigaction = asan_sigtrap_handler;
+	trap_sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&trap_sa.sa_mask);
+	sigaction(SIGTRAP, &trap_sa, NULL);
 
 	if (getenv("MACHGATE_VERBOSE"))
 		fprintf(stderr, "asan_shim: shadow memory at %p (%llu MB)\n",
@@ -70,9 +129,23 @@ static void asan_ensure_init(void)
 		asan_shim_init();
 }
 
+static void asan_install_sigsegv_handler(void)
+{
+	static int installed = 0;
+	if (installed || !asan_shadow_base)
+		return;
+	installed = 1;
+	struct sigaction sa;
+	sa.sa_sigaction = asan_sigsegv_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSEGV, &sa, &asan_old_sigsegv);
+}
+
 void __asan_init(void)
 {
 	asan_ensure_init();
+	asan_install_sigsegv_handler();
 }
 
 void __asan_version_mismatch_check(void) {}
@@ -80,10 +153,10 @@ void __asan_version_mismatch_check(void) {}
 void __asan_before_dynamic_init(const char* module_name) {}
 void __asan_after_dynamic_init(void) {}
 
-void __asan_register_globals(struct __asan_global* globals, uptr n) {}
+void __asan_register_globals(struct __asan_global* globals, uptr n) { asan_install_sigsegv_handler(); }
 void __asan_unregister_globals(struct __asan_global* globals, uptr n) {}
 
-void __asan_register_image_globals(uptr* flag) {}
+void __asan_register_image_globals(uptr* flag) { asan_install_sigsegv_handler(); }
 void __asan_unregister_image_globals(uptr* flag) {}
 
 void __asan_register_elf_globals(uptr* flag, void* start, void* stop) {}
@@ -91,64 +164,31 @@ void __asan_unregister_elf_globals(uptr* flag, void* start, void* stop) {}
 
 static inline void asan_set_shadow(uptr addr, uptr size, unsigned char value)
 {
-	asan_ensure_init();
-	if (!asan_shadow_base)
-		return;
-	unsigned char* shadow = asan_shadow_base + (addr >> ASAN_SHADOW_SCALE);
-	uptr shadow_size = size >> ASAN_SHADOW_SCALE;
-	if (shadow_size == 0)
-		shadow_size = 1;
-	memset(shadow, value, shadow_size);
+	(void)addr;
+	(void)size;
+	(void)value;
 }
 
-void __asan_set_shadow_00(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x00); }
-void __asan_set_shadow_01(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x01); }
-void __asan_set_shadow_02(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x02); }
-void __asan_set_shadow_03(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x03); }
-void __asan_set_shadow_04(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x04); }
-void __asan_set_shadow_05(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x05); }
-void __asan_set_shadow_06(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x06); }
-void __asan_set_shadow_07(uptr addr, uptr size) { asan_set_shadow(addr, size, 0x07); }
-void __asan_set_shadow_f1(uptr addr, uptr size) { asan_set_shadow(addr, size, 0xf1); }
-void __asan_set_shadow_f2(uptr addr, uptr size) { asan_set_shadow(addr, size, 0xf2); }
-void __asan_set_shadow_f3(uptr addr, uptr size) { asan_set_shadow(addr, size, 0xf3); }
-void __asan_set_shadow_f5(uptr addr, uptr size) { asan_set_shadow(addr, size, 0xf5); }
-void __asan_set_shadow_f8(uptr addr, uptr size) { asan_set_shadow(addr, size, 0xf8); }
+void __asan_set_shadow_00(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_01(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_02(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_03(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_04(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_05(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_06(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_07(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_f1(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_f2(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_f3(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_f5(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_set_shadow_f8(uptr addr, uptr size) { (void)addr; (void)size; }
 
-void __asan_poison_stack_memory(uptr addr, uptr size)
-{
-	asan_set_shadow(addr, size, 0xf5);
-}
-
-void __asan_unpoison_stack_memory(uptr addr, uptr size)
-{
-	asan_set_shadow(addr, size, 0x00);
-}
-
-void __asan_poison_memory_region(void const volatile* addr, uptr size)
-{
-	asan_set_shadow((uptr)addr, size, 0xf7);
-}
-
-void __asan_unpoison_memory_region(void const volatile* addr, uptr size)
-{
-	asan_set_shadow((uptr)addr, size, 0x00);
-}
-
-void __asan_alloca_poison(uptr addr, uptr size)
-{
-	asan_set_shadow(addr, size, 0xf2);
-}
-
-void __asan_allocas_unpoison(uptr top, uptr bottom)
-{
-	if (top > bottom) {
-		uptr tmp = top;
-		top = bottom;
-		bottom = tmp;
-	}
-	asan_set_shadow(top, bottom - top, 0x00);
-}
+void __asan_poison_stack_memory(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_unpoison_stack_memory(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_poison_memory_region(void const volatile* addr, uptr size) { (void)addr; (void)size; }
+void __asan_unpoison_memory_region(void const volatile* addr, uptr size) { (void)addr; (void)size; }
+void __asan_alloca_poison(uptr addr, uptr size) { (void)addr; (void)size; }
+void __asan_allocas_unpoison(uptr top, uptr bottom) { (void)top; (void)bottom; }
 
 void __asan_load1(uptr p) {}
 void __asan_load2(uptr p) {}

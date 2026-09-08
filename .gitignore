@@ -74,3 +74,4 @@ clang_major.cpp
 clang_c_major
 clang_cpp_major
 src/include/
+qemu_*.core
