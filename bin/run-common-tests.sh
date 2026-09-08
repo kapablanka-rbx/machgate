@@ -111,6 +111,12 @@ if [ -n "$single_binary" ] && [ "$single_binary" != "--all" ]; then
     shift || true
     guest_args="$*"
 
+    echo "  docker run --rm --platform linux/arm64 \\" >&2
+    echo "    -v build-arm64:/opt/machgate-local:ro \\" >&2
+    echo "    -v build-libcxx/lib:/machgate-libcxx:ro \\" >&2
+    echo "    -v $name:/input:ro \\" >&2
+    echo "    $image machgate /input/$binary_name $guest_args" >&2
+
     docker_args+=(-v "$binary_dir:/input:ro")
     docker_args+=("$image")
     docker_args+=(bash -lc)
@@ -180,6 +186,12 @@ for name in "${binary_dirs[@]}"; do
     binary_name=$(basename "$unit_test")
     echo "=== $name ==="
 
+    echo "  docker run --rm --platform linux/arm64 \\" >&2
+    echo "    -v build-arm64:/opt/machgate-local:ro \\" >&2
+    echo "    -v build-libcxx/lib:/machgate-libcxx:ro \\" >&2
+    echo "    -v $name:/input:ro \\" >&2
+    echo "    $image machgate /input/$binary_name $run_flags" >&2
+
     docker_args_single=(
         docker run --rm --platform linux/arm64
         -v "$machgate_root/build-arm64:/opt/machgate-local:ro"
@@ -228,20 +240,13 @@ fi
 exit $?
 '
 
-    output=$("${docker_args_single[@]}" "$config_script" 2>&1)
+    "${docker_args_single[@]}" "$config_script"
     status=$?
 
     if [ $status -eq 0 ]; then
-        summary=$(echo "$output" | grep -E 'test cases:|All tests passed|X_CHILD_STATUS|Status:' | tail -3)
-        if [ -n "$summary" ]; then
-            echo "$summary"
-        else
-            echo "(no test summary output)"
-        fi
-        echo "RESULT: PASS (exit 0)"
+        echo "RESULT: PASS"
         pass_count=$((pass_count + 1))
     else
-        echo "$output" | tail -5
         echo "RESULT: FAIL (exit $status)"
         fail_count=$((fail_count + 1))
         failed_list+=("$name")
