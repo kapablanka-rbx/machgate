@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/auxv.h>
 #include <signal.h>
 #include "macho_defs.h"
 #include <dlfcn.h>
@@ -69,6 +70,11 @@ static void setup_tlv_image(struct load_results* lr);
 static int native_prot(int prot);
 static void setup_space(struct load_results* lr, bool is_64_bit);
 static size_t align_page_size(size_t size);
+static bool host_supports_lse_atomics(void)
+{
+	return (getauxval(AT_HWCAP) & HWCAP_ATOMICS) != 0;
+}
+
 static size_t estimate_main_lse_pool_size(struct load_results* lr);
 static uint32_t* allocate_main_lse_pool(uintptr_t text_begin,
                                         uintptr_t text_end,
@@ -890,12 +896,18 @@ int main(int argc, char** argv, char** envp)
 			}
 			lp += llc->cmdsize;
 		}
-		size_t lse_pool_size = estimate_main_lse_pool_size(&machgate_load_results);
-		uint32_t* lse_pool = allocate_main_lse_pool(text_begin, text_end,
-		                                            lse_pool_size,
-		                                            &machgate_load_results);
-		if (!lse_pool) {
-			fprintf(stderr, "machgate: WARNING: LSE pool alloc failed — LSE atomics will SIGILL\n");
+		size_t lse_pool_size = 0;
+		uint32_t* lse_pool = NULL;
+		if (!host_supports_lse_atomics()) {
+			lse_pool_size = estimate_main_lse_pool_size(&machgate_load_results);
+			lse_pool = allocate_main_lse_pool(text_begin, text_end,
+			                                   lse_pool_size,
+			                                   &machgate_load_results);
+			if (!lse_pool) {
+				fprintf(stderr, "machgate: WARNING: LSE pool alloc failed — LSE atomics will SIGILL\n");
+			}
+		} else {
+			machgate_log_startup("machgate: host executes LSE atomics natively — skipping emulation\n");
 		}
 
 		lse_pool_cur = lse_pool;
@@ -1025,7 +1037,8 @@ int main(int argc, char** argv, char** envp)
 
 			/* Use the dylib's preallocated adjacent pool for LSE islands */
 			size_t dylib_pool_size = mdi->pool_size;
-			uint32_t *dylib_lse_pool = (uint32_t *)mdi->pool_base;
+			uint32_t *dylib_lse_pool = host_supports_lse_atomics()
+				? NULL : (uint32_t *)mdi->pool_base;
 			uint32_t *dylib_lse_cur = dylib_lse_pool;
 			uint32_t *dylib_lse_end = dylib_lse_pool
 				? dylib_lse_pool + dylib_pool_size / 4 : NULL;
