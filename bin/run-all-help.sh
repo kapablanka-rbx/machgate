@@ -12,7 +12,7 @@ for candidate in \
     "$machgate_root/../../game-engine-machgate/build/buck2/common-tests-macos-arm64-release" \
     "/home/coder/git/roblox/game-engine-machgate/build/buck2/common-tests-macos-arm64-release"; do
     if [ -d "$candidate" ]; then
-        default_ct_dir="$candidate"
+        default_ct_dir="$(cd "$candidate" && pwd)"
         break
     fi
 done
