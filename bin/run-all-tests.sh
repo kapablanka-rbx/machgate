@@ -58,7 +58,7 @@ for d in "$common_tests_dir"/*/; do
     echo "  machgate $unit_test $run_flags" >&2
 
     logfile="$LOG_DIR/$name.log"
-    timeout --foreground --kill-after=10s "${TEST_TIMEOUT_SECONDS:-14400}s" \
+    timeout --foreground --kill-after=10s "${TEST_TIMEOUT_SECONDS:-1800}s" \
       docker run --rm --platform linux/arm64 \
         --ulimit core=0 \
         -v "$machgate_root/build-arm64:/opt/machgate-local:ro" \
@@ -86,7 +86,7 @@ for d in "$common_tests_dir"/*/; do
         echo "$name|PASS|$summary" >> "$RESULTS_FILE"
         pass_count=$((pass_count + 1))
     elif [ $status -eq 124 ]; then
-        echo "RESULT: TIMEOUT (crash hang or long run — killed at ${TEST_TIMEOUT_SECONDS:-14400}s)"
+        echo "RESULT: TIMEOUT (crash hang or long run — killed at ${TEST_TIMEOUT_SECONDS:-1800}s)"
         echo "$name|TIMEOUT|$summary" >> "$RESULTS_FILE"
         fail_count=$((fail_count + 1))
         failed_list+=("$name")
