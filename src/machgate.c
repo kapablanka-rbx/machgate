@@ -1938,10 +1938,10 @@ static void start_thread(struct load_results* lr) {
 		/* pthread fixup and TLV setup are done earlier in main(),
 		 * before the __DATA guard locks down pages. */
 
-		/* Run C++ static initializers before main */
-		run_init_offsets(lr);
-
-		/* chdir to the binary's directory so the game finds its data files */
+		/* chdir to the binary's directory so guest initializers that
+		 * walk parent directories (e.g. Client folder discovery) see
+		 * the binary's location, matching dyld's guarantee that cwd is
+		 * established before any constructor runs. */
 		{
 			char* binary_path = strdup(lr->argv[0] ? lr->argv[0] : "");
 			char* slash = strrchr(binary_path, '/');
@@ -1952,6 +1952,9 @@ static void start_thread(struct load_results* lr) {
 			}
 			free(binary_path);
 		}
+
+		/* Run C++ static initializers before main */
+		run_init_offsets(lr);
 
 		machgate_log_startup("machgate: calling _main at %p (argc=%zu)\n",
 		                      (void*)lr->entry_point, lr->argc);
