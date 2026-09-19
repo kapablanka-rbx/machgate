@@ -52,7 +52,12 @@ for d in "$common_tests_dir"/*/; do
     unit_test=$(ls "$d"*.UnitTest 2>/dev/null | head -1)
     [ -z "$unit_test" ] && continue
 
-    echo "=== $name ==="
+    list_flag="--list-content"
+    case "$name" in
+        Luau|Luau.*|Luau*) list_flag="--list-test-cases" ;;
+    esac
+
+    echo "=== $name === ($list_flag)"
     logfile="$LOG_DIR/$name.log"
     docker run --rm --platform linux/arm64 \
         --ulimit core=0 \
@@ -65,11 +70,15 @@ for d in "$common_tests_dir"/*/; do
             export MACHGATE_CONFIG=/tmp/machgate.conf
             printf "[general]\ndylib_map = /tmp/dylib_map.conf\n" > /tmp/machgate.conf
             printf "'"$DYLIB_MAP"'\n" > /tmp/dylib_map.conf
-            exec /opt/machgate-local/machgate '"$unit_test"' --list-content
+            exec /opt/machgate-local/machgate '"$unit_test"' '"$list_flag"'
         ' 2>&1 | tee "$logfile"
     status=${PIPESTATUS[0]}
 
     test_count=$(grep -c "TEST CASE:" "$logfile" 2>/dev/null || echo 0)
+    if [ "$list_flag" = "--list-test-cases" ]; then
+        test_count=$(grep -cv '^\[doctest\]' "$logfile" 2>/dev/null | head -1)
+        [ -z "$test_count" ] && test_count=0
+    fi
 
     if [ $status -eq 0 ]; then
         echo "RESULT: PASS ($test_count test cases listed)"
