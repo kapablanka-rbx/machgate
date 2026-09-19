@@ -58,7 +58,8 @@ for d in "$common_tests_dir"/*/; do
     echo "  machgate $unit_test $run_flags" >&2
 
     logfile="$LOG_DIR/$name.log"
-    docker run --rm --platform linux/arm64 \
+    timeout --foreground --kill-after=10s "${TEST_TIMEOUT_SECONDS:-14400}s" \
+      docker run --rm --platform linux/arm64 \
         --ulimit core=0 \
         -v "$machgate_root/build-arm64:/opt/machgate-local:ro" \
         -v "$machgate_root/build-libcxx/lib:/machgate-libcxx:ro" \
@@ -71,7 +72,12 @@ for d in "$common_tests_dir"/*/; do
             printf "'"$DYLIB_MAP"'\n" > /tmp/dylib_map.conf
             exec /opt/machgate-local/machgate '"$unit_test"' '"$run_flags"'
         ' 2>&1 | tee "$logfile"
-    status=${PIPESTATUS[0]}
+    timeout_status=${PIPESTATUS[0]}
+    if [ $timeout_status -eq 124 ] || [ $timeout_status -eq 137 ]; then
+        status=124
+    else
+        status=$timeout_status
+    fi
 
     summary=$(grep -E "test cases:|All tests passed|X_CHILD_STATUS|Status:|No errors|assertions:" "$logfile" 2>/dev/null | tail -3 | tr '\n' ' ')
 
@@ -79,6 +85,11 @@ for d in "$common_tests_dir"/*/; do
         echo "RESULT: PASS"
         echo "$name|PASS|$summary" >> "$RESULTS_FILE"
         pass_count=$((pass_count + 1))
+    elif [ $status -eq 124 ]; then
+        echo "RESULT: TIMEOUT (crash hang or long run — killed at ${TEST_TIMEOUT_SECONDS:-14400}s)"
+        echo "$name|TIMEOUT|$summary" >> "$RESULTS_FILE"
+        fail_count=$((fail_count + 1))
+        failed_list+=("$name")
     elif echo "$summary" | grep -qE "test cases:|assertions:"; then
         echo "RESULT: PARTIAL — $summary"
         echo "$name|PARTIAL|$summary" >> "$RESULTS_FILE"
