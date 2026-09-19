@@ -37,6 +37,10 @@ GLIBC_2.17 {
         pthread_setname_np;
         pthread_sigmask;
         sysctl;
+        getpwuid;
+        getpwuid_r;
+        getpwnam;
+        getpwnam_r;
         sysctlbyname;
         sysctlnametomib;
         uname;

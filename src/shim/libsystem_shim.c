@@ -64,6 +64,7 @@ static int shim_startup_log_enabled(void)
 #include <malloc.h>
 #include <locale.h>
 #include <sched.h>
+#include <pwd.h>
 
 #define MACHGATE_SHIM_CALLER() __builtin_extract_return_addr(__builtin_return_address(0))
 
@@ -6340,6 +6341,196 @@ char *shim_getenv(const char *name)
 		        result ? 1 : 0);
 	}
 	return result;
+}
+
+/* ===== Darwin struct passwd marshaling ===== */
+
+struct darwin_passwd {
+	char *pw_name;
+	char *pw_passwd;
+	unsigned int pw_uid;
+	unsigned int pw_gid;
+	long long pw_change;
+	char *pw_class;
+	char *pw_gecos;
+	char *pw_dir;
+	char *pw_shell;
+	long long pw_expire;
+};
+
+static struct darwin_passwd shim_passwd_storage;
+static char shim_passwd_string_storage[2048];
+
+static int (*shim_real_getpwuid_r)(uid_t, struct passwd*, char*, size_t, struct passwd**);
+static int (*shim_real_getpwnam_r)(const char*, struct passwd*, char*, size_t, struct passwd**);
+
+static int shim_resolve_passwd_lookups(void)
+{
+	if (!shim_real_getpwuid_r)
+		shim_real_getpwuid_r = dlsym(RTLD_NEXT, "getpwuid_r");
+	if (!shim_real_getpwnam_r)
+		shim_real_getpwnam_r = dlsym(RTLD_NEXT, "getpwnam_r");
+	return shim_real_getpwuid_r && shim_real_getpwnam_r;
+}
+
+static char *shim_copy_passwd_string(char **cursor, size_t *remaining, const char *value)
+{
+	if (!value)
+		return NULL;
+	size_t length = strlen(value) + 1;
+	if (length > *remaining)
+		return NULL;
+	char *result = *cursor;
+	memcpy(result, value, length);
+	*cursor += length;
+	*remaining -= length;
+	return result;
+}
+
+static struct darwin_passwd *shim_marshal_passwd_static(const struct passwd *host)
+{
+	if (!host)
+		return NULL;
+
+	char *cursor = shim_passwd_string_storage;
+	size_t remaining = sizeof(shim_passwd_string_storage);
+
+	shim_passwd_storage.pw_name = shim_copy_passwd_string(&cursor, &remaining, host->pw_name);
+	shim_passwd_storage.pw_passwd = shim_copy_passwd_string(&cursor, &remaining, host->pw_passwd);
+	shim_passwd_storage.pw_uid = host->pw_uid;
+	shim_passwd_storage.pw_gid = host->pw_gid;
+	shim_passwd_storage.pw_change = 0;
+	shim_passwd_storage.pw_class = shim_copy_passwd_string(&cursor, &remaining, "");
+	shim_passwd_storage.pw_gecos = shim_copy_passwd_string(&cursor, &remaining, host->pw_gecos);
+	shim_passwd_storage.pw_dir = shim_copy_passwd_string(&cursor, &remaining, host->pw_dir);
+	shim_passwd_storage.pw_shell = shim_copy_passwd_string(&cursor, &remaining, host->pw_shell);
+	shim_passwd_storage.pw_expire = 0;
+	return &shim_passwd_storage;
+}
+
+static int shim_marshal_passwd_caller(const struct passwd *host,
+                                      struct darwin_passwd *pwd,
+                                      char *buffer,
+                                      size_t buffer_size,
+                                      struct darwin_passwd **result)
+{
+	if (!pwd || !buffer || !result || !host)
+		return EINVAL;
+
+	char *cursor = buffer;
+	size_t remaining = buffer_size;
+	size_t needed = 0;
+	if (host->pw_name) needed += strlen(host->pw_name) + 1;
+	if (host->pw_passwd) needed += strlen(host->pw_passwd) + 1;
+	needed += 1;
+	if (host->pw_gecos) needed += strlen(host->pw_gecos) + 1;
+	if (host->pw_dir) needed += strlen(host->pw_dir) + 1;
+	if (host->pw_shell) needed += strlen(host->pw_shell) + 1;
+	if (needed > remaining)
+		return ERANGE;
+
+	pwd->pw_name = shim_copy_passwd_string(&cursor, &remaining, host->pw_name);
+	pwd->pw_passwd = shim_copy_passwd_string(&cursor, &remaining, host->pw_passwd);
+	pwd->pw_uid = host->pw_uid;
+	pwd->pw_gid = host->pw_gid;
+	pwd->pw_change = 0;
+	pwd->pw_class = shim_copy_passwd_string(&cursor, &remaining, "");
+	pwd->pw_gecos = shim_copy_passwd_string(&cursor, &remaining, host->pw_gecos);
+	pwd->pw_dir = shim_copy_passwd_string(&cursor, &remaining, host->pw_dir);
+	pwd->pw_shell = shim_copy_passwd_string(&cursor, &remaining, host->pw_shell);
+	pwd->pw_expire = 0;
+	*result = pwd;
+	return 0;
+}
+
+struct darwin_passwd *shim_getpwuid(uid_t uid) __asm__("getpwuid");
+struct darwin_passwd *shim_getpwuid(uid_t uid)
+{
+	if (!shim_resolve_passwd_lookups())
+		return NULL;
+
+	struct passwd host;
+	struct passwd *host_result = NULL;
+	char host_buffer[2048];
+	int status = shim_real_getpwuid_r(uid, &host, host_buffer, sizeof(host_buffer), &host_result);
+	if (status != 0) {
+		errno = status;
+		return NULL;
+	}
+	return shim_marshal_passwd_static(host_result);
+}
+
+struct darwin_passwd *shim_getpwnam(const char *name) __asm__("getpwnam");
+struct darwin_passwd *shim_getpwnam(const char *name)
+{
+	if (!name || !shim_resolve_passwd_lookups())
+		return NULL;
+
+	struct passwd host;
+	struct passwd *host_result = NULL;
+	char host_buffer[2048];
+	int status = shim_real_getpwnam_r(name, &host, host_buffer, sizeof(host_buffer), &host_result);
+	if (status != 0) {
+		errno = status;
+		return NULL;
+	}
+	return shim_marshal_passwd_static(host_result);
+}
+
+int shim_getpwuid_r(uid_t uid,
+                    struct darwin_passwd *pwd,
+                    char *buffer,
+                    size_t buffer_size,
+                    struct darwin_passwd **result) __asm__("getpwuid_r");
+int shim_getpwuid_r(uid_t uid,
+                    struct darwin_passwd *pwd,
+                    char *buffer,
+                    size_t buffer_size,
+                    struct darwin_passwd **result)
+{
+	if (!shim_resolve_passwd_lookups())
+		return ENOENT;
+
+	struct passwd host;
+	struct passwd *host_result = NULL;
+	char host_buffer[2048];
+	int status = shim_real_getpwuid_r(uid, &host, host_buffer, sizeof(host_buffer), &host_result);
+	if (status != 0)
+		return status;
+	if (!host_result) {
+		if (result)
+			*result = NULL;
+		return ENOENT;
+	}
+	return shim_marshal_passwd_caller(host_result, pwd, buffer, buffer_size, result);
+}
+
+int shim_getpwnam_r(const char *name,
+                    struct darwin_passwd *pwd,
+                    char *buffer,
+                    size_t buffer_size,
+                    struct darwin_passwd **result) __asm__("getpwnam_r");
+int shim_getpwnam_r(const char *name,
+                    struct darwin_passwd *pwd,
+                    char *buffer,
+                    size_t buffer_size,
+                    struct darwin_passwd **result)
+{
+	if (!name || !shim_resolve_passwd_lookups())
+		return ENOENT;
+
+	struct passwd host;
+	struct passwd *host_result = NULL;
+	char host_buffer[2048];
+	int status = shim_real_getpwnam_r(name, &host, host_buffer, sizeof(host_buffer), &host_result);
+	if (status != 0)
+		return status;
+	if (!host_result) {
+		if (result)
+			*result = NULL;
+		return ENOENT;
+	}
+	return shim_marshal_passwd_caller(host_result, pwd, buffer, buffer_size, result);
 }
 
 /* ===== _NSGetExecutablePath ===== */
