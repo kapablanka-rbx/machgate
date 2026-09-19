@@ -23,6 +23,8 @@ if [ -z "$common_tests_dir" ] || [ ! -d "$common_tests_dir" ]; then
     exit 1
 fi
 
+engine_root="$(cd "$common_tests_dir/../../.." && pwd)"
+
 DYLIB_MAP='libSystem.B = /opt/machgate-local/libsystem_shim.so
 CoreFoundation = /opt/machgate-local/libsystem_shim.so
 CoreServices = /opt/machgate-local/libsystem_shim.so
@@ -48,22 +50,21 @@ for d in "$common_tests_dir"/*/; do
     name=$(basename "$d")
     unit_test=$(ls "$d"*.UnitTest 2>/dev/null | head -1)
     [ -z "$unit_test" ] && continue
-    binary_name=$(basename "$unit_test")
+    binary_path="$unit_test"
 
     echo "=== $name ==="
     docker run --rm --platform linux/arm64 \
+        --ulimit core=0 \
         -v "$machgate_root/build-arm64:/opt/machgate-local:ro" \
         -v "$machgate_root/build-libcxx/lib:/machgate-libcxx:ro" \
-        -v "$d:/input:ro" \
+        -v "$engine_root:$engine_root:ro" \
         "$image" \
-        bash -lc '
+        bash -c '
             export LD_LIBRARY_PATH=/machgate-libcxx:/opt/machgate-local
             export MACHGATE_CONFIG=/tmp/machgate.conf
             printf "[general]\ndylib_map = /tmp/dylib_map.conf\n" > /tmp/machgate.conf
             printf "'"$DYLIB_MAP"'\n" > /tmp/dylib_map.conf
-            set +e
-            /opt/machgate-local/machgate /input/'"$binary_name"' '"$args"'
-            exit $?
+            exec /opt/machgate-local/machgate '"$binary_path"' '"$args"'
         '
     status=$?
     if [ $status -eq 0 ]; then
