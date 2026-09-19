@@ -57,7 +57,7 @@ for d in "$common_tests_dir"/*/; do
         --ulimit core=0 \
         -v "$machgate_root/build-arm64:/opt/machgate-local:ro" \
         -v "$machgate_root/build-libcxx/lib:/machgate-libcxx:ro" \
-        -v "$engine_root:$engine_root:ro" \
+        -v "$engine_root:$engine_root" \
         "$image" \
         bash -c '
             export LD_LIBRARY_PATH=/machgate-libcxx:/opt/machgate-local
