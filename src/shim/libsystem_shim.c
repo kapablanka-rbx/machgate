@@ -57,6 +57,7 @@ static int shim_startup_log_enabled(void)
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <dirent.h>
@@ -65,6 +66,8 @@ static int shim_startup_log_enabled(void)
 #include <locale.h>
 #include <sched.h>
 #include <pwd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define MACHGATE_SHIM_CALLER() __builtin_extract_return_addr(__builtin_return_address(0))
 
@@ -6157,6 +6160,48 @@ void _exit(int status)
 	__builtin_unreachable();
 }
 
+static void tlv_print_exit_backtrace(void)
+{
+	void* frame_pointer;
+	char line[512];
+	int position = 0;
+
+	__asm__ volatile("mov %0, x29" : "=r"(frame_pointer));
+
+	position += snprintf(line + position, sizeof(line) - position,
+	                    "libsystem_shim: exit backtrace");
+	for (int depth = 0; depth < 16 && frame_pointer; depth++) {
+		void** frame = frame_pointer;
+		void* return_address = frame[1];
+		if (!return_address)
+			break;
+		position += snprintf(line + position, sizeof(line) - position,
+		                     " #%d=%p", depth, return_address);
+		if (position >= (int)sizeof(line) - 32)
+			break;
+		frame_pointer = frame[0];
+		if (!frame_pointer || (uintptr_t)frame_pointer <= (uintptr_t)frame)
+			break;
+	}
+	position += snprintf(line + position, sizeof(line) - position, "\n");
+	fwrite(line, 1, position, stderr);
+}
+
+void _Exit(int status)
+{
+	trace_process_exit_code("_Exit", status, SHIM_CALLER_RETURN_ADDRESS());
+	tlv_print_exit_backtrace();
+	syscall(SYS_exit_group, status);
+	__builtin_unreachable();
+}
+
+void quick_exit(int status)
+{
+	trace_process_exit_code("quick_exit", status, SHIM_CALLER_RETURN_ADDRESS());
+	syscall(SYS_exit_group, status);
+	__builtin_unreachable();
+}
+
 static int shim_errno_from_linux(int linux_errno)
 {
 	switch (linux_errno) {
@@ -6531,6 +6576,441 @@ int shim_getpwnam_r(const char *name,
 		return ENOENT;
 	}
 	return shim_marshal_passwd_caller(host_result, pwd, buffer, buffer_size, result);
+}
+
+/* ===== Darwin socket ABI translation ===== */
+
+#define DARWIN_AF_UNIX   1
+#define DARWIN_AF_INET   2
+#define DARWIN_AF_INET6 30
+
+#define DARWIN_SOL_SOCKET 0xffff
+#define DARWIN_SO_DEBUG      0x0001
+#define DARWIN_SO_ACCEPTCONN 0x0002
+#define DARWIN_SO_REUSEADDR  0x0004
+#define DARWIN_SO_KEEPALIVE  0x0008
+#define DARWIN_SO_DONTROUTE  0x0010
+#define DARWIN_SO_BROADCAST  0x0020
+#define DARWIN_SO_LINGER     0x0080
+#define DARWIN_SO_OOBINLINE  0x0100
+#define DARWIN_SO_REUSEPORT  0x0200
+#define DARWIN_SO_SNDTIMEO   0x1005
+#define DARWIN_SO_RCVTIMEO  0x1006
+#define DARWIN_SO_ERROR      0x1007
+#define DARWIN_SO_TYPE       0x1008
+
+static int shim_map_socket_domain(int darwin_domain)
+{
+	switch (darwin_domain) {
+	case DARWIN_AF_UNIX:
+		return AF_UNIX;
+	case DARWIN_AF_INET:
+		return AF_INET;
+	case DARWIN_AF_INET6:
+		return AF_INET6;
+	default:
+		return darwin_domain;
+	}
+}
+
+static int shim_socket_domain_is_known(int domain)
+{
+	return domain == DARWIN_AF_UNIX || domain == DARWIN_AF_INET ||
+	       domain == DARWIN_AF_INET6;
+}
+
+static int shim_translate_sockaddr_in(const void* darwin_addr,
+                                      socklen_t darwin_len,
+                                      struct sockaddr_storage* linux_addr,
+                                      socklen_t* linux_len)
+{
+	const unsigned char* raw = (const unsigned char*)darwin_addr;
+	int family = raw[0] & 0xff;
+
+	if (!darwin_addr) {
+		*linux_len = 0;
+		return 1;
+	}
+	if (darwin_len < 2 || darwin_len > (socklen_t)sizeof(*linux_addr)) {
+		errno = EINVAL;
+		return 0;
+	}
+	if (!shim_socket_domain_is_known(raw[1])) {
+		errno = EAFNOSUPPORT;
+		return 0;
+	}
+
+	memset(linux_addr, 0, sizeof(*linux_addr));
+	switch (raw[1]) {
+	case DARWIN_AF_UNIX: {
+		struct sockaddr_un* unix_addr = (struct sockaddr_un*)linux_addr;
+		size_t path_len = darwin_len - 2;
+		if (path_len > sizeof(unix_addr->sun_path)) {
+			errno = ENAMETOOLONG;
+			return 0;
+		}
+		unix_addr->sun_family = AF_UNIX;
+		memcpy(unix_addr->sun_path, raw + 2, path_len);
+		*linux_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_len);
+		return 1;
+	}
+	case DARWIN_AF_INET: {
+		struct sockaddr_in* inet_addr = (struct sockaddr_in*)linux_addr;
+		if (darwin_len < (socklen_t)sizeof(struct sockaddr_in)) {
+			errno = EINVAL;
+			return 0;
+		}
+		inet_addr->sin_family = AF_INET;
+		memcpy(&inet_addr->sin_port, raw + 2, 2);
+		memcpy(&inet_addr->sin_addr, raw + 4, 4);
+		*linux_len = (socklen_t)sizeof(struct sockaddr_in);
+		return 1;
+	}
+	case DARWIN_AF_INET6: {
+		struct sockaddr_in6* inet6_addr = (struct sockaddr_in6*)linux_addr;
+		if (darwin_len < 28) {
+			errno = EINVAL;
+			return 0;
+		}
+		inet6_addr->sin6_family = AF_INET6;
+		memcpy(&inet6_addr->sin6_port, raw + 2, 2);
+		memcpy(&inet6_addr->sin6_flowinfo, raw + 4, 4);
+		memcpy(&inet6_addr->sin6_addr, raw + 8, 16);
+		memcpy(&inet6_addr->sin6_scope_id, raw + 24, 4);
+		*linux_len = (socklen_t)sizeof(struct sockaddr_in6);
+		return 1;
+	}
+	default:
+		errno = EAFNOSUPPORT;
+		return 0;
+	}
+}
+
+static socklen_t shim_fill_darwin_sockaddr(const struct sockaddr* linux_addr,
+                                           socklen_t linux_len,
+                                           void* darwin_addr,
+                                           socklen_t darwin_capacity)
+{
+	unsigned char* raw = (unsigned char*)darwin_addr;
+
+	if (!darwin_addr || darwin_capacity < 2)
+		return 0;
+
+	switch (linux_addr->sa_family) {
+	case AF_UNIX: {
+		const struct sockaddr_un* unix_addr = (const struct sockaddr_un*)linux_addr;
+		size_t path_len = linux_len - offsetof(struct sockaddr_un, sun_path);
+		if (path_len > (size_t)(darwin_capacity - 2))
+			path_len = darwin_capacity - 2;
+		raw[0] = (unsigned char)(2 + path_len);
+		raw[1] = DARWIN_AF_UNIX;
+		memcpy(raw + 2, unix_addr->sun_path, path_len);
+		return (socklen_t)(2 + path_len);
+	}
+	case AF_INET: {
+		const struct sockaddr_in* inet_addr = (const struct sockaddr_in*)linux_addr;
+		if (darwin_capacity < (socklen_t)sizeof(struct sockaddr_in))
+			return 0;
+		raw[0] = (unsigned char)sizeof(struct sockaddr_in);
+		raw[1] = DARWIN_AF_INET;
+		memcpy(raw + 2, &inet_addr->sin_port, 2);
+		memcpy(raw + 4, &inet_addr->sin_addr, 4);
+		memset(raw + 8, 0, 8);
+		return (socklen_t)sizeof(struct sockaddr_in);
+	}
+	case AF_INET6: {
+		const struct sockaddr_in6* inet6_addr = (const struct sockaddr_in6*)linux_addr;
+		if (darwin_capacity < 28)
+			return 0;
+		raw[0] = 28;
+		raw[1] = DARWIN_AF_INET6;
+		memcpy(raw + 2, &inet6_addr->sin6_port, 2);
+		memcpy(raw + 4, &inet6_addr->sin6_flowinfo, 4);
+		memcpy(raw + 8, &inet6_addr->sin6_addr, 16);
+		memcpy(raw + 24, &inet6_addr->sin6_scope_id, 4);
+		return 28;
+	}
+	default:
+		return 0;
+	}
+}
+
+static int shim_translate_socket_option(int darwin_level, int darwin_option,
+                                        int* linux_level, int* linux_option)
+{
+	if (darwin_level != DARWIN_SOL_SOCKET) {
+		*linux_level = darwin_level;
+		*linux_option = darwin_option;
+		return 1;
+	}
+
+	*linux_level = SOL_SOCKET;
+	switch (darwin_option) {
+	case DARWIN_SO_DEBUG:      *linux_option = SO_DEBUG;      return 1;
+	case DARWIN_SO_ACCEPTCONN: *linux_option = SO_ACCEPTCONN; return 1;
+	case DARWIN_SO_REUSEADDR:  *linux_option = SO_REUSEADDR;  return 1;
+	case DARWIN_SO_KEEPALIVE:  *linux_option = SO_KEEPALIVE;  return 1;
+	case DARWIN_SO_DONTROUTE:  *linux_option = SO_DONTROUTE;  return 1;
+	case DARWIN_SO_BROADCAST:  *linux_option = SO_BROADCAST;  return 1;
+	case DARWIN_SO_LINGER:     *linux_option = SO_LINGER;     return 1;
+	case DARWIN_SO_OOBINLINE:  *linux_option = SO_OOBINLINE;  return 1;
+#ifdef SO_REUSEPORT
+	case DARWIN_SO_REUSEPORT:  *linux_option = SO_REUSEPORT;  return 1;
+#endif
+#ifdef SO_SNDTIMEO
+	case DARWIN_SO_SNDTIMEO:   *linux_option = SO_SNDTIMEO;   return 1;
+#endif
+#ifdef SO_RCVTIMEO
+	case DARWIN_SO_RCVTIMEO:   *linux_option = SO_RCVTIMEO;  return 1;
+#endif
+	case DARWIN_SO_ERROR:      *linux_option = SO_ERROR;      return 1;
+	case DARWIN_SO_TYPE:       *linux_option = SO_TYPE;       return 1;
+	default:
+		*linux_option = darwin_option;
+		return 1;
+	}
+}
+
+static int (*shim_real_socket)(int, int, int);
+static int (*shim_real_bind)(int, const struct sockaddr*, socklen_t);
+static int (*shim_real_connect)(int, const struct sockaddr*, socklen_t);
+static int (*shim_real_listen)(int, int);
+static int (*shim_real_accept)(int, struct sockaddr*, socklen_t*);
+static int (*shim_real_getsockname)(int, struct sockaddr*, socklen_t*);
+static int (*shim_real_getpeername)(int, struct sockaddr*, socklen_t*);
+static ssize_t (*shim_real_sendto)(int, const void*, size_t, int,
+                                  const struct sockaddr*, socklen_t);
+static ssize_t (*shim_real_recvfrom)(int, void*, size_t, int,
+                                     struct sockaddr*, socklen_t*);
+static int (*shim_real_setsockopt)(int, int, int, const void*, socklen_t);
+static int (*shim_real_getsockopt)(int, int, int, void*, socklen_t*);
+
+static void shim_resolve_real_socket_calls(void)
+{
+	if (!shim_real_socket)
+		shim_real_socket = dlsym(RTLD_NEXT, "socket");
+	if (!shim_real_bind)
+		shim_real_bind = dlsym(RTLD_NEXT, "bind");
+	if (!shim_real_connect)
+		shim_real_connect = dlsym(RTLD_NEXT, "connect");
+	if (!shim_real_listen)
+		shim_real_listen = dlsym(RTLD_NEXT, "listen");
+	if (!shim_real_accept)
+		shim_real_accept = dlsym(RTLD_NEXT, "accept");
+	if (!shim_real_getsockname)
+		shim_real_getsockname = dlsym(RTLD_NEXT, "getsockname");
+	if (!shim_real_getpeername)
+		shim_real_getpeername = dlsym(RTLD_NEXT, "getpeername");
+	if (!shim_real_sendto)
+		shim_real_sendto = dlsym(RTLD_NEXT, "sendto");
+	if (!shim_real_recvfrom)
+		shim_real_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
+	if (!shim_real_setsockopt)
+		shim_real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+	if (!shim_real_getsockopt)
+		shim_real_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
+}
+
+int shim_socket(int domain, int type, int protocol) __asm__("socket");
+int shim_socket(int domain, int type, int protocol)
+{
+	shim_resolve_real_socket_calls();
+	if (!shim_real_socket)
+		return -1;
+	return shim_real_socket(shim_map_socket_domain(domain), type, protocol);
+}
+
+int shim_bind(int sockfd, const void* darwin_addr, socklen_t darwin_len) __asm__("bind");
+int shim_bind(int sockfd, const void* darwin_addr, socklen_t darwin_len)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = 0;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_bind)
+		return -1;
+	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
+	                                &linux_addr, &linux_len))
+		return -1;
+	return shim_real_bind(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+}
+
+int shim_connect(int sockfd, const void* darwin_addr, socklen_t darwin_len) __asm__("connect");
+int shim_connect(int sockfd, const void* darwin_addr, socklen_t darwin_len)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = 0;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_connect)
+		return -1;
+	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
+	                                &linux_addr, &linux_len))
+		return -1;
+	return shim_real_connect(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+}
+
+int shim_listen(int sockfd, int backlog) __asm__("listen");
+int shim_listen(int sockfd, int backlog)
+{
+	shim_resolve_real_socket_calls();
+	if (!shim_real_listen)
+		return -1;
+	return shim_real_listen(sockfd, backlog);
+}
+
+int shim_accept(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr) __asm__("accept");
+int shim_accept(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = sizeof(linux_addr);
+	int result;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_accept)
+		return -1;
+
+	result = shim_real_accept(sockfd, (struct sockaddr*)&linux_addr, &linux_len);
+	if (result < 0)
+		return result;
+
+	if (darwin_addr && darwin_len_ptr) {
+		socklen_t written = shim_fill_darwin_sockaddr(
+			(const struct sockaddr*)&linux_addr, linux_len,
+			darwin_addr, *darwin_len_ptr);
+		if (written)
+			*darwin_len_ptr = written;
+	}
+	return result;
+}
+
+int shim_getsockname(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr) __asm__("getsockname");
+int shim_getsockname(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = sizeof(linux_addr);
+	int result;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_getsockname)
+		return -1;
+
+	result = shim_real_getsockname(sockfd, (struct sockaddr*)&linux_addr, &linux_len);
+	if (result < 0)
+		return result;
+
+	if (darwin_addr && darwin_len_ptr) {
+		socklen_t written = shim_fill_darwin_sockaddr(
+			(const struct sockaddr*)&linux_addr, linux_len,
+			darwin_addr, *darwin_len_ptr);
+		if (written)
+			*darwin_len_ptr = written;
+	}
+	return result;
+}
+
+int shim_getpeername(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr) __asm__("getpeername");
+int shim_getpeername(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = sizeof(linux_addr);
+	int result;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_getpeername)
+		return -1;
+
+	result = shim_real_getpeername(sockfd, (struct sockaddr*)&linux_addr, &linux_len);
+	if (result < 0)
+		return result;
+
+	if (darwin_addr && darwin_len_ptr) {
+		socklen_t written = shim_fill_darwin_sockaddr(
+			(const struct sockaddr*)&linux_addr, linux_len,
+			darwin_addr, *darwin_len_ptr);
+		if (written)
+			*darwin_len_ptr = written;
+	}
+	return result;
+}
+
+ssize_t shim_sendto(int sockfd, const void* buffer, size_t length, int flags,
+                    const void* darwin_addr, socklen_t darwin_len) __asm__("sendto");
+ssize_t shim_sendto(int sockfd, const void* buffer, size_t length, int flags,
+                    const void* darwin_addr, socklen_t darwin_len)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = 0;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_sendto)
+		return -1;
+	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
+	                                &linux_addr, &linux_len))
+		return -1;
+	return shim_real_sendto(sockfd, buffer, length, flags,
+	                        (const struct sockaddr*)&linux_addr, linux_len);
+}
+
+ssize_t shim_recvfrom(int sockfd, void* buffer, size_t length, int flags,
+                      void* darwin_addr, socklen_t* darwin_len_ptr) __asm__("recvfrom");
+ssize_t shim_recvfrom(int sockfd, void* buffer, size_t length, int flags,
+                      void* darwin_addr, socklen_t* darwin_len_ptr)
+{
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = sizeof(linux_addr);
+	ssize_t result;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_recvfrom)
+		return -1;
+
+	result = shim_real_recvfrom(sockfd, buffer, length, flags,
+	                            (struct sockaddr*)&linux_addr, &linux_len);
+	if (result < 0)
+		return result;
+
+	if (darwin_addr && darwin_len_ptr) {
+		socklen_t written = shim_fill_darwin_sockaddr(
+			(const struct sockaddr*)&linux_addr, linux_len,
+			darwin_addr, *darwin_len_ptr);
+		if (written)
+			*darwin_len_ptr = written;
+	}
+	return result;
+}
+
+int shim_setsockopt(int sockfd, int level, int option,
+                   const void* value, socklen_t value_len) __asm__("setsockopt");
+int shim_setsockopt(int sockfd, int level, int option,
+                   const void* value, socklen_t value_len)
+{
+	int linux_level;
+	int linux_option;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_setsockopt)
+		return -1;
+	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
+		return -1;
+	return shim_real_setsockopt(sockfd, linux_level, linux_option, value, value_len);
+}
+
+int shim_getsockopt(int sockfd, int level, int option,
+                    void* value, socklen_t* value_len_ptr) __asm__("getsockopt");
+int shim_getsockopt(int sockfd, int level, int option,
+                    void* value, socklen_t* value_len_ptr)
+{
+	int linux_level;
+	int linux_option;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_getsockopt)
+		return -1;
+	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
+		return -1;
+	return shim_real_getsockopt(sockfd, linux_level, linux_option,
+	                            value, value_len_ptr);
 }
 
 /* ===== _NSGetExecutablePath ===== */
@@ -7034,23 +7514,51 @@ static void forget_pthread_identity(pthread_t thread)
 	unlock_pthread_id_slots();
 }
 
-static inline uintptr_t *darwin_tsd_mirror_base(void)
-{
-#if defined(__aarch64__)
-	uintptr_t *result;
-	__asm__ volatile("mrs %0, tpidr_el0" : "=r"(result));
-	return result;
-#else
-	return NULL;
-#endif
-}
-
 static inline int darwin_tsd_key_index(pthread_key_t key)
 {
 	unsigned int value = (unsigned int)key;
 	if (value < DARWIN_TSD_FIRST_KEY || value > DARWIN_TSD_LAST_KEY)
 		return -1;
 	return (int)(value - DARWIN_TSD_FIRST_KEY);
+}
+
+static int shim_tsd_allocate_key(pthread_key_t *key, void (*destructor)(void *))
+{
+	unsigned int value;
+	int index;
+
+	value = __sync_fetch_and_add(&next_darwin_tsd_key, 1);
+	if (value > DARWIN_TSD_LAST_KEY)
+		return EAGAIN;
+
+	index = (int)(value - DARWIN_TSD_FIRST_KEY);
+	darwin_tsd_destructors[index] = destructor;
+	darwin_tsd_values[index] = NULL;
+	*key = (pthread_key_t)value;
+
+	return 0;
+}
+
+static int shim_tsd_set(pthread_key_t key, void *value)
+{
+	int index = darwin_tsd_key_index(key);
+
+	if (index < 0)
+		return EINVAL;
+
+	darwin_tsd_values[index] = value;
+
+	return 0;
+}
+
+static void *shim_tsd_get(pthread_key_t key)
+{
+	int index = darwin_tsd_key_index(key);
+
+	if (index < 0)
+		return NULL;
+
+	return darwin_tsd_values[index];
 }
 
 __attribute__((constructor(101)))
@@ -7151,54 +7659,35 @@ int pthread_mutex_destroy(pthread_mutex_t *mutex)
 
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
 {
-	unsigned int value;
-	int index;
-
-	value = __sync_fetch_and_add(&next_darwin_tsd_key, 1);
-	if (value > DARWIN_TSD_LAST_KEY)
-		return EAGAIN;
-
-	index = (int)(value - DARWIN_TSD_FIRST_KEY);
-	darwin_tsd_destructors[index] = destructor;
-	darwin_tsd_values[index] = NULL;
-	*key = (pthread_key_t)value;
+	int result = shim_tsd_allocate_key(key, destructor);
 
 	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_key_create -> %u\n", value);
+		fprintf(stderr, "libsystem_shim: pthread_key_create -> %u\n",
+		        (unsigned int)*key);
 
-	return 0;
+	return result;
 }
 
 int pthread_setspecific(pthread_key_t key, const void *value)
 {
-	uintptr_t *mirror_base;
-	int index = darwin_tsd_key_index(key);
-
-	if (index < 0)
-		return EINVAL;
-
-	darwin_tsd_values[index] = (void *)value;
-	mirror_base = darwin_tsd_mirror_base();
-	if (mirror_base)
-		mirror_base[(unsigned int)key] = (uintptr_t)value;
+	int result = shim_tsd_set(key, (void *)value);
 
 	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_setspecific(%u, %p)\n",
-		        (unsigned int)key, value);
+		fprintf(stderr, "libsystem_shim: pthread_setspecific(%u, %p) caller=%p\n",
+		        (unsigned int)key, value, __builtin_return_address(0));
 
-	return 0;
+	return result;
 }
 
 void *pthread_getspecific(pthread_key_t key)
 {
-	int index = darwin_tsd_key_index(key);
+	void *result = shim_tsd_get(key);
 
-	if (index < 0)
-		return NULL;
 	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_getspecific(%u) -> %p\n",
-		        (unsigned int)key, darwin_tsd_values[index]);
-	return darwin_tsd_values[index];
+		fprintf(stderr, "libsystem_shim: pthread_getspecific(%u) -> %p caller=%p\n",
+		        (unsigned int)key, result, __builtin_return_address(0));
+
+	return result;
 }
 
 int pthread_once(pthread_once_t *once_control, void (*init_routine)(void))
@@ -8088,9 +8577,15 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
 	result = real_pthread_create(thread, slot ? &slot->native : attr,
 	                             shim_pthread_start, context);
 	if (result != 0) {
+		if (shim_trace_enabled())
+			fprintf(stderr, "libsystem_shim: pthread_create FAILED result=%d attr=%p slot=%p\n",
+			        result, attr, (void*)slot);
 		free_thread_start_context(context);
 		return result;
 	}
+	if (!slot && attr && shim_trace_enabled())
+		fprintf(stderr, "libsystem_shim: pthread_create unregistered attr=%p passed raw\n",
+		        attr);
 	pthread_identity_for_thread(*thread);
 	return 0;
 }
@@ -8901,6 +9396,25 @@ int pthread_set_qos_class_self_np(int qos_class, int relative_priority)
 int pthread_main_np(void)
 {
 	return syscall(SYS_gettid) == getpid();
+}
+
+int pthread_cpu_number_np(unsigned int* cpu_number)
+{
+	int result;
+
+	if (!cpu_number)
+		return EINVAL;
+
+	result = sched_getcpu();
+	*cpu_number = result >= 0 ? (unsigned int)result : 0;
+	return 0;
+}
+
+int pthread_mutexattr_setpolicy_np(pthread_mutexattr_t* attr, int policy)
+{
+	(void)attr;
+	(void)policy;
+	return 0;
 }
 
 int pthread_self_is_exiting_np(void)
@@ -10466,9 +10980,22 @@ struct tlv_descriptor {
 
 static pthread_mutex_t tlv_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#define TLV_BLOCK_PREFIX 16
+
 static void tlv_destructor(void* block)
 {
-	free(block);
+	free((char*)block - TLV_BLOCK_PREFIX);
+}
+
+static char* tlv_allocate_block(size_t capacity)
+{
+	char* storage = calloc(1, TLV_BLOCK_PREFIX + capacity);
+	if (!storage)
+		return NULL;
+	*(size_t*)storage = capacity;
+	if (__tlv_image_base && __tlv_image_size > 0)
+		memcpy(storage + TLV_BLOCK_PREFIX, __tlv_image_base, __tlv_image_size);
+	return storage + TLV_BLOCK_PREFIX;
 }
 
 void* _tlv_bootstrap_impl(struct tlv_descriptor* desc)
@@ -10477,29 +11004,39 @@ void* _tlv_bootstrap_impl(struct tlv_descriptor* desc)
 		pthread_mutex_lock(&tlv_mutex);
 		if (desc->key == 0) {
 			pthread_key_t key;
-			pthread_key_create(&key, tlv_destructor);
+			shim_tsd_allocate_key(&key, tlv_destructor);
 			desc->key = (unsigned long)key + 1;
 		}
 		pthread_mutex_unlock(&tlv_mutex);
 	}
 
 	pthread_key_t key = (pthread_key_t)(desc->key - 1);
-	void* block = pthread_getspecific(key);
+	char* block = shim_tsd_get(key);
+
+	size_t needed = __tlv_image_size + __tlv_bss_size;
+	if (needed < desc->offset + 16)
+		needed = desc->offset + 16;
+	if (needed < 4096) needed = 4096;
 
 	if (!block) {
-		/* Allocate per-thread TLV block */
-		size_t total = __tlv_image_size + __tlv_bss_size;
-		if (total < 4096) total = 4096; /* minimum size */
-		block = calloc(1, total);
-
-		/* Copy initial values from __thread_data */
-		if (__tlv_image_base && __tlv_image_size > 0)
-			memcpy(block, __tlv_image_base, __tlv_image_size);
-
-		pthread_setspecific(key, block);
+		block = tlv_allocate_block(needed);
+		if (!block)
+			return NULL;
+		shim_tsd_set(key, block);
+	} else {
+		size_t capacity = *(size_t*)(block - TLV_BLOCK_PREFIX);
+		if (capacity < needed) {
+			char* grown = tlv_allocate_block(needed);
+			if (!grown)
+				return NULL;
+			memcpy(grown, block, capacity);
+			free(block - TLV_BLOCK_PREFIX);
+			shim_tsd_set(key, grown);
+			block = grown;
+		}
 	}
 
-	return (char*)block + desc->offset;
+	return block + desc->offset;
 }
 
 #if defined(__aarch64__)
@@ -13376,4 +13913,200 @@ size_t malloc_size(const void* ptr)
 	if (result == 0 && shim_alloc_trace_enabled())
 		fprintf(stderr, "libsystem_shim: malloc_size zero foreign ptr=%p\n", ptr);
 	return result;
+}
+
+#define SHIM_OBJC_MAGIC 0x4F424A43
+
+enum shim_objc_kind {
+	SHIM_OBJC_CLASS_NSPROCESSINFO,
+	SHIM_OBJC_INSTANCE_NSPROCESSINFO,
+	SHIM_OBJC_CLASS_NSSTRING,
+	SHIM_OBJC_STRING,
+};
+
+struct shim_objc_header {
+	uint32_t magic;
+	uint32_t kind;
+};
+
+struct shim_objc_string {
+	struct shim_objc_header header;
+	char utf8[];
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSProcessInfo = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSPROCESSINFO,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSString = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSSTRING,
+};
+
+static struct shim_objc_header shim_processinfo_singleton = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSPROCESSINFO,
+};
+
+static const uint32_t shim_objc_os_version[3] = {15, 0, 0};
+
+static int shim_objc_is_object(const void* receiver, uint32_t kind)
+{
+	const struct shim_objc_header* header = receiver;
+	return header->magic == SHIM_OBJC_MAGIC && header->kind == kind;
+}
+
+static void* shim_objc_make_string(const char* text)
+{
+	size_t length = strlen(text);
+	struct shim_objc_string* result = malloc(sizeof(*result) + length + 1);
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_STRING;
+	memcpy(result->utf8, text, length + 1);
+	return result;
+}
+
+static char* shim_objc_format_integers(const char* format, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6)
+{
+	uintptr_t values[4] = {a3, a4, a5, a6};
+	size_t capacity = strlen(format) * 4 + 128;
+	char* result = malloc(capacity);
+	size_t position = 0;
+	int value_index = 0;
+
+	if (!result)
+		return NULL;
+
+	for (const char* cursor = format; *cursor && position + 32 < capacity; cursor++) {
+		if (*cursor != '%') {
+			result[position++] = *cursor;
+			continue;
+		}
+		const char* spec = cursor + 1;
+		if (*spec == '%') {
+			result[position++] = '%';
+			cursor = spec;
+			continue;
+		}
+		while (*spec == 'l' || *spec == 'z')
+			spec++;
+		if ((*spec == 'd' || *spec == 'u') && value_index < 4) {
+			uintptr_t value = values[value_index++];
+			int written;
+			if (*spec == 'd')
+				written = snprintf(result + position, capacity - position, "%ld", (long)value);
+			else
+				written = snprintf(result + position, capacity - position, "%lu", (unsigned long)value);
+			if (written > 0)
+				position += (size_t)written;
+			cursor = spec;
+		} else {
+			result[position++] = *cursor;
+		}
+	}
+	result[position] = '\0';
+	return result;
+}
+
+void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t a3,
+                             uintptr_t a4, uintptr_t a5, uintptr_t a6, void* sret)
+{
+	const char* selector = sel;
+
+	if (!receiver || !selector)
+		return NULL;
+
+	if (strcmp(selector, "processInfo") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSPROCESSINFO))
+			return &shim_processinfo_singleton;
+	} else if (strcmp(selector, "operatingSystemVersion") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSPROCESSINFO) && sret) {
+			memcpy(sret, shim_objc_os_version, sizeof(shim_objc_os_version));
+			return sret;
+		}
+	} else if (strcmp(selector, "stringWithFormat:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSSTRING)) {
+			char* text = shim_objc_format_integers((const char*)a2, a3, a4, a5, a6);
+			void* result;
+			if (!text)
+				return NULL;
+			result = shim_objc_make_string(text);
+			free(text);
+			return result;
+		}
+	} else if (strcmp(selector, "UTF8String") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
+			return ((struct shim_objc_string*)receiver)->utf8;
+	}
+
+	if (shim_trace_enabled())
+		fprintf(stderr, "libsystem_shim: objc_msgSend unhandled selector '%s' receiver=%p\n",
+		        selector, receiver);
+	return NULL;
+}
+
+#if defined(__aarch64__)
+__asm__(
+	".text\n"
+	".global objc_msgSend\n"
+	".type objc_msgSend, %function\n"
+	"objc_msgSend:\n"
+	"mov x7, x8\n"
+	"b shim_objc_msgSend_impl\n"
+);
+#else
+void* objc_msgSend(void* receiver, void* sel, ...)
+{
+	void* sret = NULL;
+	return shim_objc_msgSend_impl(receiver, sel, 0, 0, 0, 0, 0, sret);
+}
+#endif
+
+void* objc_getClass(const char* name)
+{
+	if (!name)
+		return NULL;
+	if (strcmp(name, "NSProcessInfo") == 0)
+		return &OBJC_CLASS_$_NSProcessInfo;
+	if (strcmp(name, "NSString") == 0)
+		return &OBJC_CLASS_$_NSString;
+	if (shim_trace_enabled())
+		fprintf(stderr, "libsystem_shim: objc_getClass unknown '%s'\n", name);
+	return NULL;
+}
+
+void* objc_lookUpClass(const char* name)
+{
+	return objc_getClass(name);
+}
+
+void* objc_retain(void* object)
+{
+	return object;
+}
+
+void objc_release(void* object)
+{
+	(void)object;
+}
+
+void* objc_autorelease(void* object)
+{
+	return object;
+}
+
+void* objc_retainAutoreleasedReturnValue(void* object)
+{
+	return object;
+}
+
+void* objc_autoreleaseReturnValue(void* object)
+{
+	return object;
+}
+
+void objc_storeStrong(void** location, void* object)
+{
+	if (location)
+		*location = object;
 }

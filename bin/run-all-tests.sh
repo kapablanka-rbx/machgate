@@ -34,8 +34,8 @@ libresolv = /opt/machgate-local/libsystem_shim.so
 libicucore = /opt/machgate-local/libsystem_shim.so
 libz.1 = libz.so
 libiconv = libc.so.6
-libobjc = STUB
-Foundation = SKIP
+libobjc = /opt/machgate-local/libsystem_shim.so
+Foundation = /opt/machgate-local/libsystem_shim.so
 SystemConfiguration = SKIP
 AppKit = SKIP
 libc++.1 = /machgate-libcxx/libc++.so.1'
@@ -51,6 +51,7 @@ echo "binary|status|summary" > "$RESULTS_FILE"
 
 for d in "$common_tests_dir"/*/; do
     name=$(basename "$d")
+    case " ${SKIP_BINARIES:-} " in *" $name "*) echo "=== $name (skipped) ==="; continue;; esac
     unit_test=$(ls "$d"*.UnitTest 2>/dev/null | head -1)
     [ -z "$unit_test" ] && continue
 
@@ -73,6 +74,7 @@ for d in "$common_tests_dir"/*/; do
             exec /opt/machgate-local/machgate '"$unit_test"' '"$run_flags"'
         ' 2>&1 | tee "$logfile"
     timeout_status=${PIPESTATUS[0]}
+    docker kill $(docker ps -q --filter ancestor="$image" --filter status=running) >/dev/null 2>&1 || true
     if [ $timeout_status -eq 124 ] || [ $timeout_status -eq 137 ]; then
         status=124
     else

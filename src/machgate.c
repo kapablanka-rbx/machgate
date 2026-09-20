@@ -1758,6 +1758,12 @@ static void setup_tlv_image(struct load_results* lr)
 		shim = dlopen(shim_paths[i], RTLD_NOLOAD | RTLD_LAZY);
 		if (shim) break;
 	}
+	if (!shim) {
+		extern void* resolver_libsystem_shim_handle(void);
+		shim = resolver_libsystem_shim_handle();
+		if (shim)
+			machgate_log_startup("machgate: TLV shim located via resolver handle\n");
+	}
 	if (shim) {
 		void** p_base = (void**)dlsym(shim, "__tlv_image_base");
 		size_t* p_size = (size_t*)dlsym(shim, "__tlv_image_size");

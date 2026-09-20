@@ -782,6 +782,8 @@ static struct {
 	int ndylibs;
 } g_deferred;
 
+static void* g_libsystem_shim_handle;
+
 static void* (*g_real_SDL_GL_CreateContext)(void*) = NULL;
 static int (*g_real_SDL_GL_SetAttribute)(int, int) = NULL;
 
@@ -1964,6 +1966,9 @@ static int open_dylibs(struct resolver_state* rs)
 			continue;
 		}
 
+		if (strstr(m->so_path, "libsystem_shim.so"))
+			g_libsystem_shim_handle = de->handle;
+
 		snprintf(de->so_path, MAX_NAME, "%s", m->so_path);
 		de->action = DYLIB_MAP;
 		machgate_log_startup("resolver: dylib[%d] '%s' → '%s' — loaded\n",
@@ -1971,6 +1976,11 @@ static int open_dylibs(struct resolver_state* rs)
 	}
 
 	return 0;
+}
+
+void* resolver_libsystem_shim_handle(void)
+{
+	return g_libsystem_shim_handle;
 }
 
 /* ---- Make segment writable for patching ---- */
@@ -2120,10 +2130,10 @@ static void resolver_complete_deferred(void)
 		const char* lookup = db->sym_name;
 		if (lookup[0] == '_') lookup++;
 
-		/* Strip $ suffixes */
+		/* Strip $ suffixes, but keep ObjC $_ symbols (OBJC_CLASS_$_Name) */
 		char stripped[256];
 		const char* dollar = strchr(lookup, '$');
-		if (dollar && (size_t)(dollar - lookup) < sizeof(stripped)) {
+		if (dollar && dollar[1] != '_' && (size_t)(dollar - lookup) < sizeof(stripped)) {
 			memcpy(stripped, lookup, dollar - lookup);
 			stripped[dollar - lookup] = '\0';
 			lookup = stripped;
@@ -2256,11 +2266,12 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 		lookup_name++;
 
 	/* Strip Apple $ suffixes ($DARWIN_EXTSN, $UNIX2003, $NOCANCEL).
-	 * On Linux, glibc provides the modern behavior by default. */
+	 * On Linux, glibc provides the modern behavior by default.
+	 * ObjC $_ symbols (OBJC_CLASS_$_Name) keep their $ intact. */
 	char dollar_stripped[256];
 	{
 		const char* dollar = strchr(lookup_name, '$');
-		if (dollar) {
+		if (dollar && dollar[1] != '_') {
 			size_t len = dollar - lookup_name;
 			if (len < sizeof(dollar_stripped)) {
 				memcpy(dollar_stripped, lookup_name, len);
@@ -2676,11 +2687,12 @@ static uintptr_t resolve_bind_by_name(struct resolver_state* rs,
 		lookup_name++;
 	const struct dylib_entry* trace_de = NULL;
 
-	/* Strip Apple $ suffixes ($DARWIN_EXTSN, $UNIX2003, $NOCANCEL) */
+	/* Strip Apple $ suffixes ($DARWIN_EXTSN, $UNIX2003, $NOCANCEL).
+	 * ObjC $_ symbols (OBJC_CLASS_$_Name) keep their $ intact. */
 	char dollar_stripped[256];
 	{
 		const char* dollar = strchr(lookup_name, '$');
-		if (dollar) {
+		if (dollar && dollar[1] != '_') {
 			size_t len = dollar - lookup_name;
 			if (len < sizeof(dollar_stripped)) {
 				memcpy(dollar_stripped, lookup_name, len);
@@ -2994,7 +3006,7 @@ static void do_bind_one(struct resolver_state* rs, int seg_index,
 			lookup_name++;
 		char stripped[256];
 		const char* dollar = strchr(lookup_name, '$');
-		if (dollar && (size_t)(dollar - lookup_name) < sizeof(stripped)) {
+		if (dollar && dollar[1] != '_' && (size_t)(dollar - lookup_name) < sizeof(stripped)) {
 			memcpy(stripped, lookup_name, dollar - lookup_name);
 			stripped[dollar - lookup_name] = '\0';
 			lookup_name = stripped;

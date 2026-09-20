@@ -230,8 +230,8 @@ libresolv = __SHIM_PATH__
 libicucore = __SHIM_PATH__
 libz.1 = libz.so
 libiconv = libc.so.6
-libobjc = STUB
-Foundation = SKIP
+libobjc = /opt/machgate-local/libsystem_shim.so
+Foundation = /opt/machgate-local/libsystem_shim.so
 SystemConfiguration = SKIP
 AppKit = SKIP
 MAP_EOF
