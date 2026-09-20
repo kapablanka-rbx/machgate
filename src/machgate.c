@@ -898,7 +898,18 @@ int main(int argc, char** argv, char** envp)
 		}
 		size_t lse_pool_size = 0;
 		uint32_t* lse_pool = NULL;
-		if (!host_supports_lse_atomics()) {
+		const char* lse_mode = getenv_compat("MACHGATE_LSE_EMULATION",
+		                                     "MACHISMO_LSE_EMULATION");
+		int lse_disabled = lse_mode && lse_mode[0] &&
+		                   (strcmp(lse_mode, "0") == 0 ||
+		                    strcasecmp(lse_mode, "off") == 0 ||
+		                    strcasecmp(lse_mode, "disable") == 0 ||
+		                    strcasecmp(lse_mode, "disabled") == 0);
+		int lse_forced = lse_mode && lse_mode[0] &&
+		                 strcasecmp(lse_mode, "force") == 0;
+		if (lse_disabled) {
+			machgate_log_startup("machgate: LSE emulation disabled by MACHGATE_LSE_EMULATION — binary must not use LSE atomics on this host\n");
+		} else if (lse_forced || !host_supports_lse_atomics()) {
 			lse_pool_size = estimate_main_lse_pool_size(&machgate_load_results);
 			lse_pool = allocate_main_lse_pool(text_begin, text_end,
 			                                   lse_pool_size,
@@ -907,7 +918,7 @@ int main(int argc, char** argv, char** envp)
 				fprintf(stderr, "machgate: WARNING: LSE pool alloc failed — LSE atomics will SIGILL\n");
 			}
 		} else {
-			machgate_log_startup("machgate: host executes LSE atomics natively — skipping emulation\n");
+			machgate_log_startup("machgate: host executes LSE atomics natively — skipping emulation (set MACHGATE_LSE_EMULATION=force to override)\n");
 		}
 
 		lse_pool_cur = lse_pool;
