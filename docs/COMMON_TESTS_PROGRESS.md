@@ -137,3 +137,29 @@ All 32 iOS common-test binaries pass `--help` and `--list-content`. Not yet test
 ## Blocking factor
 
 QEMU emulation on x86_64 makes each binary 10-50x slower. On a real ARM64 host, all tests would finish in minutes.
+
+## 2026-09-20 — crash-class arc: exit 232 (App_Group) resolved
+
+Root cause chain (all fixed MachGate-side, stock binaries unchanged):
+1. TLV image never reached the shim (loader probed ./libsystem_shim.so paths;
+   resolver loads it at the dylib_map path) -> 4096-byte TLV blocks vs 15416
+   needed. Fixed via resolver handle + __tlv_bss_size export + growable blocks.
+2. pthread_cpu_number_np was a return-0 stub with unwritten out-param
+   (STM per-CPU pool index). Fixed via sched_getcpu.
+3. _tlv_atexit was a no-op -> guest thread_local dtors never ran at thread
+   exit -> STM Context leak (1024 total, no fallback) -> reuse(128) NULL ->
+   STM_ENSURE -> nested panic -> _Exit(1000) -> exit 232. Fixed with real
+   per-thread TLV term-func list + Darwin TSD destructors (4-pass) run in
+   shim_pthread_start and exit().
+
+Remaining App_Group SIGABRT at ClassChecks/SetPropertySlots is NOT a MachGate
+bug: the test is in the official Linebacker exclusion list
+(game-engine Client/BuildScripts/rotest/filter_config/linebacker-exclusions.json)
+— it is excluded from macOS/Linux CI runs as well. It poisons whole-binary
+corpus runs (everything after it is lost). Future corpus accuracy work: run
+crashing binaries per-test with the exclusion list (CI's model), or annotate
+results against the exclusions JSON.
+
+Also discovered: test binaries accept --fflags=true|false|FFlag<Name>=value
+and --fflag_file=<path>; several tests are flag-sensitive (daemon-scheduler
+runs pin flags per test).
