@@ -850,6 +850,20 @@ static void stale_data_sigsegv(int sig, siginfo_t* info, void* ucontext)
 		print_signal_macho_context("signal.lr", lr, 0);
 		if (lr >= 4)
 			print_signal_macho_context("signal.lr-4", lr - 4, lr - 4);
+		if (fp >= 16 && fp > sp && (fp & 7) == 0) {
+			for (int depth = 0; depth < 16; depth++) {
+				uintptr_t* frame = (uintptr_t*)fp;
+				uintptr_t next_fp = frame[0];
+				uintptr_t frame_lr = frame[1];
+				char label[32];
+				snprintf(label, sizeof(label), "signal.fp[%d]", depth);
+				print_signal_macho_context(label, frame_lr, 0);
+				if (next_fp <= fp || next_fp - fp > (1 << 20) ||
+				    (next_fp & 7) != 0)
+					break;
+				fp = next_fp;
+			}
+		}
 		fprintf(stderr,
 		        "machgate: regs x0=%p x1=%p x2=%p x3=%p x4=%p x5=%p x6=%p x7=%p x8=%p\n",
 		        (void*)ucontext_reg(ucontext, 0),
