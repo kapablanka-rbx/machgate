@@ -47,6 +47,10 @@ Why:
 
 All game-engine common-test builds for MachGate must use `sanitize=none`.
 
+Plan to lift this: docs/ASAN_PLAN.md (Approach A: load Apple's real
+`libclang_rt.asan_osx_dynamic.dylib` as a guest dylib; fallback B: ASan shim
+from the compiler-rt sources in the llvm-project submodule).
+
 ## Release workflow status
 
 The release workflow (`.github/workflows/release.yml`) is set up for
