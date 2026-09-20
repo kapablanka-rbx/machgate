@@ -84,6 +84,8 @@ static int shim_alloc_signal_dump_enabled(void);
 static int shim_host_sigchld_handler_enabled(void);
 static FILE* shim_open_trace_file(void);
 static void shim_fd_trace_log(const char* format, ...);
+static void shim_run_tlv_term_funcs(void);
+static void shim_run_thread_tsd_destructors(void);
 static pid_t shim_trace_tid(void);
 static unsigned long shim_trace_pthread_self(void);
 static const char* shim_trace_path(const char* path);
@@ -6149,6 +6151,8 @@ static void trace_process_exit_code(const char* name, int status, void* caller)
 void exit(int status)
 {
 	trace_process_exit_code("exit", status, SHIM_CALLER_RETURN_ADDRESS());
+	shim_run_tlv_term_funcs();
+	shim_run_thread_tsd_destructors();
 	syscall(SYS_exit_group, status);
 	__builtin_unreachable();
 }
@@ -8549,10 +8553,14 @@ static void* shim_pthread_start(void* raw_context)
 		(struct shim_thread_start_context*)raw_context;
 	void* (*start_routine)(void*) = context->start_routine;
 	void* arg = context->arg;
+	void* result;
 
 	register_current_pthread_identity();
 	free_thread_start_context(context);
-	return start_routine(arg);
+	result = start_routine(arg);
+	shim_run_tlv_term_funcs();
+	shim_run_thread_tsd_destructors();
+	return result;
 }
 
 int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
@@ -10943,12 +10951,55 @@ void dispatch_retain(void *object)
 	__sync_add_and_fetch(&obj->refcount, 1);
 }
 
-/* ===== Thread-local variable support (stubs) ===== */
+/* ===== Thread-local variable support ===== */
+
+#define SHIM_TLV_TERM_MAX 512
+#define SHIM_TSD_DESTRUCTOR_PASSES 4
+
+struct shim_tlv_term_entry {
+	void (*func)(void*);
+	void* obj;
+};
+
+static __thread struct shim_tlv_term_entry shim_tlv_term_entries[SHIM_TLV_TERM_MAX];
+static __thread int shim_tlv_term_count;
 
 void _tlv_atexit(void (*func)(void *), void *arg)
 {
-	(void)func; (void)arg;
-	/* Best-effort: ignore TLV cleanup registration */
+	if (shim_tlv_term_count >= SHIM_TLV_TERM_MAX)
+		return;
+	shim_tlv_term_entries[shim_tlv_term_count].func = func;
+	shim_tlv_term_entries[shim_tlv_term_count].obj = arg;
+	shim_tlv_term_count++;
+}
+
+static void shim_run_tlv_term_funcs(void)
+{
+	while (shim_tlv_term_count > 0) {
+		shim_tlv_term_count--;
+		shim_tlv_term_entries[shim_tlv_term_count].func(
+			shim_tlv_term_entries[shim_tlv_term_count].obj);
+	}
+}
+
+static void shim_run_thread_tsd_destructors(void)
+{
+	for (int pass = 0; pass < SHIM_TSD_DESTRUCTOR_PASSES; pass++) {
+		int rerun = 0;
+		for (int index = 0; index < DARWIN_TSD_KEY_COUNT; index++) {
+			void* value = darwin_tsd_values[index];
+			if (!value)
+				continue;
+			darwin_tsd_values[index] = NULL;
+			if (darwin_tsd_destructors[index]) {
+				darwin_tsd_destructors[index](value);
+				if (darwin_tsd_values[index])
+					rerun = 1;
+			}
+		}
+		if (!rerun)
+			break;
+	}
 }
 
 /*
