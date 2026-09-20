@@ -16,11 +16,11 @@
 set -uo pipefail
 
 # ================= Configuration =================
-PARALLEL=4              # binaries running at the same time
-STALL_SECONDS=180       # no-output watchdog per binary (0 = disabled)
-TEST_TIMEOUT_SECONDS=1200  # hard ceiling per binary
-SKIP_BINARIES=""        # space-separated binary names to skip, e.g. "App App_Group"
-RUN_FLAGS=""            # extra args passed to every test binary
+PARALLEL=16                # binaries running at the same time (48-core box)
+STALL_SECONDS=120          # no-output watchdog per binary (0 = disabled)
+TEST_TIMEOUT_SECONDS=1800  # hard ceiling per binary (room for slow passers)
+SKIP_BINARIES=""           # space-separated binary names to skip, e.g. "App App_Group"
+RUN_FLAGS=""               # extra args passed to every test binary
 # ==================================================
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
