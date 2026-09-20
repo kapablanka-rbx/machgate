@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# Run every common-tests binary through MachGate in an ARM64 container.
+#
+# Env knobs:
+#   TEST_TIMEOUT_SECONDS  hard ceiling per binary (default 1800)
+#   STALL_SECONDS         no-output watchdog — a binary whose log stops
+#                         growing this long gets its container killed and
+#                         the run moves on (default 180; 0 disables)
+#   SKIP_BINARIES         space-separated binary names to skip
+#   RUN_FLAGS             extra args passed to every test binary
+#   COMMON_TESTS_DIR      corpus location
 set -uo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -59,23 +69,49 @@ for d in "$common_tests_dir"/*/; do
     echo "  machgate $unit_test $run_flags" >&2
 
     logfile="$LOG_DIR/$name.log"
-    timeout --foreground --kill-after=10s "${TEST_TIMEOUT_SECONDS:-1800}s" \
-      docker run --rm --platform linux/arm64 \
-        --ulimit core=0 \
-        -v "$machgate_root/build-arm64:/opt/machgate-local:ro" \
-        -v "$machgate_root/build-libcxx/lib:/machgate-libcxx:ro" \
-        -v "$engine_root:$engine_root" \
-        "$image" \
-        bash -c '
-            export LD_LIBRARY_PATH=/machgate-libcxx:/opt/machgate-local
-            export MACHGATE_CONFIG=/tmp/machgate.conf
-            printf "[general]\ndylib_map = /tmp/dylib_map.conf\n" > /tmp/machgate.conf
-            printf "'"$DYLIB_MAP"'\n" > /tmp/dylib_map.conf
-            exec /opt/machgate-local/machgate '"$unit_test"' '"$run_flags"'
-        ' 2>&1 | tee "$logfile"
-    timeout_status=${PIPESTATUS[0]}
+    stall_seconds="${STALL_SECONDS:-180}"
+    if ! [ "$stall_seconds" -gt 0 ] 2>/dev/null; then
+        stall_seconds=99999999
+    fi
+    rm -f "$LOG_DIR/${name}.exit"
+    (
+        timeout --foreground --kill-after=10s "${TEST_TIMEOUT_SECONDS:-1800}s" \
+          docker run --rm --platform linux/arm64 \
+            --ulimit core=0 \
+            -v "$machgate_root/build-arm64:/opt/machgate-local:ro" \
+            -v "$machgate_root/build-libcxx/lib:/machgate-libcxx:ro" \
+            -v "$engine_root:$engine_root" \
+            "$image" \
+            bash -c '
+                export LD_LIBRARY_PATH=/machgate-libcxx:/opt/machgate-local
+                export MACHGATE_CONFIG=/tmp/machgate.conf
+                printf "[general]\ndylib_map = /tmp/dylib_map.conf\n" > /tmp/machgate.conf
+                printf "'"$DYLIB_MAP"'\n" > /tmp/dylib_map.conf
+                exec /opt/machgate-local/machgate '"$unit_test"' '"$run_flags"'
+            ' 2>&1 | tee "$logfile"
+        echo "${PIPESTATUS[0]}" > "$LOG_DIR/${name}.exit"
+    ) &
+    run_pipeline_pid=$!
+
+    last_size=0
+    last_growth_epoch=$(date +%s)
+    while kill -0 "$run_pipeline_pid" 2>/dev/null; do
+        sleep 15
+        cur_size=$(stat -c %s "$logfile" 2>/dev/null || echo 0)
+        cur_epoch=$(date +%s)
+        if [ "$cur_size" -gt "$last_size" ]; then
+            last_size=$cur_size
+            last_growth_epoch=$cur_epoch
+        elif [ $((cur_epoch - last_growth_epoch)) -ge "$stall_seconds" ]; then
+            echo "  stall: no output for ${stall_seconds}s — killing container" >&2
+            docker kill $(docker ps -q --filter ancestor="$image" --filter status=running) >/dev/null 2>&1 || true
+            last_growth_epoch=$cur_epoch
+        fi
+    done
+    wait "$run_pipeline_pid" 2>/dev/null
+    timeout_status=$(cat "$LOG_DIR/${name}.exit" 2>/dev/null || echo 1)
     docker kill $(docker ps -q --filter ancestor="$image" --filter status=running) >/dev/null 2>&1 || true
-    if [ $timeout_status -eq 124 ] || [ $timeout_status -eq 137 ]; then
+    if [ "$timeout_status" = "124" ] || [ "$timeout_status" = "137" ]; then
         status=124
     else
         status=$timeout_status
