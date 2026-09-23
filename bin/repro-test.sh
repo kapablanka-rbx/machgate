@@ -7,6 +7,9 @@ image="${MACHGATE_IMAGE:-machgate-arm64-toolchain}"
 
 default_ct_dir=""
 for candidate in \
+    "$machgate_root/../game-engine-machgate/build/buck2/common-tests-macos-arm64-optimized" \
+    "$machgate_root/../../game-engine-machgate/build/buck2/common-tests-macos-arm64-optimized" \
+    "/home/coder/git/roblox/game-engine-machgate/build/buck2/common-tests-macos-arm64-optimized" \
     "$machgate_root/../game-engine-machgate/build/buck2/common-tests-macos-arm64-release" \
     "$machgate_root/../../game-engine-machgate/build/buck2/common-tests-macos-arm64-release" \
     "/home/coder/git/roblox/game-engine-machgate/build/buck2/common-tests-macos-arm64-release"; do
@@ -44,7 +47,7 @@ SystemConfiguration = SKIP
 libc++.1 = /machgate-libcxx/libc++.so.1'
 
 docker_env=()
-for env_name in MACHGATE_TRACE_SHIM MACHGATE_TRACE_SIGNALS MACHGATE_TRACE_BINDINGS MACHGATE_TRACE_SYSCALL MACHGATE_VERBOSE MACHGATE_TRACE_CXX_INIT; do
+for env_name in MACHGATE_TRACE_SHIM MACHGATE_TRACE_SIGNALS MACHGATE_TRACE_BINDINGS MACHGATE_TRACE_SYSCALL MACHGATE_VERBOSE MACHGATE_TRACE_CXX_INIT MACHGATE_FD_TRACE_FILE; do
     if [ -n "${!env_name:-}" ]; then
         docker_env+=(-e "$env_name=${!env_name}")
     fi

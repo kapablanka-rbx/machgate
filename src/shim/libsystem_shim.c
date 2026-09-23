@@ -6600,8 +6600,13 @@ int shim_getpwnam_r(const char *name,
 #define DARWIN_SO_REUSEPORT  0x0200
 #define DARWIN_SO_SNDTIMEO   0x1005
 #define DARWIN_SO_RCVTIMEO  0x1006
-#define DARWIN_SO_ERROR      0x1007
+#define DARWIN_SO_ERROR     0x1007
 #define DARWIN_SO_TYPE       0x1008
+#define DARWIN_SO_SNDBUF    0x1001
+#define DARWIN_SO_RCVBUF    0x1002
+#define DARWIN_SO_SNDLOWAT  0x1003
+#define DARWIN_SO_RCVLOWAT  0x1004
+#define DARWIN_SO_NOSIGPIPE 0x1022
 
 static int shim_map_socket_domain(int darwin_domain)
 {
@@ -6765,10 +6770,18 @@ static int shim_translate_socket_option(int darwin_level, int darwin_option,
 	case DARWIN_SO_SNDTIMEO:   *linux_option = SO_SNDTIMEO;   return 1;
 #endif
 #ifdef SO_RCVTIMEO
-	case DARWIN_SO_RCVTIMEO:   *linux_option = SO_RCVTIMEO;  return 1;
+	case DARWIN_SO_RCVTIMEO:   *linux_option = SO_RCVTIMEO;   return 1;
 #endif
 	case DARWIN_SO_ERROR:      *linux_option = SO_ERROR;      return 1;
 	case DARWIN_SO_TYPE:       *linux_option = SO_TYPE;       return 1;
+	case DARWIN_SO_SNDBUF:     *linux_option = SO_SNDBUF;     return 1;
+	case DARWIN_SO_RCVBUF:     *linux_option = SO_RCVBUF;     return 1;
+#ifdef SO_SNDLOWAT
+	case DARWIN_SO_SNDLOWAT:   *linux_option = SO_SNDLOWAT;   return 1;
+#endif
+#ifdef SO_RCVLOWAT
+	case DARWIN_SO_RCVLOWAT:   *linux_option = SO_RCVLOWAT;   return 1;
+#endif
 	default:
 		*linux_option = darwin_option;
 		return 1;
@@ -6995,6 +7008,8 @@ int shim_setsockopt(int sockfd, int level, int option,
 	shim_resolve_real_socket_calls();
 	if (!shim_real_setsockopt)
 		return -1;
+	if (level == DARWIN_SOL_SOCKET && option == DARWIN_SO_NOSIGPIPE)
+		return 0;
 	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
 		return -1;
 	return shim_real_setsockopt(sockfd, linux_level, linux_option, value, value_len);
@@ -8767,6 +8782,7 @@ struct darwin_kevent_placeholder {
 	uint32_t fflags;
 	int64_t data;
 	void* udata;
+	uint64_t ext[2];
 };
 
 #define DARWIN_EVFILT_READ (-1)

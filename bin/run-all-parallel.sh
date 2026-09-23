@@ -31,6 +31,9 @@ parallel_jobs="$PARALLEL"
 
 default_ct_dir=""
 for candidate in \
+    "$machgate_root/../game-engine-machgate/build/buck2/common-tests-macos-arm64-optimized" \
+    "$machgate_root/../../game-engine-machgate/build/buck2/common-tests-macos-arm64-optimized" \
+    "/home/coder/git/roblox/game-engine-machgate/build/buck2/common-tests-macos-arm64-optimized" \
     "$machgate_root/../game-engine-machgate/build/buck2/common-tests-macos-arm64-release" \
     "$machgate_root/../../game-engine-machgate/build/buck2/common-tests-macos-arm64-release" \
     "/home/coder/git/roblox/game-engine-machgate/build/buck2/common-tests-macos-arm64-release"; do
