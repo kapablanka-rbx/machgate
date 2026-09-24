@@ -40,6 +40,16 @@ rm -rf "$FIXTURE_DIR/range_200_399.tmp" \
        "$FIXTURE_DIR/range_200_399.exchange_b" \
        /dev/shm/machgate_range_200_399
 printf "xxxxx" > "$FIXTURE_DIR/range_200_399.done"
+
+if ! command -v setfattr >/dev/null 2>&1 || \
+   ! ( touch "$FIXTURE_DIR/range_200_399.xattrtest" 2>/dev/null && \
+       setfattr -n user.test -v "ok" "$FIXTURE_DIR/range_200_399.xattrtest" 2>/dev/null ); then
+    echo "SKIP: xattrs not supported on this filesystem"
+    rm -f "$FIXTURE_DIR/range_200_399.xattrtest"
+    exit 0
+fi
+rm -f "$FIXTURE_DIR/range_200_399.xattrtest"
+
 output="$(cd "$FIXTURE_DIR" && "$BUILD_DIR/machgate" darwin_range_200_399 2>/dev/null)"
 [ "$output" = "range-200-ok" ]
 [ "$(wc -c < "$FIXTURE_DIR/range_200_399.tmp")" -eq 5 ]
