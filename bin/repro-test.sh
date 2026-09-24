@@ -46,8 +46,9 @@ AppKit = SKIP
 SystemConfiguration = SKIP
 libc++.1 = /machgate-libcxx/libc++.so.1'
 
+set -f
 docker_env=()
-for env_name in MACHGATE_TRACE_SHIM MACHGATE_TRACE_SIGNALS MACHGATE_TRACE_BINDINGS MACHGATE_TRACE_SYSCALL MACHGATE_VERBOSE MACHGATE_TRACE_CXX_INIT MACHGATE_FD_TRACE_FILE; do
+for env_name in MACHGATE_TRACE_SHIM MACHGATE_TRACE_SIGNALS MACHGATE_TRACE_BINDINGS MACHGATE_TRACE_SYSCALL MACHGATE_VERBOSE MACHGATE_TRACE_CXX_INIT MACHGATE_FD_TRACE_FILE MACHGATE_KEEP_CRASH_HANDLER; do
     if [ -n "${!env_name:-}" ]; then
         docker_env+=(-e "$env_name=${!env_name}")
     fi
@@ -66,8 +67,8 @@ timeout --foreground --kill-after=15s "${REPRO_TIMEOUT_SECONDS:-600}s" \
         export MACHGATE_CONFIG=/tmp/machgate.conf
         printf "[general]\ndylib_map = /tmp/dylib_map.conf\n" > /tmp/machgate.conf
         printf "'"$DYLIB_MAP"'\n" > /tmp/dylib_map.conf
-        exec /opt/machgate-local/machgate '"$unit_test"' '"$test_args"'
-    ' 2>&1
+        exec /opt/machgate-local/machgate "$@"
+    ' _ "$unit_test" $test_args 2>&1
 status=$?
 docker kill $(docker ps -q --filter ancestor="$image" --filter status=running) >/dev/null 2>&1 || true
 exit $status

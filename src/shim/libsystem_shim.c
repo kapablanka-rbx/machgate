@@ -6607,6 +6607,10 @@ int shim_getpwnam_r(const char *name,
 #define DARWIN_SO_SNDLOWAT  0x1003
 #define DARWIN_SO_RCVLOWAT  0x1004
 #define DARWIN_SO_NOSIGPIPE 0x1022
+#define DARWIN_IP_DONTFRAG          28
+#define LINUX_IP_MTU_DISCOVER       10
+#define LINUX_IP_PMTUDISC_DONT      0
+#define LINUX_IP_PMTUDISC_DO        2
 
 static int shim_map_socket_domain(int darwin_domain)
 {
@@ -6801,6 +6805,18 @@ static ssize_t (*shim_real_recvfrom)(int, void*, size_t, int,
                                      struct sockaddr*, socklen_t*);
 static int (*shim_real_setsockopt)(int, int, int, const void*, socklen_t);
 static int (*shim_real_getsockopt)(int, int, int, void*, socklen_t*);
+static ssize_t (*shim_real_sendmsg)(int, const struct msghdr*, int);
+static ssize_t (*shim_real_recvmsg)(int, struct msghdr*, int);
+
+struct darwin_msghdr {
+	void* msg_name;
+	socklen_t msg_namelen;
+	struct iovec* msg_iov;
+	int msg_iovlen;
+	void* msg_control;
+	socklen_t msg_controllen;
+	int msg_flags;
+};
 
 static void shim_resolve_real_socket_calls(void)
 {
@@ -6826,15 +6842,25 @@ static void shim_resolve_real_socket_calls(void)
 		shim_real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
 	if (!shim_real_getsockopt)
 		shim_real_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
+	if (!shim_real_sendmsg)
+		shim_real_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
+	if (!shim_real_recvmsg)
+		shim_real_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
 }
 
 int shim_socket(int domain, int type, int protocol) __asm__("socket");
 int shim_socket(int domain, int type, int protocol)
 {
+	int result;
+
 	shim_resolve_real_socket_calls();
 	if (!shim_real_socket)
 		return -1;
-	return shim_real_socket(shim_map_socket_domain(domain), type, protocol);
+	result = shim_real_socket(shim_map_socket_domain(domain), type, protocol);
+	shim_fd_trace_log("socket caller=%p domain=%d type=%d protocol=%d -> %d errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), domain, type, protocol,
+	                  result, result < 0 ? errno : 0);
+	return result;
 }
 
 int shim_bind(int sockfd, const void* darwin_addr, socklen_t darwin_len) __asm__("bind");
@@ -6842,14 +6868,24 @@ int shim_bind(int sockfd, const void* darwin_addr, socklen_t darwin_len)
 {
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = 0;
+	int result;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_bind)
 		return -1;
 	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
-	                                &linux_addr, &linux_len))
+	                                &linux_addr, &linux_len)) {
+		shim_fd_trace_log("bind caller=%p fd=%d translate_failed len=%d\n",
+		                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, darwin_len);
 		return -1;
-	return shim_real_bind(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+	}
+	result = shim_real_bind(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+	shim_fd_trace_log("bind caller=%p fd=%d family=%d port=%d -> %d errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
+	                  linux_addr.ss_family,
+	                  ntohs(((const struct sockaddr_in*)&linux_addr)->sin_port),
+	                  result, result < 0 ? errno : 0);
+	return result;
 }
 
 int shim_connect(int sockfd, const void* darwin_addr, socklen_t darwin_len) __asm__("connect");
@@ -6870,10 +6906,16 @@ int shim_connect(int sockfd, const void* darwin_addr, socklen_t darwin_len)
 int shim_listen(int sockfd, int backlog) __asm__("listen");
 int shim_listen(int sockfd, int backlog)
 {
+	int result;
+
 	shim_resolve_real_socket_calls();
 	if (!shim_real_listen)
 		return -1;
-	return shim_real_listen(sockfd, backlog);
+	result = shim_real_listen(sockfd, backlog);
+	shim_fd_trace_log("listen caller=%p fd=%d backlog=%d -> %d errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, backlog,
+	                  result, result < 0 ? errno : 0);
+	return result;
 }
 
 int shim_accept(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr) __asm__("accept");
@@ -6958,6 +7000,7 @@ ssize_t shim_sendto(int sockfd, const void* buffer, size_t length, int flags,
 {
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = 0;
+	ssize_t result;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_sendto)
@@ -6965,8 +7008,89 @@ ssize_t shim_sendto(int sockfd, const void* buffer, size_t length, int flags,
 	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
 	                                &linux_addr, &linux_len))
 		return -1;
-	return shim_real_sendto(sockfd, buffer, length, flags,
-	                        (const struct sockaddr*)&linux_addr, linux_len);
+	result = shim_real_sendto(sockfd, buffer, length, flags,
+	                          (const struct sockaddr*)&linux_addr, linux_len);
+	shim_fd_trace_log("sendto caller=%p fd=%d len=%zu -> %zd errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, length,
+	                  result, result < 0 ? errno : 0);
+	return result;
+}
+
+ssize_t shim_sendmsg(int sockfd, const void* darwin_msg_hdr, int flags) __asm__("sendmsg");
+ssize_t shim_sendmsg(int sockfd, const void* darwin_msg_hdr, int flags)
+{
+	const struct darwin_msghdr* darwin_msg =
+		(const struct darwin_msghdr*)darwin_msg_hdr;
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = 0;
+	struct msghdr linux_msg;
+	ssize_t result;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_sendmsg)
+		return -1;
+	memset(&linux_msg, 0, sizeof(linux_msg));
+	if (darwin_msg->msg_name) {
+		if (!shim_translate_sockaddr_in(darwin_msg->msg_name,
+		                                darwin_msg->msg_namelen,
+		                                &linux_addr, &linux_len)) {
+			errno = EFAULT;
+			return -1;
+		}
+		linux_msg.msg_name = &linux_addr;
+		linux_msg.msg_namelen = linux_len;
+	}
+	linux_msg.msg_iov = darwin_msg->msg_iov;
+	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
+	linux_msg.msg_flags = darwin_msg->msg_flags;
+	result = shim_real_sendmsg(sockfd, &linux_msg, flags);
+	shim_fd_trace_log("sendmsg caller=%p fd=%d iovlen=%d namelen=%d -> %zd errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
+	                  darwin_msg->msg_iovlen, darwin_msg->msg_namelen,
+	                  result, result < 0 ? errno : 0);
+	return result;
+}
+
+ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags) __asm__("recvmsg");
+ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
+{
+	struct darwin_msghdr* darwin_msg = (struct darwin_msghdr*)darwin_msg_hdr;
+	struct sockaddr_storage linux_addr;
+	socklen_t linux_len = sizeof(linux_addr);
+	struct msghdr linux_msg;
+	socklen_t darwin_capacity = darwin_msg->msg_namelen;
+	ssize_t result;
+
+	shim_resolve_real_socket_calls();
+	if (!shim_real_recvmsg)
+		return -1;
+	memset(&linux_addr, 0, sizeof(linux_addr));
+	memset(&linux_msg, 0, sizeof(linux_msg));
+	linux_msg.msg_name = darwin_msg->msg_name ? &linux_addr : NULL;
+	linux_msg.msg_namelen = sizeof(linux_addr);
+	linux_msg.msg_iov = darwin_msg->msg_iov;
+	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
+	linux_msg.msg_control = darwin_msg->msg_control;
+	linux_msg.msg_controllen = (size_t)darwin_msg->msg_controllen;
+	result = shim_real_recvmsg(sockfd, &linux_msg, flags);
+	if (result >= 0) {
+		darwin_msg->msg_flags = linux_msg.msg_flags;
+		if (darwin_msg->msg_name && darwin_capacity >= 2) {
+			socklen_t written = shim_fill_darwin_sockaddr(
+				(const struct sockaddr*)&linux_addr, linux_msg.msg_namelen,
+				darwin_msg->msg_name, darwin_capacity);
+			darwin_msg->msg_namelen = written ? written : darwin_capacity;
+		} else if (darwin_msg->msg_name) {
+			darwin_msg->msg_namelen = 0;
+		}
+		darwin_msg->msg_controllen =
+			(socklen_t)linux_msg.msg_controllen;
+	}
+	shim_fd_trace_log("recvmsg caller=%p fd=%d len_iov=%d -> %zd errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
+	                  darwin_msg->msg_iovlen,
+	                  result, result < 0 ? errno : 0);
+	return result;
 }
 
 ssize_t shim_recvfrom(int sockfd, void* buffer, size_t length, int flags,
@@ -7004,15 +7128,31 @@ int shim_setsockopt(int sockfd, int level, int option,
 {
 	int linux_level;
 	int linux_option;
+	int result;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_setsockopt)
 		return -1;
 	if (level == DARWIN_SOL_SOCKET && option == DARWIN_SO_NOSIGPIPE)
 		return 0;
+	if (level == 0 && option == DARWIN_IP_DONTFRAG) {
+		int mtu_discovery = LINUX_IP_PMTUDISC_DONT;
+		if (value && value_len >= (socklen_t)sizeof(int) && *(const int*)value > 0)
+			mtu_discovery = LINUX_IP_PMTUDISC_DO;
+		result = shim_real_setsockopt(sockfd, 0, LINUX_IP_MTU_DISCOVER,
+		                             &mtu_discovery, sizeof(mtu_discovery));
+		shim_fd_trace_log("setsockopt caller=%p fd=%d level=0 option=IP_DONTFRAG translated=IP_MTU_DISCOVER -> %d errno=%d\n",
+		                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, result, result < 0 ? errno : 0);
+		return result;
+	}
 	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
-		return -1;
-	return shim_real_setsockopt(sockfd, linux_level, linux_option, value, value_len);
+		result = -1;
+	else
+		result = shim_real_setsockopt(sockfd, linux_level, linux_option, value, value_len);
+	shim_fd_trace_log("setsockopt caller=%p fd=%d level=%d option=%d linux_level=%d linux_option=%d -> %d errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, level, option,
+	                  linux_level, linux_option, result, result < 0 ? errno : 0);
+	return result;
 }
 
 int shim_getsockopt(int sockfd, int level, int option,
@@ -8385,11 +8525,14 @@ static void shim_fd_trace_log(const char* format, ...)
 	int offset;
 	int length;
 	va_list args;
+	struct timespec now;
 
 	if (trace_fd < 0)
 		return;
 
-	offset = snprintf(buffer, sizeof(buffer), "fdtrace pid=%d tid=%d ",
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	offset = snprintf(buffer, sizeof(buffer), "fdtrace t=%lld.%06ld pid=%d tid=%d ",
+	                  (long long)now.tv_sec, now.tv_nsec / 1000,
 	                  (int)syscall(SYS_getpid), (int)syscall(SYS_gettid));
 	if (offset < 0 || (size_t)offset >= sizeof(buffer))
 		return;
@@ -9127,6 +9270,16 @@ static int emit_kqueue_events(struct pollfd* pollfds,
 		short revents = pollfds[i].revents;
 		int ready = revents != 0;
 
+		if (!live_matches ||
+		    live_registration->udata != registration->udata) {
+			if (registration->filter == DARWIN_EVFILT_USER) {
+				uint64_t value;
+				while (read(registration->kq, &value,
+				            sizeof(value)) > 0) {
+				}
+			}
+			continue;
+		}
 		if (!ready && registration->filter != DARWIN_EVFILT_USER) {
 			if (live_matches)
 				live_registration->ready = 0;
@@ -10073,6 +10226,19 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 		}
 		if (shim_trace_enabled())
 			fprintf(stderr, "libsystem_shim: sigaction(%d->%d act=%p old=%p) -> 0 errno=0\n",
+			        signum, linux_signal, act, oldact);
+		return 0;
+	}
+
+	if ((signum == 4 || signum == 7 || signum == 11) && darwin_act &&
+	    darwin_act->handler != 0 && getenv("MACHGATE_KEEP_CRASH_HANDLER")) {
+		if (darwin_oldact) {
+			darwin_oldact->handler = 0;
+			darwin_oldact->mask = 0;
+			darwin_oldact->flags = 0;
+		}
+		if (shim_trace_enabled())
+			fprintf(stderr, "libsystem_shim: sigaction(%d->%d act=%p old=%p) kept machgate handler\n",
 			        signum, linux_signal, act, oldact);
 		return 0;
 	}
