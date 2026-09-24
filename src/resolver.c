@@ -638,10 +638,49 @@ static void trace_target_binding(const char* context,
 	        source_path ? source_path : "(unknown)");
 }
 
+enum { SHIM_OBJC_MAGIC = 0x4F424A43 };
+enum shim_objc_kind { SHIM_OBJC_STRING = 3 };
+
+struct shim_objc_string_stub {
+	uint32_t magic;
+	uint32_t kind;
+	char utf8[sizeof("public.utf8-plain-text")];
+};
+
+static uintptr_t resolve_asan_data_symbol(const char* sym_name)
+{
+	static uintptr_t shadow_base = 0;
+	static uint32_t detect_stack_use_after_return = 0;
+
+	if (strcmp(sym_name, "___asan_option_detect_stack_use_after_return") == 0)
+		return (uintptr_t)&detect_stack_use_after_return;
+
+	if (strcmp(sym_name, "___asan_shadow_memory_dynamic_address") == 0) {
+		if (!shadow_base) {
+			size_t shadow_size = 512UL * 1024 * 1024;
+			void* shadow_region = mmap(NULL, shadow_size,
+			                           PROT_READ | PROT_WRITE,
+			                           MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
+			                           -1, 0);
+			if (shadow_region == MAP_FAILED)
+				return 0;
+			shadow_base = (uintptr_t)shadow_region;
+		}
+		return (uintptr_t)&shadow_base;
+	}
+
+	return 0;
+}
+
 static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
                                                 const char* sym_name)
 {
-	static const void* ns_pasteboard_type_string = NULL;
+	static const struct shim_objc_string_stub ns_pasteboard_type_string_obj = {
+		SHIM_OBJC_MAGIC,
+		SHIM_OBJC_STRING,
+		"public.utf8-plain-text",
+	};
+	static const void* ns_pasteboard_type_string = &ns_pasteboard_type_string_obj;
 
 	if (!de)
 		return 0;
@@ -649,6 +688,9 @@ static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
 	if (strcmp(de->name, "AppKit") == 0 &&
 	    strcmp(sym_name, "_NSPasteboardTypeString") == 0)
 		return (uintptr_t)&ns_pasteboard_type_string;
+
+	if (strstr(de->name, "libclang_rt.asan"))
+		return resolve_asan_data_symbol(sym_name);
 
 	return 0;
 }

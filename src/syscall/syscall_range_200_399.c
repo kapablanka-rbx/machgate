@@ -1,6 +1,7 @@
 #include "syscall_range_200_399.h"
 #include "execve_reexec.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -4087,7 +4088,10 @@ static void handle_psynch_wait_probe(struct syscall_gate_state* state)
 {
 	uint32_t* address = (uint32_t*)state->x[0];
 	uint32_t expected = (uint32_t)state->x[1];
-	struct timespec timeout = {0, 0};
+	int64_t timeout_sec = (int64_t)state->x[4];
+	uint32_t timeout_nsec = (uint32_t)state->x[5];
+	struct timespec* timeout_ptr = NULL;
+	struct timespec timeout;
 
 	if (!address) {
 		set_failure(state, DARWIN_EFAULT);
@@ -4099,14 +4103,26 @@ static void handle_psynch_wait_probe(struct syscall_gate_state* state)
 		return;
 	}
 
+	if (timeout_sec < 0) {
+		timeout.tv_sec = 0;
+		timeout.tv_nsec = 0;
+		timeout_ptr = &timeout;
+	} else if (timeout_sec > 0 || timeout_nsec > 0) {
+		timeout.tv_sec = (time_t)timeout_sec;
+		timeout.tv_nsec = (long)timeout_nsec;
+		if (timeout.tv_nsec >= 1000000000L) {
+			timeout.tv_sec += timeout.tv_nsec / 1000000000L;
+			timeout.tv_nsec %= 1000000000L;
+		}
+		timeout_ptr = &timeout;
+	}
+
 #ifdef SYS_futex
 	errno = 0;
 	long result = syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected,
-	                      &timeout, NULL, 0);
+	                      timeout_ptr, NULL, 0);
 	if (result < 0) {
 		int err = errno ? errno : EIO;
-		if (err == ETIMEDOUT)
-			err = EAGAIN;
 		set_failure(state, errno_to_darwin(err));
 		return;
 	}
@@ -4553,7 +4569,7 @@ static void handle_mac_execve(struct syscall_gate_state* state)
 	set_failure(state, result);
 }
 
-static int is_eventfd_backed_queue(int fd)
+static int __attribute__((unused)) is_eventfd_backed_queue(int fd)
 {
 	char path[64];
 	char target[64];
@@ -4584,29 +4600,103 @@ static int is_eventfd_backed_queue(int fd)
 	return 1;
 }
 
-static void handle_kevent_noop_wait(struct syscall_gate_state* state,
-                                    int fd,
-                                    uint64_t changelist,
-                                    int nchanges,
-                                    uint64_t eventlist,
-                                    int nevents)
+typedef int (*shim_kqueue_fn)(void);
+typedef int (*shim_kevent_fn)(int kq, const void* changelist, int nchanges,
+                              void* eventlist, int nevents,
+                              const struct timespec* timeout);
+typedef int (*shim_kevent64_fn)(int kq, const void* changelist, int nchanges,
+                                void* eventlist, int nevents, uint32_t flags,
+                                const struct timespec* timeout);
+
+static shim_kqueue_fn resolve_shim_kqueue(void)
+{
+	static shim_kqueue_fn fn;
+	if (!fn)
+		fn = (shim_kqueue_fn)dlsym(RTLD_DEFAULT, "kqueue");
+	return fn;
+}
+
+static shim_kevent_fn resolve_shim_kevent(void)
+{
+	static shim_kevent_fn fn;
+	if (!fn)
+		fn = (shim_kevent_fn)dlsym(RTLD_DEFAULT, "kevent");
+	return fn;
+}
+
+static shim_kevent64_fn resolve_shim_kevent64(void)
+{
+	static shim_kevent64_fn fn;
+	if (!fn)
+		fn = (shim_kevent64_fn)dlsym(RTLD_DEFAULT, "kevent64");
+	return fn;
+}
+
+static void handle_kqueue_via_shim(struct syscall_gate_state* state)
+{
+	shim_kqueue_fn shim_kqueue = resolve_shim_kqueue();
+	if (shim_kqueue) {
+		errno = 0;
+		int result = shim_kqueue();
+		finish_syscall_result(state, result);
+		return;
+	}
+
+	errno = 0;
+	long result = syscall(SYS_eventfd2, 0, EFD_CLOEXEC | EFD_NONBLOCK);
+	finish_syscall_result(state, result);
+}
+
+static void handle_kevent_via_shim(struct syscall_gate_state* state, int kq,
+                                  uint64_t changelist, int nchanges,
+                                  uint64_t eventlist, int nevents,
+                                  uint64_t timeout_addr)
 {
 	if (nchanges < 0 || nevents < 0) {
 		set_failure(state, DARWIN_EINVAL);
 		return;
 	}
 
-	if (!is_eventfd_backed_queue(fd)) {
-		set_failure(state, errno_to_darwin(errno ? errno : EBADF));
-		return;
-	}
-
-	if (nchanges != 0 || changelist || nevents != 0 || eventlist) {
+	shim_kevent_fn shim_kevent = resolve_shim_kevent();
+	if (!shim_kevent) {
 		set_enosys(state);
 		return;
 	}
 
-	set_success(state, 0);
+	errno = 0;
+	int result = shim_kevent(kq, (const void*)changelist, nchanges,
+	                        (void*)eventlist, nevents,
+	                        (const struct timespec*)timeout_addr);
+	if (result < 0)
+		set_failure(state, errno_to_darwin(errno ? errno : EBADF));
+	else
+		set_success(state, (uint64_t)result);
+}
+
+static void handle_kevent64_via_shim(struct syscall_gate_state* state, int kq,
+                                    uint64_t changelist, int nchanges,
+                                    uint64_t eventlist, int nevents,
+                                    uint32_t flags, uint64_t timeout_addr)
+{
+	if (nchanges < 0 || nevents < 0) {
+		set_failure(state, DARWIN_EINVAL);
+		return;
+	}
+
+	shim_kevent64_fn shim_kevent64 = resolve_shim_kevent64();
+	if (!shim_kevent64) {
+		set_enosys(state);
+		return;
+	}
+
+	errno = 0;
+	int result = shim_kevent64(kq, (const void*)changelist, nchanges,
+	                           (void*)eventlist, nevents, flags,
+	                           (const struct timespec*)timeout_addr);
+	if (result < 0)
+		set_failure(state, errno_to_darwin(errno ? errno : EBADF));
+	else
+		set_success(state, (uint64_t)result);
 }
 
 static void handle_shared_region_check(struct syscall_gate_state* state)
@@ -5325,16 +5415,13 @@ int syscall_range_200_399_dispatch(struct syscall_gate_state* state)
 	case DARWIN_SYS_bsdthread_terminate:
 		handle_bsdthread_terminate(state);
 		return 1;
-	case DARWIN_SYS_kqueue: {
-		errno = 0;
-		long result = syscall(SYS_eventfd2, 0, EFD_CLOEXEC);
-		finish_syscall_result(state, result);
+	case DARWIN_SYS_kqueue:
+		handle_kqueue_via_shim(state);
 		return 1;
-	}
 	case DARWIN_SYS_kevent:
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_kevent_via_shim(state, (int)state->x[0], state->x[1],
+		                      (int)state->x[2], state->x[3],
+		                      (int)state->x[4], state->x[5]);
 		return 1;
 	case DARWIN_SYS_lchown: {
 		errno = 0;
@@ -5355,13 +5442,10 @@ int syscall_range_200_399_dispatch(struct syscall_gate_state* state)
 		handle_workq_kernreturn(state);
 		return 1;
 	case DARWIN_SYS_kevent64:
-		if (state->x[5]) {
-			set_enosys(state);
-			return 1;
-		}
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
+		handle_kevent64_via_shim(state, (int)state->x[0], state->x[1],
 		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		                        (int)state->x[4], (uint32_t)state->x[5],
+		                        state->x[6]);
 		return 1;
 	case DARWIN_SYS_thread_selfid: {
 		errno = 0;
@@ -5373,22 +5457,14 @@ int syscall_range_200_399_dispatch(struct syscall_gate_state* state)
 		set_success(state, 0);
 		return 1;
 	case DARWIN_SYS_kevent_qos:
-		if (state->x[5] || state->x[6] || state->x[7]) {
-			set_enosys(state);
-			return 1;
-		}
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_kevent_via_shim(state, (int)state->x[0], state->x[1],
+		                      (int)state->x[2], state->x[3],
+		                      (int)state->x[4], state->x[7]);
 		return 1;
 	case DARWIN_SYS_kevent_id:
-		if (state->x[5] || state->x[6] || state->x[7]) {
-			set_enosys(state);
-			return 1;
-		}
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_kevent_via_shim(state, (int)state->x[0], state->x[1],
+		                      (int)state->x[2], state->x[3],
+		                      (int)state->x[4], state->x[7]);
 		return 1;
 	case DARWIN_SYS___mac_execve:
 		handle_mac_execve(state);

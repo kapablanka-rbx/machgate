@@ -8918,6 +8918,7 @@ int kqueue(void)
 	return result;
 }
 
+#pragma pack(4)
 struct darwin_kevent_placeholder {
 	uint64_t ident;
 	int16_t filter;
@@ -8925,8 +8926,8 @@ struct darwin_kevent_placeholder {
 	uint32_t fflags;
 	int64_t data;
 	void* udata;
-	uint64_t ext[2];
 };
+#pragma pack()
 
 #define DARWIN_EVFILT_READ (-1)
 #define DARWIN_EVFILT_WRITE (-2)
@@ -10819,7 +10820,7 @@ void* dispatch_queue_create(const char *label, void *attr)
 	return q;
 }
 
-/* ---- Async/sync (execute blocks inline — no real concurrency) ---- */
+/* ---- Async dispatch (worker thread pool) / sync (inline) ---- */
 
 typedef void (*dispatch_block_t)(void);
 typedef void (*dispatch_function_t)(void*);
@@ -10845,10 +10846,95 @@ static void dispatch_invoke_block(void* block)
 		invoke(block);
 }
 
+struct dispatch_work_item {
+	void* block;
+	struct dispatch_work_item* next;
+};
+
+static pthread_mutex_t dispatch_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dispatch_pool_cond = PTHREAD_COND_INITIALIZER;
+static struct dispatch_work_item* dispatch_pool_head;
+static struct dispatch_work_item* dispatch_pool_tail;
+static int dispatch_pool_started;
+
+#define DISPATCH_POOL_WORKER_COUNT 4
+
+static void* dispatch_pool_worker(void* arg)
+{
+	(void)arg;
+	for (;;) {
+		struct dispatch_work_item* item;
+
+		pthread_mutex_lock(&dispatch_pool_mutex);
+		while (!dispatch_pool_head)
+			pthread_cond_wait(&dispatch_pool_cond, &dispatch_pool_mutex);
+		item = dispatch_pool_head;
+		dispatch_pool_head = item->next;
+		if (!dispatch_pool_head)
+			dispatch_pool_tail = NULL;
+		pthread_mutex_unlock(&dispatch_pool_mutex);
+
+		dispatch_invoke_block(item->block);
+		free(item);
+	}
+
+	return NULL;
+}
+
+static void dispatch_pool_start_workers(void)
+{
+	static int (*real_pthread_create_fn)(pthread_t*, const pthread_attr_t*,
+	                                     void* (*)(void*), void*) = NULL;
+	int index;
+
+	if (dispatch_pool_started)
+		return;
+	if (!real_pthread_create_fn)
+		real_pthread_create_fn = dlsym(RTLD_NEXT, "pthread_create");
+	if (!real_pthread_create_fn)
+		return;
+
+	pthread_mutex_lock(&dispatch_pool_mutex);
+	if (dispatch_pool_started) {
+		pthread_mutex_unlock(&dispatch_pool_mutex);
+		return;
+	}
+	dispatch_pool_started = 1;
+	for (index = 0; index < DISPATCH_POOL_WORKER_COUNT; index++) {
+		pthread_t worker;
+		real_pthread_create_fn(&worker, NULL, dispatch_pool_worker, NULL);
+		pthread_detach(worker);
+	}
+	pthread_mutex_unlock(&dispatch_pool_mutex);
+}
+
 void dispatch_async(void *queue, void *block)
 {
+	struct dispatch_work_item* item;
+
 	(void)queue;
-	dispatch_invoke_block(block);
+	dispatch_pool_start_workers();
+	if (!dispatch_pool_started) {
+		dispatch_invoke_block(block);
+		return;
+	}
+
+	item = malloc(sizeof(*item));
+	if (!item) {
+		dispatch_invoke_block(block);
+		return;
+	}
+	item->block = block;
+	item->next = NULL;
+
+	pthread_mutex_lock(&dispatch_pool_mutex);
+	if (dispatch_pool_tail)
+		dispatch_pool_tail->next = item;
+	else
+		dispatch_pool_head = item;
+	dispatch_pool_tail = item;
+	pthread_cond_signal(&dispatch_pool_cond);
+	pthread_mutex_unlock(&dispatch_pool_mutex);
 }
 
 void dispatch_sync(void *queue, void *block)
@@ -11809,7 +11895,7 @@ int shim_close(int fd)
 int shim_pipe(int pipefd[2]) __asm__("pipe");
 int shim_pipe(int pipefd[2])
 {
-	int result = syscall(SYS_pipe2, pipefd, 0);
+	int result = syscall(SYS_pipe2, pipefd, O_NONBLOCK);
 	shim_fd_trace_log("pipe caller=%p result=%d read_fd=%d write_fd=%d errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), result,
 	                  result == 0 ? pipefd[0] : -1,
