@@ -759,8 +759,24 @@ static void emit_fde_frame(size_t cie_offset, uintptr_t func_addr,
 /*
  * Emit an FDE for a FRAMELESS function.
  *
- * FRAMELESS: No frame pointer. CFA = SP + stack_size.
- * LR is at the top of the saved area (SP + stack_size - 8) if saved.
+ * FRAMELESS: No frame pointer; LR is never saved — the return address stays in
+ * the LR register throughout (compact_unwind_encoding.h: "A 'frameless' leaf
+ * function, where FP/LR are not saved. The return address remains in LR
+ * throughout the function."). Any saved non-volatile registers are pushed
+ * before local stack space, so they sit at the top of the frame, and the
+ * encoded stack size includes them.
+ *
+ * Apple libunwind's step (CompactUnwinder.hpp stepWithCompactEncodingFrameless):
+ *   savedRegisterLoc = SP + stackSize
+ *   x-pairs and d-pairs walk DOWN from there (pair order by register number)
+ *   caller SP = the location reached after walking past all pairs
+ *   PC = LR (unchanged register)
+ *
+ * DWARF equivalent: CFA = SP + stackSize (= caller SP + 8*pair_count is NOT
+ * used — Apple counts saved registers inside stackSize, so CFA is exactly
+ * SP + stackSize). Saved pairs are at CFA-8, CFA-16, ... in pair order, with
+ * the FIRST pair's FIRST register highest. LR gets no rule: the unwinder's
+ * virtual LR register already holds the return address.
  */
 static void emit_fde_frameless(size_t cie_offset, uintptr_t func_addr,
                                uint32_t func_size, uint32_t encoding,
@@ -786,51 +802,57 @@ static void emit_fde_frameless(size_t cie_offset, uintptr_t func_addr,
 		ehf_uleb128(0);
 	}
 
-	/* CFI: after prologue, CFA = SP + stack_size */
+	/* CFI: after prologue, CFA = SP + stack_size (caller SP area boundary).
+	 * DW_CFA_def_cfa_expression is not needed; SP-based CFA with register 31
+	 * is emitted as DW_CFA_def_cfa on the DWARF SP register. */
 	if (stack_size > 0) {
 		ehf_u8(DW_CFA_advance_loc | 1);
-		ehf_u8(DW_CFA_def_cfa_offset);
+		ehf_u8(DW_CFA_def_cfa);
+		ehf_uleb128(DWARF_REG_SP);
 		ehf_uleb128(stack_size);
 
+		/* Saved pairs sit directly below the CFA (top of this frame),
+		 * first pair highest. Offsets are in data_align units (-8):
+		 * slot N means CFA - 8*(N+1). */
 		int slot = 0;
 		uint32_t x_pairs = encoding & 0x1F;
 		if (x_pairs & UNWIND_ARM64_FRAME_X19_X20_PAIR) {
-			ehf_u8(DW_CFA_offset | DWARF_REG_X19); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset | DWARF_REG_X20); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X19); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X20); ehf_uleb128(++slot);
 		}
 		if (x_pairs & UNWIND_ARM64_FRAME_X21_X22_PAIR) {
-			ehf_u8(DW_CFA_offset | DWARF_REG_X21); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset | DWARF_REG_X22); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X21); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X22); ehf_uleb128(++slot);
 		}
 		if (x_pairs & UNWIND_ARM64_FRAME_X23_X24_PAIR) {
-			ehf_u8(DW_CFA_offset | DWARF_REG_X23); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset | DWARF_REG_X24); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X23); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X24); ehf_uleb128(++slot);
 		}
 		if (x_pairs & UNWIND_ARM64_FRAME_X25_X26_PAIR) {
-			ehf_u8(DW_CFA_offset | DWARF_REG_X25); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset | DWARF_REG_X26); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X25); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X26); ehf_uleb128(++slot);
 		}
 		if (x_pairs & UNWIND_ARM64_FRAME_X27_X28_PAIR) {
-			ehf_u8(DW_CFA_offset | DWARF_REG_X27); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset | DWARF_REG_X28); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X27); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset | DWARF_REG_X28); ehf_uleb128(++slot);
 		}
 
 		uint32_t d_pairs = (encoding >> 8) & 0x0F;
 		if (d_pairs & (UNWIND_ARM64_FRAME_D8_D9_PAIR >> 8)) {
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D8); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D9); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D8); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D9); ehf_uleb128(++slot);
 		}
 		if (d_pairs & (UNWIND_ARM64_FRAME_D10_D11_PAIR >> 8)) {
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D10); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D11); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D10); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D11); ehf_uleb128(++slot);
 		}
 		if (d_pairs & (UNWIND_ARM64_FRAME_D12_D13_PAIR >> 8)) {
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D12); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D13); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D12); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D13); ehf_uleb128(++slot);
 		}
 		if (d_pairs & (UNWIND_ARM64_FRAME_D14_D15_PAIR >> 8)) {
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D14); ehf_uleb128(slot++);
-			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D15); ehf_uleb128(slot++);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D14); ehf_uleb128(++slot);
+			ehf_u8(DW_CFA_offset_extended); ehf_uleb128(DWARF_REG_D15); ehf_uleb128(++slot);
 		}
 	}
 
