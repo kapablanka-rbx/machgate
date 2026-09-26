@@ -18,6 +18,7 @@
 
 #include "resolver.h"
 #include "dylib_loader.h"
+#include "loader.h"
 #include "lua_entity_opt.h"
 #include "macho_defs.h"
 #include "log.h"
@@ -28,6 +29,7 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 
 /* macOS malloc returns zero-initialized pages for most allocations.
@@ -434,6 +436,7 @@ enum dylib_action {
 struct dylib_entry {
 	int ordinal;                     /* 1-based ordinal from LC_LOAD_DYLIB order */
 	char name[MAX_NAME];             /* dylib install name (basename) */
+	char install_name[MAX_NAME];      /* full dylib install path from the load command */
 	enum dylib_action action;
 	char so_path[MAX_NAME];          /* Linux .so path (for DYLIB_MAP) or Mach-O path */
 	void* handle;                    /* dlopen handle (DYLIB_MAP) */
@@ -1082,9 +1085,14 @@ static const struct variadic_info variadic_functions[] = {
 	/* va_list passthrough — same glibc function, converted va_list.
 	 * source_reg = register holding macOS va_list (char*) */
 	{"vsnprintf",       "vsnprintf",        3, 1, 3},
+	{"vsprintf",        "vsprintf",         2, 1, 2},
 	{"vfprintf",        "vfprintf",         2, 1, 2},
+	{"vprintf",         "vprintf",         1, 1, 1},
 	{"vsscanf",         "vsscanf",          2, 1, 2},
+	{"vsnprintf",       "vsnprintf",        3, 1, 3},
+	{"vasprintf",       "vasprintf",        2, 1, 2},
 	{"__vsnprintf_chk", "__vsnprintf_chk",  5, 1, 5},
+	{"__vsprintf_chk",  "__vsprintf_chk",   4, 1, 4},
 	{NULL, NULL, 0, 0, 0}
 };
 
@@ -1791,8 +1799,11 @@ static int parse_load_commands(struct resolver_state* rs)
 			if (dylib_ordinal <= MAX_DYLIBS) {
 				struct dylib_entry* de = &rs->dylibs[dylib_ordinal - 1];
 				de->ordinal = dylib_ordinal;
+				strncpy(de->install_name, name, MAX_NAME - 1);
+				de->install_name[MAX_NAME - 1] = '\0';
 				const char* base = basename_from_path(name);
 				strncpy(de->name, base, MAX_NAME - 1);
+				de->name[MAX_NAME - 1] = '\0';
 				de->action = DYLIB_SKIP; /* default: skip until mapped */
 				de->handle = NULL;
 			}
@@ -1939,6 +1950,71 @@ static const struct dylib_mapping* find_mapping(struct resolver_state* rs, const
 
 /* ---- Open Linux .so files for mapped dylibs ---- */
 
+extern struct load_results machgate_load_results;
+
+static int file_is_macho(const char* path)
+{
+	FILE* file = fopen(path, "rb");
+	if (!file)
+		return 0;
+	uint32_t magic = 0;
+	size_t got = fread(&magic, 4, 1, file);
+	fclose(file);
+	return got == 1 && (magic == 0xfeedfacf || magic == 0xfeedface ||
+	                     magic == 0xcafebabe || magic == 0xbebafeca);
+}
+
+static int open_executable_path_dylib(struct resolver_state* rs,
+                                       struct dylib_entry* de)
+{
+	const char* prefix_exec = "@executable_path/";
+	const char* prefix_loader = "@loader_path/";
+	const char* install_name = de->install_name;
+	const char* relative = NULL;
+
+	if (strncmp(install_name, prefix_exec, strlen(prefix_exec)) == 0)
+		relative = install_name + strlen(prefix_exec);
+	else if (strncmp(install_name, prefix_loader, strlen(prefix_loader)) == 0)
+		relative = install_name + strlen(prefix_loader);
+	else if (install_name[0] != '/' && strchr(install_name, '/') == NULL)
+		relative = install_name;
+	else
+		return 0;
+
+	const char* guest_argv0 = machgate_load_results.argv ? machgate_load_results.argv[0] : NULL;
+	if (!guest_argv0)
+		return 0;
+
+	const char* slash = strrchr(guest_argv0, '/');
+	if (!slash)
+		return 0;
+
+	size_t dir_len = (size_t)(slash - guest_argv0);
+	char candidate[PATH_MAX];
+	if (dir_len + 1 + strlen(relative) + 1 > sizeof(candidate))
+		return 0;
+	memcpy(candidate, guest_argv0, dir_len);
+	candidate[dir_len] = '/';
+	strcpy(candidate + dir_len + 1, relative);
+
+	if (!file_is_macho(candidate))
+		return 0;
+
+	struct macho_dylib_info* mdi = dylib_loader_find(candidate);
+	if (!mdi)
+		mdi = dylib_loader_load(candidate);
+	if (!mdi)
+		return 0;
+
+	de->macho_info = mdi;
+	de->action = DYLIB_MACHO;
+	strncpy(de->so_path, candidate, MAX_NAME - 1);
+	machgate_log_startup(
+	    "resolver: dylib[%d] '%s' → MACHO '%s' via @executable_path (%u symbols)\n",
+	    de->ordinal, de->name, candidate, mdi->nsyms);
+	return 1;
+}
+
 static int open_dylibs(struct resolver_state* rs)
 {
 	for (int i = 0; i < rs->ndylibs && i < MAX_DYLIBS; i++) {
@@ -1946,6 +2022,9 @@ static int open_dylibs(struct resolver_state* rs)
 		const struct dylib_mapping* m = find_mapping(rs, de->name);
 
 		if (!m) {
+			if (open_executable_path_dylib(rs, de)) {
+				continue;
+			}
 			machgate_log_startup("resolver: dylib[%d] '%s' — no mapping, skipping\n",
 			                      de->ordinal, de->name);
 			de->action = DYLIB_SKIP;
