@@ -112,6 +112,11 @@
 #define DARWIN_F_GETLK     7
 #define DARWIN_F_SETLK     8
 #define DARWIN_F_SETLKW    9
+
+/* Darwin lock type values (XNU bsd/sys/fcntl.h) */
+#define DARWIN_F_RDLCK 1
+#define DARWIN_F_UNLCK 2
+#define DARWIN_F_WRLCK 3
 #define DARWIN_F_FULLFSYNC 51
 #define DARWIN_F_DUPFD_CLOEXEC 67
 
@@ -1314,6 +1319,66 @@ static void finish_pipe_result(struct syscall_gate_state* state, long result,
 	state->nzcv &= ~DARWIN_CARRY;
 }
 
+/* Convert a Darwin-layout struct flock (XNU LP64: l_start+0, l_len+8,
+ * l_pid+16, l_type+20, l_whence+22) to the Linux layout. Returns 0 on
+ * success, -1 with errno=EINVAL for an unknown lock type. */
+static int darwin_flock_to_linux(const void* darwin_flock, struct flock* out)
+{
+	const unsigned char* d = (const unsigned char*)darwin_flock;
+	off_t l_start;
+	off_t l_len;
+	int32_t l_pid;
+	short l_type;
+	short l_whence;
+	memcpy(&l_start, d + 0, 8);
+	memcpy(&l_len, d + 8, 8);
+	memcpy(&l_pid, d + 16, 4);
+	memcpy(&l_type, d + 20, 2);
+	memcpy(&l_whence, d + 22, 2);
+
+	short linux_type;
+	if (l_type == DARWIN_F_RDLCK)
+		linux_type = F_RDLCK;
+	else if (l_type == DARWIN_F_WRLCK)
+		linux_type = F_WRLCK;
+	else if (l_type == DARWIN_F_UNLCK)
+		linux_type = F_UNLCK;
+	else {
+		errno = EINVAL;
+		return -1;
+	}
+
+	memset(out, 0, sizeof(*out));
+	out->l_type = linux_type;
+	out->l_whence = l_whence;
+	out->l_start = l_start;
+	out->l_len = l_len;
+	out->l_pid = l_pid;
+	return 0;
+}
+
+/* Convert a Linux-layout struct flock back into a Darwin-layout struct. */
+static void linux_flock_to_darwin(const struct flock* in, void* darwin_flock)
+{
+	unsigned char* d = (unsigned char*)darwin_flock;
+	short darwin_type;
+	if (in->l_type == F_RDLCK)
+		darwin_type = DARWIN_F_RDLCK;
+	else if (in->l_type == F_WRLCK)
+		darwin_type = DARWIN_F_WRLCK;
+	else
+		darwin_type = DARWIN_F_UNLCK;
+	off_t l_start = in->l_start;
+	off_t l_len = in->l_len;
+	int32_t l_pid = (int32_t)in->l_pid;
+	short l_whence = in->l_whence;
+	memcpy(d + 0, &l_start, 8);
+	memcpy(d + 8, &l_len, 8);
+	memcpy(d + 16, &l_pid, 4);
+	memcpy(d + 20, &darwin_type, 2);
+	memcpy(d + 22, &l_whence, 2);
+}
+
 static long raw_fcntl(int fd, int darwin_cmd, uint64_t arg)
 {
 	int linux_cmd;
@@ -1354,7 +1419,19 @@ static long raw_fcntl(int fd, int darwin_cmd, uint64_t arg)
 	if (darwin_cmd == F_SETFL)
 		arg = (uint64_t)translate_open_flags_to_linux((int)arg);
 
+	struct flock converted_flock;
+	void* darwin_flock_ptr = NULL;
+	if (darwin_cmd == DARWIN_F_GETLK || darwin_cmd == DARWIN_F_SETLK ||
+	    darwin_cmd == DARWIN_F_SETLKW) {
+		darwin_flock_ptr = (void*)arg;
+		if (darwin_flock_to_linux(darwin_flock_ptr, &converted_flock) != 0)
+			return -1;
+		arg = (uint64_t)&converted_flock;
+	}
+
 	long result = syscall(SYS_fcntl, fd, linux_cmd, arg);
+	if (result >= 0 && darwin_cmd == DARWIN_F_GETLK && darwin_flock_ptr)
+		linux_flock_to_darwin(&converted_flock, darwin_flock_ptr);
 	if (darwin_cmd == F_GETFL && result >= 0)
 		result = translate_open_flags_to_darwin((int)result);
 	return result;
