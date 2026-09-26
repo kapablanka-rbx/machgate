@@ -92,6 +92,7 @@ static const char* shim_trace_path(const char* path);
 static char* getenv_from_guest_envp(const char* name);
 static int shim_errno_from_linux(int linux_errno);
 static int translate_oflags(int darwin_flags);
+static int libc_open(const char* pathname, int linux_flags, mode_t mode);
 static void trace_guest_address_context(const char* label, uintptr_t address);
 static uintptr_t trace_ucontext_reg(void* ucontext, int reg);
 static void trace_signal_indirect_branch(uintptr_t call_site, void* ucontext);
@@ -759,7 +760,7 @@ int CCRandomGenerateBytes(void* bytes, size_t count)
 		if (result < 0) {
 			if (errno == EINTR)
 				continue;
-			int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+			int fd = libc_open("/dev/urandom", O_RDONLY | O_CLOEXEC, 0);
 			if (fd < 0)
 				return -1;
 			while (offset < count) {
@@ -5408,7 +5409,7 @@ static void apply_spawn_file_actions(struct shim_spawn_file_actions* actions)
 			dup2(action->fd, action->newfd);
 			break;
 		case SHIM_SPAWN_ACTION_OPEN: {
-			int fd = open(action->path, translate_oflags(action->flags),
+			int fd = libc_open(action->path, translate_oflags(action->flags),
 			              action->mode);
 			if (fd >= 0) {
 				if (fd != action->fd) {
@@ -5802,11 +5803,11 @@ int copyfile(const char* from, const char* to, void* state, uint32_t flags)
 		return -1;
 	}
 
-	int input_fd = open(from, O_RDONLY);
+	int input_fd = libc_open(from, O_RDONLY, 0);
 	if (input_fd < 0)
 		return -1;
 
-	int output_fd = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	int output_fd = libc_open(to, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 	if (output_fd < 0) {
 		int saved_errno = errno;
 		close(input_fd);
@@ -11599,38 +11600,112 @@ static int translate_dirfd(int darwin_dirfd)
 
 /* ---- open() / openat() ---- */
 
-int shim_open(const char *pathname, int flags, ...) __asm__("open");
-int shim_open(const char *pathname, int flags, ...)
+/*
+ * Darwin passes a variadic function's unnamed arguments on the caller stack,
+ * starting at the incoming [sp]. Linux AAPCS64 also passes unnamed arguments
+ * in registers x2..x7 (saved by va_start) before spilling to the stack, so a
+ * Linux-compiled va_arg reads the register save area first and never sees the
+ * Darwin caller's stack slot — open(path, O_CREAT, 0644) arrived with mode=002
+ * (stale x2) and created 0000-mode files, breaking NamedMutex and every guest
+ * that re-opened one (EACCES -> throw).
+ *
+ * Naming x2..x7 as dummy parameters consumes the register save area, so the
+ * first va_arg lands exactly on the Darwin caller's first stack argument.
+ * Internal shim callers use real_open/real_openat, which take the mode as a
+ * fixed parameter under the Linux convention.
+ */
+
+static int (*real_open_libc)(const char*, int, ...) = NULL;
+static int (*real_openat_libc)(int, const char*, int, ...) = NULL;
+
+static int libc_open(const char* pathname, int linux_flags, mode_t mode)
+{
+	if (!real_open_libc)
+		real_open_libc = dlsym(RTLD_NEXT, "open");
+	if (!real_open_libc)
+		return -1;
+	return real_open_libc(pathname, linux_flags, mode);
+}
+
+static int libc_openat(int dirfd, const char* pathname, int linux_flags, mode_t mode)
+{
+	if (!real_openat_libc)
+		real_openat_libc = dlsym(RTLD_NEXT, "openat");
+	if (!real_openat_libc)
+		return -1;
+	return real_openat_libc(dirfd, pathname, linux_flags, mode);
+}
+
+static long shim_open_common(const char* pathname, int flags, mode_t mode)
 {
 	int linux_flags = translate_oflags(flags);
-	mode_t mode = 0;
-
-	if (flags & DARWIN_O_CREAT) {
-		va_list args;
-		va_start(args, flags);
-		mode = va_arg(args, mode_t);
-		va_end(args);
-	}
-
 	/* aarch64 Linux has no SYS_open; everything goes through SYS_openat */
 	return syscall(SYS_openat, AT_FDCWD, pathname, linux_flags, mode);
 }
 
-int shim_openat(int dirfd, const char *pathname, int flags, ...) __asm__("openat");
-int shim_openat(int dirfd, const char *pathname, int flags, ...)
+static long shim_openat_common(int dirfd, const char* pathname, int flags, mode_t mode)
 {
 	int linux_flags = translate_oflags(flags);
+	return syscall(SYS_openat, translate_dirfd(dirfd), pathname,
+	               linux_flags, mode);
+}
+
+int shim_open(const char *pathname, int flags,
+              long darwin_stack_area_do_not_use_0,
+              long darwin_stack_area_do_not_use_1,
+              long darwin_stack_area_do_not_use_2,
+              long darwin_stack_area_do_not_use_3,
+              long darwin_stack_area_do_not_use_4,
+              long darwin_stack_area_do_not_use_5,
+              ...) __asm__("open");
+int shim_open(const char *pathname, int flags,
+              long darwin_stack_area_do_not_use_0,
+              long darwin_stack_area_do_not_use_1,
+              long darwin_stack_area_do_not_use_2,
+              long darwin_stack_area_do_not_use_3,
+              long darwin_stack_area_do_not_use_4,
+              long darwin_stack_area_do_not_use_5,
+              ...)
+{
 	mode_t mode = 0;
 
 	if (flags & DARWIN_O_CREAT) {
 		va_list args;
-		va_start(args, flags);
+		va_start(args, darwin_stack_area_do_not_use_5);
 		mode = va_arg(args, mode_t);
 		va_end(args);
 	}
 
-	return syscall(SYS_openat, translate_dirfd(dirfd), pathname,
-	               linux_flags, mode);
+	return shim_open_common(pathname, flags, mode);
+}
+
+int shim_openat(int dirfd, const char *pathname, int flags,
+               long darwin_stack_area_do_not_use_0,
+               long darwin_stack_area_do_not_use_1,
+               long darwin_stack_area_do_not_use_2,
+               long darwin_stack_area_do_not_use_3,
+               long darwin_stack_area_do_not_use_4,
+               long darwin_stack_area_do_not_use_5,
+               ...) __asm__("openat");
+int shim_openat(int dirfd, const char *pathname, int flags,
+               long darwin_stack_area_do_not_use_0,
+               long darwin_stack_area_do_not_use_1,
+               long darwin_stack_area_do_not_use_2,
+               long darwin_stack_area_do_not_use_3,
+               long darwin_stack_area_do_not_use_4,
+               long darwin_stack_area_do_not_use_5,
+               ...)
+{
+	mode_t mode = 0;
+
+	if (flags & DARWIN_O_CREAT) {
+		va_list args;
+		va_start(args, darwin_stack_area_do_not_use_5);
+		mode = va_arg(args, mode_t);
+		va_end(args);
+	}
+
+	return shim_openat_common(dirfd, pathname, flags, mode);
 }
 
 int __renameatx_np(int oldfd, const char* old_path, int newfd,
@@ -11663,6 +11738,83 @@ int renameatx_np(int oldfd, const char* old_path, int newfd,
 }
 
 /* ---- fcntl() ---- */
+
+/* ---- struct flock layout translation (Darwin vs Linux) ----
+ * Darwin (XNU bsd/sys/fcntl.h, LP64):            Linux (aarch64 glibc):
+ *   off_t  l_start;   +0                           short  l_type;    +0
+ *   off_t  l_len;     +8                           short  l_whence;  +2
+ *   pid_t  l_pid;     +16                          off_t  l_start;    +8
+ *   short  l_type;    +20                          off_t  l_len;     +16
+ *   short  l_whence;  +22                          pid_t  l_pid;     +24
+ * Lock type values (XNU bsd/sys/fcntl.h):
+ *   Darwin F_RDLCK=1 F_UNLCK=2 F_WRLCK=3;
+ *   Linux  F_RDLCK=0 F_WRLCK=1 F_UNLCK=2. */
+#define DARWIN_F_RDLCK 1
+#define DARWIN_F_UNLCK 2
+#define DARWIN_F_WRLCK 3
+
+static short darwin_lock_type_to_linux(short darwin_type)
+{
+	switch (darwin_type) {
+	case DARWIN_F_RDLCK: return F_RDLCK;
+	case DARWIN_F_WRLCK: return F_WRLCK;
+	case DARWIN_F_UNLCK: return F_UNLCK;
+	default: return -1;
+	}
+}
+
+static short linux_lock_type_to_darwin(short linux_type)
+{
+	switch (linux_type) {
+	case F_RDLCK: return DARWIN_F_RDLCK;
+	case F_WRLCK: return DARWIN_F_WRLCK;
+	case F_UNLCK: return DARWIN_F_UNLCK;
+	default: return -1;
+	}
+}
+
+static int darwin_flock_to_linux(const void* darwin_flock, struct flock* linux_flock)
+{
+	const unsigned char* d = (const unsigned char*)darwin_flock;
+	off_t l_start, l_len;
+	int32_t l_pid;
+	short l_type, l_whence;
+	memcpy(&l_start, d + 0, 8);
+	memcpy(&l_len, d + 8, 8);
+	memcpy(&l_pid, d + 16, 4);
+	memcpy(&l_type, d + 20, 2);
+	memcpy(&l_whence, d + 22, 2);
+
+	short linux_type = darwin_lock_type_to_linux(l_type);
+	if (linux_type < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	memset(linux_flock, 0, sizeof(*linux_flock));
+	linux_flock->l_type = linux_type;
+	linux_flock->l_whence = l_whence;
+	linux_flock->l_start = l_start;
+	linux_flock->l_len = l_len;
+	linux_flock->l_pid = l_pid;
+	return 0;
+}
+
+static void linux_flock_to_darwin(const struct flock* linux_flock, void* darwin_flock)
+{
+	unsigned char* d = (unsigned char*)darwin_flock;
+	short darwin_type = linux_lock_type_to_darwin(linux_flock->l_type);
+	off_t l_start = linux_flock->l_start;
+	off_t l_len = linux_flock->l_len;
+	int32_t l_pid = (int32_t)linux_flock->l_pid;
+	short l_whence = linux_flock->l_whence;
+
+	memcpy(d + 0, &l_start, 8);
+	memcpy(d + 8, &l_len, 8);
+	memcpy(d + 16, &l_pid, 4);
+	memcpy(d + 20, &darwin_type, 2);
+	memcpy(d + 22, &l_whence, 2);
+}
 
 static int shim_fcntl_fixed(int fd, int cmd, unsigned long arg)
 {
@@ -11706,8 +11858,31 @@ static int shim_fcntl_fixed(int fd, int cmd, unsigned long arg)
 	if (cmd == F_SETFL)
 		arg = (unsigned long)translate_oflags((int)arg);
 
-	int ret = syscall(SYS_fcntl, fd, linux_cmd, arg);
+	/* Translate struct flock for the record-lock commands. The Darwin
+	 * caller's flock layout differs from Linux (see the table above), so
+	 * convert in both directions; F_GETLK writes the result back into the
+	 * caller's Darwin-layout struct. */
+	struct flock converted_flock;
+	void* darwin_flock_ptr = NULL;
+	int flock_is_garbage = 0;
+	if (cmd == DARWIN_F_GETLK || cmd == DARWIN_F_SETLK || cmd == DARWIN_F_SETLKW) {
+		darwin_flock_ptr = (void*)arg;
+		if (darwin_flock_to_linux(darwin_flock_ptr, &converted_flock) == 0) {
+			arg = (unsigned long)&converted_flock;
+		} else {
+			flock_is_garbage = 1;
+		}
+	}
+
+	int ret;
+	if (flock_is_garbage)
+		ret = -1;
+	else
+		ret = syscall(SYS_fcntl, fd, linux_cmd, arg);
 	int saved_errno = errno;
+
+	if (ret >= 0 && cmd == DARWIN_F_GETLK && darwin_flock_ptr)
+		linux_flock_to_darwin(&converted_flock, darwin_flock_ptr);
 	if (ret >= 0 && (cmd == F_DUPFD || cmd == DARWIN_F_DUPFD_CLOEXEC))
 		remember_kqueue_dup(fd, ret);
 
@@ -11725,11 +11900,30 @@ static int shim_fcntl_fixed(int fd, int cmd, unsigned long arg)
 	return ret;
 }
 
-int shim_fcntl(int fd, int cmd, ...) __asm__("fcntl");
-int shim_fcntl(int fd, int cmd, ...)
+/*
+ * Darwin passes the variadic third argument on the caller stack (see the
+ * open() note above); the dummy named parameters consume the register save
+ * area so va_arg lands on the Darwin stack slot carrying the flock* / int.
+ */
+int shim_fcntl(int fd, int cmd,
+               long darwin_stack_area_do_not_use_0,
+               long darwin_stack_area_do_not_use_1,
+               long darwin_stack_area_do_not_use_2,
+               long darwin_stack_area_do_not_use_3,
+               long darwin_stack_area_do_not_use_4,
+               long darwin_stack_area_do_not_use_5,
+               ...) __asm__("fcntl");
+int shim_fcntl(int fd, int cmd,
+               long darwin_stack_area_do_not_use_0,
+               long darwin_stack_area_do_not_use_1,
+               long darwin_stack_area_do_not_use_2,
+               long darwin_stack_area_do_not_use_3,
+               long darwin_stack_area_do_not_use_4,
+               long darwin_stack_area_do_not_use_5,
+               ...)
 {
 	va_list args;
-	va_start(args, cmd);
+	va_start(args, darwin_stack_area_do_not_use_5);
 	unsigned long arg = va_arg(args, unsigned long);
 	va_end(args);
 
