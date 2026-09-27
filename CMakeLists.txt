@@ -4,6 +4,10 @@ project(machgate C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 14)
 
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 option(BUILD_WRAPGEN "Build the wrapgen utility" ON)
 option(BUILD_TESTS "Build test fixtures" ON)
 
@@ -44,7 +48,7 @@ endif()
 add_executable(machgate ${MACHGATE_SOURCES})
 
 target_include_directories(machgate PRIVATE src)
-target_compile_options(machgate PRIVATE -Wall -O2 -g)
+target_compile_options(machgate PRIVATE -Wall)
 target_compile_definitions(machgate PRIVATE
     INSTALL_PREFIX=""
     SYSTEM_ROOT=""
@@ -62,7 +66,7 @@ set_target_properties(vm_interpose PROPERTIES
     OUTPUT_NAME "machgate_vm_interpose"
     PREFIX "lib"
 )
-target_compile_options(vm_interpose PRIVATE -Wall -O2 -g)
+target_compile_options(vm_interpose PRIVATE -Wall)
 target_compile_definitions(vm_interpose PRIVATE _GNU_SOURCE)
 target_link_libraries(vm_interpose PRIVATE dl)
 
@@ -76,7 +80,7 @@ set_target_properties(system_shim PROPERTIES
     OUTPUT_NAME "system_shim"
     PREFIX "lib"
 )
-target_compile_options(system_shim PRIVATE -Wall -O2 -g -fno-omit-frame-pointer)
+target_compile_options(system_shim PRIVATE -Wall -fno-omit-frame-pointer)
 target_link_libraries(system_shim PRIVATE m pthread dl)
 target_link_options(system_shim PRIVATE
     -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/shim/libsystem_shim.ver
@@ -91,7 +95,7 @@ set_target_properties(galaxy_shim PROPERTIES
     OUTPUT_NAME "galaxy_shim"
     PREFIX "lib"
 )
-target_compile_options(galaxy_shim PRIVATE -Wall -O2 -g)
+target_compile_options(galaxy_shim PRIVATE -Wall)
 target_link_options(galaxy_shim PRIVATE
     -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/shim/libgalaxy_shim.ver
 )
@@ -100,7 +104,7 @@ target_link_options(galaxy_shim PRIVATE
 
 if(BUILD_WRAPGEN)
     add_executable(wrapgen tools/wrapgen.cpp)
-    target_compile_options(wrapgen PRIVATE -Wall -O2 -g)
+    target_compile_options(wrapgen PRIVATE -Wall)
     target_link_libraries(wrapgen PRIVATE dl)
 endif()
 
@@ -109,13 +113,13 @@ endif()
 if(BUILD_TESTS)
     add_executable(test_lse_emul tests/test_lse_emul.c src/isa_emul.c)
     target_include_directories(test_lse_emul PRIVATE src)
-    target_compile_options(test_lse_emul PRIVATE -Wall -O2 -g)
+    target_compile_options(test_lse_emul PRIVATE -Wall)
     target_compile_definitions(test_lse_emul PRIVATE _GNU_SOURCE)
     target_link_libraries(test_lse_emul PRIVATE pthread)
 
     add_executable(test_necrolevel_rng tests/test_necrolevel_rng.c src/dylib_loader.c)
     target_include_directories(test_necrolevel_rng PRIVATE src)
-    target_compile_options(test_necrolevel_rng PRIVATE -Wall -O2 -g)
+    target_compile_options(test_necrolevel_rng PRIVATE -Wall)
     target_compile_definitions(test_necrolevel_rng PRIVATE _GNU_SOURCE)
     target_link_libraries(test_necrolevel_rng PRIVATE dl m)
 
