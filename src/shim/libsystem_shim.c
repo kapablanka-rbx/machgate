@@ -9440,16 +9440,31 @@ int kevent(int kq, const struct darwin_kevent_placeholder* changelist,
 		return result;
 
 	if (changelist && nchanges > 0) {
+		int receipts = 0;
 		if (eventlist && nevents > 0)
-			result = emit_kqueue_receipts(changelist, nchanges, eventlist,
-			                              nevents);
+			receipts = emit_kqueue_receipts(changelist, nchanges,
+			                                eventlist, nevents);
 		if (shim_trace_enabled())
-			fprintf(stderr, "libsystem_shim: kevent(kq=%d nchanges=%d nevents=%d receipts=%d) -> %d errno=0\n",
-			        kq, nchanges, nevents, result, result);
+			fprintf(stderr, "libsystem_shim: kevent(kq=%d nchanges=%d nevents=%d receipts=%d) applied\n",
+			        kq, nchanges, nevents, receipts);
 		shim_fd_trace_log("kevent caller=%p kq=%d nchanges=%d nevents=%d receipts=%d result=%d errno=0\n",
 		                  SHIM_CALLER_RETURN_ADDRESS(), kq, nchanges,
-		                  nevents, result, result);
-		return result;
+		                  nevents, receipts, receipts);
+		/*
+		 * Real kqueue applies the changes AND waits for events when
+		 * nevents > 0. Returning here made every register+wait caller
+		 * (curl connect loops, dispatch sources) see zero events
+		 * immediately: connect-completion was never observed, requests
+		 * were aborted, and each such test burned its full timeout.
+		 * Fall through to the poll path below; the receipt entries
+		 * occupy the leading eventlist slots, and real events follow.
+		 */
+		if (!(eventlist && nevents > 0))
+			return receipts;
+		if (receipts >= nevents)
+			return receipts;
+		nevents -= receipts;
+		eventlist += receipts;
 	}
 
 	if (eventlist && nevents > 0) {
