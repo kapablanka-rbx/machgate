@@ -12027,6 +12027,9 @@ struct machgate_dispatch_source {
 	uintptr_t mask;
 	void* queue;
 	void* event_handler;
+	void* cancel_handler;
+	int resumed;
+	int cancelled;
 };
 
 const char _dispatch_source_type_mach_recv[] = "mach_recv";
@@ -12184,6 +12187,44 @@ void dispatch_source_set_event_handler(void* source_ref, void* handler)
 	struct machgate_dispatch_source* source = source_ref;
 	if (source)
 		source->event_handler = handler;
+}
+
+void dispatch_source_set_timer(void* source_ref, uint64_t start,
+                              uint64_t interval, uint64_t leeway)
+{
+	(void)source_ref;
+	(void)start;
+	(void)interval;
+	(void)leeway;
+}
+
+void dispatch_source_set_cancel_handler(void* source_ref, void* handler)
+{
+	struct machgate_dispatch_source* source = source_ref;
+	if (!source)
+		return;
+	source->cancel_handler = handler;
+	if (source->cancelled)
+		dispatch_invoke_block(source->cancel_handler);
+}
+
+void dispatch_source_cancel(void* source_ref)
+{
+	struct machgate_dispatch_source* source = source_ref;
+	if (!source)
+		return;
+	if (source->cancelled)
+		return;
+	source->cancelled = 1;
+	if (source->cancel_handler)
+		dispatch_invoke_block(source->cancel_handler);
+}
+
+void dispatch_after(uint64_t when, void* queue, void* block)
+{
+	(void)when;
+	(void)queue;
+	dispatch_invoke_block(block);
 }
 
 void dispatch_resume(void* object)
