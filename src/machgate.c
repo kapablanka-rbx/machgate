@@ -1121,6 +1121,23 @@ int main(int argc, char** argv, char** envp)
 			struct macho_dylib_info *mdi = &g_macho_dylibs[i];
 			machgate_log_startup("machgate: resolving fixups for Mach-O dylib '%s'\n", mdi->path);
 			resolver_resolve_fixups((void*)mdi->mh, mdi->slide, cfg.dylib_map);
+
+			for (int patch_index = 0; patch_index < cfg.num_dylib_patches;
+			     patch_index++) {
+				const machgate_dylib_patch_config_t* dylib_patch =
+					&cfg.dylib_patches[patch_index];
+				const char* dylib_name = strrchr(mdi->path, '/');
+				dylib_name = dylib_name ? dylib_name + 1 : mdi->path;
+				if (!dylib_patch->patches || !dylib_patch->dylib ||
+				    strcmp(dylib_name, dylib_patch->dylib) != 0)
+					continue;
+				if (patcher_apply(dylib_patch->patches, (void*)mdi->mh,
+				                  mdi->slide) < 0) {
+					fprintf(stderr, "machgate: dylib patcher failed for '%s' — aborting\n",
+					        mdi->path);
+					abort();
+				}
+			}
 		}
 
 		/* Fix macOS pthread signatures in dylib __DATA segments.

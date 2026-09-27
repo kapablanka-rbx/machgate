@@ -27,6 +27,7 @@ int config_load(const char* path, machgate_config_t* cfg)
 
 	char line[512];
 	machgate_trampoline_config_t* cur_tramp = NULL;
+	machgate_dylib_patch_config_t* cur_dylib_patch = NULL;
 
 	while (fgets(line, sizeof(line), f)) {
 		char* s = strip(line);
@@ -42,6 +43,7 @@ int config_load(const char* path, machgate_config_t* cfg)
 			s++;
 
 			cur_tramp = NULL;
+		cur_dylib_patch = NULL;
 
 			if (strcmp(s, "general") == 0) {
 				/* general section — handled by key=value below */
@@ -51,6 +53,15 @@ int config_load(const char* path, machgate_config_t* cfg)
 					cur_tramp = &cfg->trampolines[cfg->num_trampolines++];
 					memset(cur_tramp, 0, sizeof(*cur_tramp));
 					cur_tramp->name = strdup(name);
+				}
+			} else if (strncmp(s, "dylib_patch.", 13) == 0) {
+				const char* name = s + 13;
+				if (cfg->num_dylib_patches < CONFIG_MAX_DYLIB_PATCHES) {
+					machgate_dylib_patch_config_t* dp =
+						&cfg->dylib_patches[cfg->num_dylib_patches++];
+					memset(dp, 0, sizeof(*dp));
+					dp->dylib = strdup(name);
+					cur_dylib_patch = dp;
 				}
 			}
 			continue;
@@ -63,7 +74,12 @@ int config_load(const char* path, machgate_config_t* cfg)
 		char* key = strip(s);
 		char* val = strip(eq + 1);
 
-		if (cur_tramp) {
+		if (cur_dylib_patch) {
+			if (strcmp(key, "patches") == 0) {
+				free(cur_dylib_patch->patches);
+				cur_dylib_patch->patches = strdup(val);
+			}
+		} else if (cur_tramp) {
 			/* Inside a [trampoline.*] section */
 			if (strcmp(key, "lib") == 0) {
 				free(cur_tramp->lib);
@@ -102,6 +118,10 @@ void config_free(machgate_config_t* cfg)
 {
 	free(cfg->dylib_map);
 	free(cfg->patches);
+	for (int i = 0; i < cfg->num_dylib_patches; i++) {
+		free(cfg->dylib_patches[i].dylib);
+		free(cfg->dylib_patches[i].patches);
+	}
 	for (int i = 0; i < cfg->num_trampolines; i++) {
 		free(cfg->trampolines[i].name);
 		free(cfg->trampolines[i].lib);

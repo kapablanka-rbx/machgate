@@ -13,9 +13,10 @@
  *   [trampoline.bgfx]
  *   lib = ./build-bgfx/libbgfx-shared.so
  *   prefix = _bgfx_
- *   prefix = __ZN4bgfx
- *   init_wrapper = true
- *   renderer = opengles
+ *   ...
+ *
+ *   [dylib_patch.libfbxsdk.dylib]
+ *   patches = patches/fbxsdk.conf
  */
 
 #ifndef CONFIG_H
@@ -23,6 +24,7 @@
 
 #define CONFIG_MAX_TRAMPOLINES 8
 #define CONFIG_MAX_PREFIXES    8
+#define CONFIG_MAX_DYLIB_PATCHES 8
 
 typedef struct {
 	char* name;                              /* section suffix, e.g. "sdl2" */
@@ -36,10 +38,17 @@ typedef struct {
 } machgate_trampoline_config_t;
 
 typedef struct {
+	char* dylib;                             /* guest dylib basename to patch */
+	char* patches;                           /* patch file applied to that dylib */
+} machgate_dylib_patch_config_t;
+
+typedef struct {
 	char* dylib_map;
 	char* patches;
 	machgate_trampoline_config_t trampolines[CONFIG_MAX_TRAMPOLINES];
 	int num_trampolines;
+	machgate_dylib_patch_config_t dylib_patches[CONFIG_MAX_DYLIB_PATCHES];
+	int num_dylib_patches;
 } machgate_config_t;
 
 /* Load config from file. Returns 0 on success, -1 if file not found (not an error). */
