@@ -706,7 +706,9 @@ static int is_darwin_runtime_symbol(const char* lookup_name)
 	       strcmp(lookup_name, "munmap") == 0 ||
 	       strcmp(lookup_name, "mprotect") == 0 ||
 	       strcmp(lookup_name, "sigaction") == 0 ||
-	       strcmp(lookup_name, "sigaltstack") == 0;
+	       strcmp(lookup_name, "sigaltstack") == 0 ||
+	       strcmp(lookup_name, "popen") == 0 ||
+	       strcmp(lookup_name, "pclose") == 0;
 }
 
 static int is_darwin_allocator_symbol(const char* lookup_name)

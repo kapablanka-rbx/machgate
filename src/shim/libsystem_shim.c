@@ -5534,6 +5534,236 @@ int execve(const char* path, char* const argv[], char* const envp[])
 	return -1;
 }
 
+/* ===== popen / pclose ===== */
+
+/*
+ * A guest popen("<mach-o-guest> args...", "r") command must not reach the host
+ * shell: /bin/sh cannot exec a Mach-O, so the child would die with ENOEXEC
+ * (exit 126) before printing a byte. When the first token of the command is
+ * a Mach-O image we spawn it directly through the MachGate loader re-exec
+ * path; everything else falls back to the real host popen.
+ */
+
+struct shim_popen_record {
+	FILE* stream;
+	pid_t child;
+	struct shim_popen_record* next;
+};
+
+static struct shim_popen_record* shim_popen_records;
+static pthread_mutex_t shim_popen_records_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int shim_path_is_macho(const char* path)
+{
+	unsigned char magic[4];
+	int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	ssize_t bytes_read = (ssize_t)syscall(SYS_read, fd, magic, sizeof(magic));
+	syscall(SYS_close, fd);
+	if (bytes_read != (ssize_t)sizeof(magic))
+		return 0;
+	return (magic[0] == 0xcf && magic[1] == 0xfa &&
+	        magic[2] == 0xed && magic[3] == 0xfe) ||
+	       (magic[0] == 0xca && magic[1] == 0xfe &&
+	        magic[2] == 0xba && magic[3] == 0xbe);
+}
+
+static int shim_popen_token_is_plain(const char* token)
+{
+	return strpbrk(token, "\"'`\\|;&<>()*?$~") == NULL;
+}
+
+static void shim_popen_child_exec(const char* guest_path, char* guest_argv[],
+                                  int pipe_end, int redirect_to,
+                                  int merge_stderr)
+{
+	if (redirect_to == STDOUT_FILENO) {
+		syscall(SYS_dup3, pipe_end, STDOUT_FILENO, 0);
+		if (merge_stderr)
+			syscall(SYS_dup3, STDOUT_FILENO, STDERR_FILENO, 0);
+	} else {
+		syscall(SYS_dup3, pipe_end, STDIN_FILENO, 0);
+	}
+	if (pipe_end > STDERR_FILENO)
+		syscall(SYS_close, pipe_end);
+
+	int exec_result = machgate_execve_macho_guest_forksafe(
+	    guest_path, guest_argv, environ);
+	(void)exec_result;
+	syscall(SYS_exit_group, exec_result == 45 ? 126 : 126);
+}
+
+static FILE* shim_popen_macho(const char* guest_path, char* guest_argv[],
+                              int guest_argc, int redirect_to,
+                              int merge_stderr, int close_on_exec)
+{
+	int pipe_fds[2];
+	if (syscall(SYS_pipe2, pipe_fds, close_on_exec ? O_CLOEXEC : 0) < 0)
+		return NULL;
+
+	int read_end = pipe_fds[0];
+	int write_end = pipe_fds[1];
+	int child_end = redirect_to == STDOUT_FILENO ? write_end : read_end;
+	int parent_end = redirect_to == STDOUT_FILENO ? read_end : write_end;
+
+	pid_t child = fork();
+	if (child < 0) {
+		syscall(SYS_close, read_end);
+		syscall(SYS_close, write_end);
+		return NULL;
+	}
+	if (child == 0) {
+		syscall(SYS_close, parent_end);
+		shim_popen_child_exec(guest_path, guest_argv, child_end,
+		                      redirect_to, merge_stderr);
+	}
+
+	syscall(SYS_close, child_end);
+	FILE* stream = fdopen(parent_end, redirect_to == STDOUT_FILENO ? "r" : "w");
+	if (!stream) {
+		int saved_errno = errno;
+		syscall(SYS_close, parent_end);
+		syscall(SYS_kill, child, SIGKILL);
+		syscall(SYS_wait4, child, NULL, 0, NULL);
+		errno = saved_errno;
+		return NULL;
+	}
+
+	struct shim_popen_record* record = malloc(sizeof(*record));
+	if (!record) {
+		fclose(stream);
+		errno = ENOMEM;
+		return NULL;
+	}
+	record->stream = stream;
+	record->child = child;
+
+	pthread_mutex_lock(&shim_popen_records_mutex);
+	record->next = shim_popen_records;
+	shim_popen_records = record;
+	pthread_mutex_unlock(&shim_popen_records_mutex);
+	return stream;
+}
+
+static FILE* shim_real_popen(const char* command, const char* type)
+{
+	static FILE* (*real_popen)(const char*, const char*);
+	if (!real_popen)
+		real_popen = dlsym(RTLD_NEXT, "popen");
+	return real_popen ? real_popen(command, type) : NULL;
+}
+
+static int shim_real_pclose(FILE* stream)
+{
+	static int (*real_pclose)(FILE*);
+	if (!real_pclose)
+		real_pclose = dlsym(RTLD_NEXT, "pclose");
+	return real_pclose ? real_pclose(stream) : -1;
+}
+
+FILE* popen(const char* command, const char* type)
+{
+	if (!command || !type)
+	{
+		errno = EINVAL;
+		return NULL;
+	}
+
+	int redirect_to = STDOUT_FILENO;
+	int close_on_exec = 0;
+	for (const char* mode_char = type; *mode_char; mode_char++) {
+		if (*mode_char == 'w')
+			redirect_to = STDIN_FILENO;
+		else if (*mode_char == 'e')
+			close_on_exec = 1;
+	}
+
+	char* command_copy = strdup(command);
+	if (!command_copy) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	char* guest_argv[4096];
+	int guest_argc = 0;
+	int merge_stderr = 0;
+	int plain_command = 1;
+	char* save_ptr = NULL;
+	for (char* token = strtok_r(command_copy, " \t", &save_ptr); token;
+	     token = strtok_r(NULL, " \t", &save_ptr)) {
+		if (strcmp(token, "2>&1") == 0) {
+			merge_stderr = 1;
+			continue;
+		}
+		if (!shim_popen_token_is_plain(token)) {
+			plain_command = 0;
+			break;
+		}
+		if (guest_argc == 4095) {
+			errno = E2BIG;
+			free(command_copy);
+			return NULL;
+		}
+		guest_argv[guest_argc++] = token;
+	}
+
+	FILE* result = NULL;
+	if (plain_command && guest_argc > 0 && shim_path_is_macho(guest_argv[0])) {
+		guest_argv[guest_argc] = NULL;
+		result = shim_popen_macho(guest_argv[0], guest_argv, guest_argc,
+		                          redirect_to, merge_stderr, close_on_exec);
+		free(command_copy);
+		return result;
+	}
+
+	result = shim_real_popen(command, type);
+	free(command_copy);
+	return result;
+}
+
+int pclose(FILE* stream)
+{
+	if (!stream) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	struct shim_popen_record* record = NULL;
+	struct shim_popen_record* previous = NULL;
+
+	pthread_mutex_lock(&shim_popen_records_mutex);
+	for (record = shim_popen_records; record; previous = record, record = record->next) {
+		if (record->stream == stream) {
+			if (previous)
+				previous->next = record->next;
+			else
+				shim_popen_records = record->next;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&shim_popen_records_mutex);
+
+	if (!record)
+		return shim_real_pclose(stream);
+
+	if (fclose(stream) != 0)
+		return -1;
+
+	int status = 0;
+	for (;;) {
+		pid_t waited = (pid_t)syscall(SYS_wait4, record->child, &status, 0, NULL);
+		if (waited == record->child)
+			break;
+		if (waited < 0 && errno != EINTR) {
+			free(record);
+			return -1;
+		}
+	}
+	free(record);
+	return status;
+}
+
 static ssize_t shim_write_with_sigpipe_guard(long syscall_number, int fd,
                                              const void* buffer,
                                              size_t size_or_count)

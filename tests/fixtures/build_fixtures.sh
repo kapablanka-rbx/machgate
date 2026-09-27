@@ -422,6 +422,17 @@ echo "  Built with_lc_main"
 rm -f trampoline_target.o
 echo "  Built trampoline_target"
 
+# --- darwin_popen_exit42: popen() of a Mach-O guest re-execs via the loader ---
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj -o darwin_popen_exit42.o darwin_popen_exit42.s
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj -o libsystem_stub_empty.o empty_dylib.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -dylib -o libSystem.dylib libsystem_stub_empty.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -fixup_chains \
+    -o darwin_popen_exit42 -e _main darwin_popen_exit42.o libSystem.dylib
+rm -f darwin_popen_exit42.o libsystem_stub_empty.o
+echo "  Built darwin_popen_exit42"
+
 # --- libtest_native.so: native .so with replacement function ---
 gcc -shared -fPIC -o libtest_native.so libtest_native.c
 echo "  Built libtest_native.so"
