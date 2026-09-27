@@ -7486,6 +7486,9 @@ int shim_getpwnam_r(const char *name,
 #define DARWIN_SO_RCVLOWAT  0x1004
 #define DARWIN_SO_NOSIGPIPE 0x1022
 #define DARWIN_IP_DONTFRAG          28
+#define DARWIN_IP_PKTINFO           26
+#define LINUX_IP_PKTINFO            8
+#define DARWIN_IPPROTO_IP           0
 #define DARWIN_IPPROTO_TCP          6
 #define DARWIN_TCP_KEEPALIVE        0x10
 #define DARWIN_TCP_KEEPINTVL        0x101
@@ -7750,6 +7753,18 @@ static int shim_translate_socket_option(int darwin_level, int darwin_option,
 		}
 	}
 
+	if (darwin_level == DARWIN_IPPROTO_IP) {
+		*linux_level = IPPROTO_IP;
+		switch (darwin_option) {
+		case DARWIN_IP_PKTINFO:
+			*linux_option = LINUX_IP_PKTINFO;
+			return 1;
+		default:
+			*linux_option = darwin_option;
+			return 1;
+		}
+	}
+
 	if (darwin_level != DARWIN_SOL_SOCKET) {
 		*linux_level = darwin_level;
 		*linux_option = darwin_option;
@@ -7845,6 +7860,147 @@ static void shim_resolve_real_socket_calls(void)
 		shim_real_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
 	if (!shim_real_recvmsg)
 		shim_real_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
+}
+
+struct darwin_cmsghdr {
+	uint32_t cmsg_len;
+	int32_t cmsg_level;
+	int32_t cmsg_type;
+};
+
+#define DARWIN_CMSG_LEN(data_len) \
+	((uint32_t)sizeof(struct darwin_cmsghdr) + (uint32_t)(data_len))
+#define DARWIN_CMSG_ALIGN(len) \
+	(((uint32_t)(len) + 3u) & ~(uint32_t)3u)
+#define DARWIN_CMSG_SPACE(data_len) \
+	(DARWIN_CMSG_ALIGN(DARWIN_CMSG_LEN(data_len)))
+
+static size_t shim_repack_linux_cmsgs_to_darwin(const void* linux_control,
+                                                 size_t linux_length,
+                                                 void* darwin_control,
+                                                 size_t darwin_capacity)
+{
+	const struct cmsghdr* cmsg;
+	size_t darwin_offset = 0;
+
+	if (!linux_control || !darwin_control || linux_length < sizeof(struct cmsghdr))
+		return 0;
+
+	for (cmsg = (const struct cmsghdr*)linux_control;
+	     (size_t)((const unsigned char*)cmsg -
+	              (const unsigned char*)linux_control) +
+	             sizeof(struct cmsghdr) <= linux_length;
+	     cmsg = (const struct cmsghdr*)
+	             ((const unsigned char*)cmsg + CMSG_ALIGN(cmsg->cmsg_len))) {
+		size_t consumed = (size_t)((const unsigned char*)cmsg -
+		                           (const unsigned char*)linux_control);
+		size_t remaining = linux_length - consumed;
+		struct darwin_cmsghdr* darwin_cmsg;
+		size_t data_length;
+		uint32_t darwin_len;
+
+		if (cmsg->cmsg_len < sizeof(struct cmsghdr) ||
+		    cmsg->cmsg_len > remaining)
+			break;
+
+		data_length = (size_t)cmsg->cmsg_len - sizeof(struct cmsghdr);
+		darwin_len = DARWIN_CMSG_LEN(data_length);
+		if (darwin_offset + DARWIN_CMSG_ALIGN(darwin_len) > darwin_capacity)
+			break;
+
+		darwin_cmsg = (struct darwin_cmsghdr*)
+			((unsigned char*)darwin_control + darwin_offset);
+		darwin_cmsg->cmsg_len = darwin_len;
+		darwin_cmsg->cmsg_level = cmsg->cmsg_level;
+		darwin_cmsg->cmsg_type = cmsg->cmsg_type;
+
+		if (darwin_cmsg->cmsg_level == IPPROTO_IP &&
+		    darwin_cmsg->cmsg_type == LINUX_IP_PKTINFO) {
+			darwin_cmsg->cmsg_type = DARWIN_IP_PKTINFO;
+		} else if (darwin_cmsg->cmsg_level == DARWIN_IPPROTO_IPV6 &&
+		           darwin_cmsg->cmsg_type == LINUX_IPV6_PKTINFO &&
+		           data_length >= sizeof(struct in6_pktinfo)) {
+			unsigned char* darwin_data =
+				((unsigned char*)darwin_cmsg) +
+				sizeof(struct darwin_cmsghdr);
+			const unsigned char* linux_data =
+				(const unsigned char*)cmsg + sizeof(struct cmsghdr);
+			darwin_cmsg->cmsg_type = DARWIN_IPV6_PKTINFO;
+			memcpy(darwin_data, linux_data + sizeof(unsigned int),
+			       16);
+			memcpy(darwin_data + 16, linux_data, sizeof(unsigned int));
+		}
+
+		if (data_length &&
+		    !(darwin_cmsg->cmsg_level == DARWIN_IPPROTO_IPV6 &&
+		      darwin_cmsg->cmsg_type == DARWIN_IPV6_PKTINFO &&
+		      data_length >= sizeof(struct in6_pktinfo))) {
+			memcpy(((unsigned char*)darwin_cmsg) + sizeof(struct darwin_cmsghdr),
+			       (const unsigned char*)cmsg + sizeof(struct cmsghdr),
+			       data_length);
+		}
+
+		darwin_offset += DARWIN_CMSG_ALIGN(darwin_len);
+	}
+
+	return darwin_offset;
+}
+
+static size_t shim_repack_darwin_cmsgs_to_linux(const void* darwin_control,
+                                                size_t darwin_length,
+                                                void* linux_control,
+                                                size_t linux_capacity)
+{
+	const struct darwin_cmsghdr* cmsg;
+	size_t linux_offset = 0;
+
+	if (!darwin_control || !linux_control || darwin_length < sizeof(struct darwin_cmsghdr))
+		return 0;
+
+	for (cmsg = (const struct darwin_cmsghdr*)darwin_control;
+	     (size_t)((const unsigned char*)cmsg -
+	              (const unsigned char*)darwin_control) +
+	             sizeof(struct darwin_cmsghdr) <= darwin_length;
+	     cmsg = (const struct darwin_cmsghdr*)
+	             ((const unsigned char*)cmsg +
+	              DARWIN_CMSG_ALIGN(cmsg->cmsg_len))) {
+		size_t consumed = (size_t)((const unsigned char*)cmsg -
+		                           (const unsigned char*)darwin_control);
+		size_t remaining = darwin_length - consumed;
+		struct cmsghdr* linux_cmsg;
+		size_t data_length;
+		size_t linux_stride;
+
+		if (cmsg->cmsg_len < sizeof(struct darwin_cmsghdr) ||
+		    (size_t)cmsg->cmsg_len > remaining)
+			break;
+
+		data_length = (size_t)cmsg->cmsg_len - sizeof(struct darwin_cmsghdr);
+		linux_stride = CMSG_SPACE(data_length);
+		if (linux_offset + linux_stride > linux_capacity)
+			break;
+
+		linux_cmsg = (struct cmsghdr*)
+			((unsigned char*)linux_control + linux_offset);
+		linux_cmsg->cmsg_len = CMSG_LEN(data_length);
+		linux_cmsg->cmsg_level = cmsg->cmsg_level;
+		linux_cmsg->cmsg_type = cmsg->cmsg_type;
+
+		if (linux_cmsg->cmsg_level == DARWIN_IPPROTO_IP &&
+		    linux_cmsg->cmsg_type == DARWIN_IP_PKTINFO)
+			linux_cmsg->cmsg_type = LINUX_IP_PKTINFO;
+		else if (linux_cmsg->cmsg_level == DARWIN_IPPROTO_IPV6 &&
+		         linux_cmsg->cmsg_type == DARWIN_IPV6_PKTINFO)
+			linux_cmsg->cmsg_type = LINUX_IPV6_PKTINFO;
+
+		memcpy((unsigned char*)linux_cmsg + sizeof(struct cmsghdr),
+		       (const unsigned char*)cmsg + sizeof(struct darwin_cmsghdr),
+		       data_length);
+
+		linux_offset += linux_stride;
+	}
+
+	return linux_offset;
 }
 
 int shim_socket(int domain, int type, int protocol) __asm__("socket");
@@ -8103,10 +8259,24 @@ ssize_t shim_sendmsg(int sockfd, const void* darwin_msg_hdr, int flags)
 	linux_msg.msg_iov = darwin_msg->msg_iov;
 	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
 	linux_msg.msg_flags = darwin_msg->msg_flags;
+	if (darwin_msg->msg_control && darwin_msg->msg_controllen) {
+		linux_msg.msg_control = malloc(darwin_msg->msg_controllen);
+		if (!linux_msg.msg_control) {
+			errno = ENOMEM;
+			return -1;
+		}
+		linux_msg.msg_controllen = shim_repack_darwin_cmsgs_to_linux(
+			darwin_msg->msg_control,
+			(size_t)darwin_msg->msg_controllen,
+			linux_msg.msg_control,
+			(size_t)darwin_msg->msg_controllen);
+	}
 	errno = 0;
 	result = shim_real_sendmsg(sockfd, &linux_msg,
 	                          shim_send_flags_to_linux(flags));
 	saved_errno = errno;
+	if (linux_msg.msg_control)
+		free(linux_msg.msg_control);
 	if (result < 0)
 		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("sendmsg caller=%p fd=%d iovlen=%d namelen=%d -> %zd errno=%d\n",
@@ -8125,6 +8295,7 @@ ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
 	socklen_t linux_len = sizeof(linux_addr);
 	struct msghdr linux_msg;
 	socklen_t darwin_capacity = darwin_msg->msg_namelen;
+	char linux_control[512];
 	ssize_t result;
 	int saved_errno;
 
@@ -8137,8 +8308,13 @@ ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
 	linux_msg.msg_namelen = sizeof(linux_addr);
 	linux_msg.msg_iov = darwin_msg->msg_iov;
 	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
-	linux_msg.msg_control = darwin_msg->msg_control;
-	linux_msg.msg_controllen = (size_t)darwin_msg->msg_controllen;
+	if (darwin_msg->msg_control && darwin_msg->msg_controllen) {
+		linux_msg.msg_control = linux_control;
+		linux_msg.msg_controllen = sizeof(linux_control);
+	} else {
+		linux_msg.msg_control = NULL;
+		linux_msg.msg_controllen = 0;
+	}
 	result = shim_real_recvmsg(sockfd, &linux_msg,
 	                           shim_recv_flags_to_linux(flags));
 	if (result < 0) {
@@ -8156,8 +8332,15 @@ ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
 		} else if (darwin_msg->msg_name) {
 			darwin_msg->msg_namelen = 0;
 		}
-		darwin_msg->msg_controllen =
-			(socklen_t)linux_msg.msg_controllen;
+		if (darwin_msg->msg_control && darwin_msg->msg_controllen) {
+			size_t repacked = shim_repack_linux_cmsgs_to_darwin(
+				linux_control, (size_t)linux_msg.msg_controllen,
+				darwin_msg->msg_control,
+				(size_t)darwin_msg->msg_controllen);
+			darwin_msg->msg_controllen = (socklen_t)repacked;
+		} else {
+			darwin_msg->msg_controllen = 0;
+		}
 	}
 	shim_fd_trace_log("recvmsg caller=%p fd=%d len_iov=%d -> %zd errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
@@ -8285,11 +8468,11 @@ int shim_setsockopt(int sockfd, int level, int option,
 		return -1;
 	if (level == DARWIN_SOL_SOCKET && option == DARWIN_SO_NOSIGPIPE)
 		return 0;
-	if (level == 0 && option == DARWIN_IP_DONTFRAG) {
+	if (level == DARWIN_IPPROTO_IP && option == DARWIN_IP_DONTFRAG) {
 		int mtu_discovery = LINUX_IP_PMTUDISC_DONT;
 		if (value && value_len >= (socklen_t)sizeof(int) && *(const int*)value > 0)
 			mtu_discovery = LINUX_IP_PMTUDISC_DO;
-		result = shim_real_setsockopt(sockfd, 0, LINUX_IP_MTU_DISCOVER,
+		result = shim_real_setsockopt(sockfd, IPPROTO_IP, LINUX_IP_MTU_DISCOVER,
 		                             &mtu_discovery, sizeof(mtu_discovery));
 		shim_fd_trace_log("setsockopt caller=%p fd=%d level=0 option=IP_DONTFRAG translated=IP_MTU_DISCOVER -> %d errno=%d\n",
 		                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, result, result < 0 ? errno : 0);
@@ -8324,6 +8507,21 @@ int shim_getsockopt(int sockfd, int level, int option,
 	shim_resolve_real_socket_calls();
 	if (!shim_real_getsockopt)
 		return -1;
+	if (level == DARWIN_IPPROTO_IP && option == DARWIN_IP_DONTFRAG) {
+		int mtu_discovery = 0;
+		socklen_t mtu_len = sizeof(mtu_discovery);
+		errno = 0;
+		result = shim_real_getsockopt(sockfd, IPPROTO_IP,
+		                              LINUX_IP_MTU_DISCOVER,
+		                              &mtu_discovery, &mtu_len);
+		saved_errno = errno;
+		if (result == 0 && value && value_len_ptr &&
+		    *value_len_ptr >= (socklen_t)sizeof(int)) {
+			*(int*)value = mtu_discovery == LINUX_IP_PMTUDISC_DO ? 1 : 0;
+			*value_len_ptr = sizeof(int);
+		}
+		return result;
+	}
 	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
 		return -1;
 	errno = 0;
@@ -10682,6 +10880,14 @@ static int64_t kqueue_event_data(const struct shim_kqueue_registration* registra
 		if (syscall(SYS_ioctl, (int)registration->ident, FIONREAD,
 		            &available) == 0 && available > 0)
 			return available;
+		if (revents & POLLIN) {
+			int listening = 0;
+			socklen_t listening_len = sizeof(listening);
+			if (syscall(SYS_getsockopt, (int)registration->ident,
+			            SOL_SOCKET, SO_ACCEPTCONN, &listening,
+			            &listening_len) == 0 && listening)
+				return 1;
+		}
 		return 0;
 	}
 	if (registration->filter == DARWIN_EVFILT_WRITE) {
@@ -12538,6 +12744,9 @@ static void dispatch_run_block(void* block)
 
 	if (!block)
 		return;
+	if (shim_trace_enabled())
+		fprintf(stderr, "libsystem_shim: dispatch run block=%p invoke=%p\n",
+		        block, (void*)(uintptr_t)layout->invoke);
 	if (layout->invoke)
 		layout->invoke(block);
 	_Block_release(block);
@@ -12617,6 +12826,10 @@ void dispatch_async(void *queue, void *block)
 	struct dispatch_queue* serial = queue;
 	struct dispatch_work_item* item;
 	void* owned;
+
+	if (shim_trace_enabled() && serial && serial->type == DISPATCH_OBJ_QUEUE)
+		fprintf(stderr, "libsystem_shim: dispatch_async queue=%s block=%p\n",
+		        serial->label, block);
 
 	if (queue == &_dispatch_main_q || queue == &_dispatch_global_default)
 		serial = NULL;
