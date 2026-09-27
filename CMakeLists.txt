@@ -26,6 +26,7 @@ set(MACHGATE_SOURCES
     src/bgfx_shim.c
     src/sdl_window_shim.c
     src/eh_frame.c
+    src/startup_cache.c
     src/dylib_loader.c
     src/isa_emul.c
     src/syscall/syscall_gate.c
