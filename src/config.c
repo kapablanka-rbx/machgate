@@ -54,8 +54,8 @@ int config_load(const char* path, machgate_config_t* cfg)
 					memset(cur_tramp, 0, sizeof(*cur_tramp));
 					cur_tramp->name = strdup(name);
 				}
-			} else if (strncmp(s, "dylib_patch.", 13) == 0) {
-				const char* name = s + 13;
+			} else if (strncmp(s, "dylib_patch.", 12) == 0) {
+				const char* name = s + 12;
 				if (cfg->num_dylib_patches < CONFIG_MAX_DYLIB_PATCHES) {
 					machgate_dylib_patch_config_t* dp =
 						&cfg->dylib_patches[cfg->num_dylib_patches++];
