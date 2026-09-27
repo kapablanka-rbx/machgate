@@ -14999,8 +14999,9 @@ typedef int   (*real_posix_memalign_fn)(void **, size_t, size_t);
 static real_malloc_fn  real_malloc  = NULL;
 static real_free_fn real_free = NULL;
 
-#define MACHGATE_FREE_QUARANTINE_SLOTS 32768
+#define MACHGATE_FREE_QUARANTINE_SLOTS 262144
 #define MACHGATE_FREE_QUARANTINE_MAX_CHUNK (16u << 20)
+#define MACHGATE_FREE_QUARANTINE_DEFAULT_BUDGET (8u << 30)
 
 struct machgate_free_quarantine_slot {
 	void* ptr;
@@ -15028,6 +15029,8 @@ static size_t machgate_free_quarantine_budget(void)
 		else
 			configured = 0;
 	}
+	if (configured == 0)
+		return MACHGATE_FREE_QUARANTINE_DEFAULT_BUDGET;
 	return (size_t)configured;
 }
 
@@ -15688,16 +15691,19 @@ static void shim_free_impl_at(void *ptr, void* caller)
 	if (!real_free) resolve_real_funcs();
 	if (!real_free) return;
 	size_t quarantine_size = known ? old_size : 0;
+	if (quarantine_size > MACHGATE_FREE_QUARANTINE_MAX_CHUNK)
+		quarantine_size = 0;
 	if (!quarantine_size) {
 		quarantine_size = malloc_usable_size(ptr);
-		if (ptr != bootstrap_buf)
-			known = quarantine_size > 0;
+		if ((char*)ptr >= bootstrap_buf &&
+		    (char*)ptr < bootstrap_buf + sizeof(bootstrap_buf))
+			quarantine_size = 0;
 	}
-	if (!known || quarantine_size > MACHGATE_FREE_QUARANTINE_MAX_CHUNK) {
+	if (!quarantine_size || quarantine_size > MACHGATE_FREE_QUARANTINE_MAX_CHUNK) {
 		real_free(ptr);
 		return;
 	}
-	shim_free_quarantine_push(ptr, quarantine_size ? quarantine_size : 1);
+	shim_free_quarantine_push(ptr, quarantine_size);
 }
 
 void shim_free(void *ptr) __asm__("free");
