@@ -13,6 +13,7 @@ set(MACHGATE_SOURCES
     src/machgate.c
     src/vm_interpose_loader.c
     src/commpage.c
+    src/guest_cpus.c
     src/resolver.c
     src/trampoline.c
     src/gdb_jit.c

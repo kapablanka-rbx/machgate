@@ -1,5 +1,6 @@
 #include "syscall_range_200_399.h"
 #include "execve_reexec.h"
+#include "guest_cpus.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -1199,12 +1200,7 @@ static int validate_fd_argument(int fd)
 
 static int host_cpu_count(void)
 {
-	long result = sysconf(_SC_NPROCESSORS_ONLN);
-	if (result < 1)
-		return 1;
-	if (result > INT32_MAX)
-		return INT32_MAX;
-	return (int)result;
+	return guest_cpu_count();
 }
 
 static uint64_t host_memory_size(void)

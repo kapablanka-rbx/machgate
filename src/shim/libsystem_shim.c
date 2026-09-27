@@ -7311,6 +7311,8 @@ void* getsectiondata(const void* header, const char* segment_name,
 	return getsegmentdata(header, segment_name, size);
 }
 
+static void* shim_objc_make_single_element_array(const char* text);
+
 /* ===== NSSearchPathEnumeration =====
  *
  * Apple's API for enumerating well-known user directories. Sugar's
@@ -7338,6 +7340,68 @@ unsigned int NSGetNextSearchPathEnumeration(unsigned int state, char *path)
 	const char *home = get_fake_home();
 	snprintf(path, 1024, "%.980s/Library/Application Support", home);
 	return 0x80000000u; /* nonzero so caller uses the buffer */
+}
+
+/* ===== NSSearchPathForDirectoriesInDomains =====
+ *
+ * Foundation's well-known-directory lookup. RBX::FileSystem::getLogsDirectory
+ * (Darwin FileSystem.mm) asks for NSLibraryDirectory in the user domain, then
+ * takes objectAtIndex:0 and calls cStringUsingEncoding:. Without a real array
+ * the shim's objc layer returned NULL and std::string(NULL) crashed in the
+ * CSG DCD dump worker (SelfUnionTest SIGSEGV). We return a one-element NSArray
+ * of NSStrings under the rewritten HOME, mirroring the enumeration variant.
+ *
+ * Apple directory keys (NSSearchPathDirectory):
+ *   9  NSDocumentDirectory             ~/Documents
+ *   5  NSLibraryDirectory              ~/Library
+ *   13 NSCachesDirectory               ~/Library/Caches
+ *   14 NSApplicationSupportDirectory   ~/Library/Application Support
+ *   12 NSDesktopDirectory              ~/Desktop
+ *   15 NSDownloadsDirectory            ~/Downloads
+ *   17 NSMoviesDirectory               ~/Movies
+ *   18 NSMusicDirectory                ~/Music
+ *   19 NSPicturesDirectory             ~/Pictures
+ */
+void* NSSearchPathForDirectoriesInDomains(unsigned int directory,
+                                          unsigned int domain_mask,
+                                          unsigned int expand_tilde)
+{
+	static const struct {
+		unsigned int key;
+		const char* suffix;
+	} directory_suffixes[] = {
+		{ 5,  "/Library" },
+		{ 9,  "/Documents" },
+		{ 12, "/Desktop" },
+		{ 13, "/Library/Caches" },
+		{ 14, "/Library/Application Support" },
+		{ 15, "/Downloads" },
+		{ 17, "/Movies" },
+		{ 18, "/Music" },
+		{ 19, "/Pictures" },
+	};
+	const char* suffix = NULL;
+	char path[1100];
+	void* result;
+
+	(void)domain_mask;
+	(void)expand_tilde;
+
+	for (size_t index = 0; index < sizeof(directory_suffixes) / sizeof(directory_suffixes[0]); index++) {
+		if (directory_suffixes[index].key == directory) {
+			suffix = directory_suffixes[index].suffix;
+			break;
+		}
+	}
+	if (!suffix)
+		suffix = "/Library";
+
+	snprintf(path, sizeof(path), "%.980s%s", get_fake_home(), suffix);
+	result = shim_objc_make_single_element_array(path);
+	if (!result && shim_trace_enabled())
+		fprintf(stderr, "libsystem_shim: NSSearchPathForDirectoriesInDomains allocation failed key=%u\n",
+		        directory);
+	return result;
 }
 
 /* ===== Apple locale / ctype ===== */
@@ -8877,9 +8941,8 @@ long sysconf(int name)
 	case DARWIN_SC_PAGESIZE:
 		return real_sysconf(_SC_PAGESIZE);
 	case DARWIN_SC_NPROCESSORS_CONF:
-		return real_sysconf(_SC_NPROCESSORS_CONF);
 	case DARWIN_SC_NPROCESSORS_ONLN:
-		return real_sysconf(_SC_NPROCESSORS_ONLN);
+		return shim_hw_ncpu();
 	default:
 		return real_sysconf(name);
 	}
@@ -10466,6 +10529,12 @@ static const char darwin_model[] = "VirtualMac2,1";
 
 static int shim_hw_ncpu(void)
 {
+	const char* override = getenv("MACHGATE_GUEST_NCPU");
+	if (override && *override) {
+		int parsed = atoi(override);
+		if (parsed >= 1 && parsed <= 255)
+			return parsed;
+	}
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
 	return (n < 1) ? 1 : (int)n;
 }
@@ -14435,6 +14504,7 @@ enum shim_objc_kind {
 	SHIM_OBJC_INSTANCE_NSPROCESSINFO,
 	SHIM_OBJC_CLASS_NSSTRING,
 	SHIM_OBJC_STRING,
+	SHIM_OBJC_ARRAY,
 };
 
 struct shim_objc_header {
@@ -14445,6 +14515,12 @@ struct shim_objc_header {
 struct shim_objc_string {
 	struct shim_objc_header header;
 	char utf8[];
+};
+
+struct shim_objc_array {
+	struct shim_objc_header header;
+	uint32_t count;
+	struct shim_objc_string* elements[];
 };
 
 struct shim_objc_header OBJC_CLASS_$_NSProcessInfo = {
@@ -14477,6 +14553,27 @@ static void* shim_objc_make_string(const char* text)
 	result->header.kind = SHIM_OBJC_STRING;
 	memcpy(result->utf8, text, length + 1);
 	return result;
+}
+
+static void* shim_objc_make_array(struct shim_objc_string** elements, uint32_t count)
+{
+	struct shim_objc_array* result = malloc(sizeof(*result) + sizeof(*elements) * (count ? count : 1));
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_ARRAY;
+	result->count = count;
+	for (uint32_t element_index = 0; element_index < count; element_index++)
+		result->elements[element_index] = elements[element_index];
+	return result;
+}
+
+static void* shim_objc_make_single_element_array(const char* text)
+{
+	struct shim_objc_string* element = shim_objc_make_string(text);
+	if (!element)
+		return NULL;
+	return shim_objc_make_array(&element, 1);
 }
 
 static char* shim_objc_format_integers(const char* format, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6)
@@ -14550,6 +14647,35 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 	} else if (strcmp(selector, "UTF8String") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return ((struct shim_objc_string*)receiver)->utf8;
+	} else if (strcmp(selector, "cStringUsingEncoding:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
+			return ((struct shim_objc_string*)receiver)->utf8;
+	} else if (strcmp(selector, "length") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
+			return (void*)(uintptr_t)strlen(((struct shim_objc_string*)receiver)->utf8);
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY))
+			return (void*)(uintptr_t)((struct shim_objc_array*)receiver)->count;
+	} else if (strcmp(selector, "count") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY))
+			return (void*)(uintptr_t)((struct shim_objc_array*)receiver)->count;
+	} else if (strcmp(selector, "objectAtIndex:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			const struct shim_objc_array* array = receiver;
+			if (a2 < array->count)
+				return array->elements[a2];
+		}
+	} else if (strcmp(selector, "firstObject") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			const struct shim_objc_array* array = receiver;
+			if (array->count > 0)
+				return array->elements[0];
+		}
+	} else if (strcmp(selector, "lastObject") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			const struct shim_objc_array* array = receiver;
+			if (array->count > 0)
+				return array->elements[array->count - 1];
+		}
 	}
 
 	if (shim_trace_enabled())

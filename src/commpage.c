@@ -8,6 +8,7 @@
  */
 
 #include "commpage.h"
+#include "guest_cpus.h"
 #include <sys/mman.h>
 #include <stdio.h>
 #include <errno.h>
@@ -92,8 +93,9 @@ void commpage_setup(bool _64bit)
 	*(uint16_t*)(commpage + CP_VERSION) = 14; /* match recent XNU */
 
 	/* CPU count */
-	uint8_t ncpus = sysconf(_SC_NPROCESSORS_CONF);
-	uint8_t nactive = sysconf(_SC_NPROCESSORS_ONLN);
+	int ncpus_value = guest_cpu_count();
+	uint8_t ncpus = (uint8_t)ncpus_value;
+	uint8_t nactive = ncpus;
 	*(uint8_t*)(commpage + CP_NCPUS) = ncpus;
 	*(uint8_t*)(commpage + CP_ACTIVE_CPUS) = nactive;
 	*(uint8_t*)(commpage + CP_PHYSICAL_CPUS) = ncpus;
