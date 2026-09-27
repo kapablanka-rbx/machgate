@@ -42,10 +42,12 @@
 #include "eh_frame.h"
 #include "dylib_loader.h"
 #include "isa_emul.h"
+#include "startup_cache.h"
 #include "syscall/syscall_gate.h"
 #include "vm_interpose.h"
 #include "log.h"
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
 /* VM_PROT_* and SEG_DATA are defined in macho_defs.h */
@@ -637,6 +639,54 @@ static int rewrite_tpidrro_read(uint32_t *instruction)
 	return 1;
 }
 
+#define MAIN_TEXT_PATCH_MAX (2 * 1024 * 1024)
+
+static struct startup_cache_patch* main_text_patches;
+static size_t main_text_patch_count;
+
+static void record_text_patch(uint64_t text_offset, uint32_t instruction,
+                              uint32_t kind)
+{
+	if (!main_text_patches)
+		return;
+	if (main_text_patch_count >= MAIN_TEXT_PATCH_MAX)
+		return;
+	main_text_patches[main_text_patch_count].text_offset = text_offset;
+	main_text_patches[main_text_patch_count].instruction = instruction;
+	main_text_patches[main_text_patch_count].kind = kind;
+	main_text_patch_count++;
+}
+
+static void main_text_patches_alloc(void)
+{
+	main_text_patches = (struct startup_cache_patch*)malloc(
+		MAIN_TEXT_PATCH_MAX * sizeof(struct startup_cache_patch));
+	main_text_patch_count = 0;
+}
+
+static void publish_main_startup_cache(void)
+{
+	if (!startup_cache_enabled())
+		return;
+
+	const char* binary_path = NULL;
+	struct stat binary_st;
+	if (eh_frame_cache_context(&binary_path, &binary_st) != 0)
+		return;
+
+	struct stat current_st;
+	if (stat(binary_path, &current_st) != 0)
+		return;
+	if (current_st.st_ino != binary_st.st_ino ||
+	    current_st.st_size != binary_st.st_size ||
+	    current_st.st_mtim.tv_sec != binary_st.st_mtim.tv_sec ||
+	    current_st.st_mtim.tv_nsec != binary_st.st_mtim.tv_nsec)
+		return;
+
+	eh_frame_cache_capture(binary_path, &binary_st, main_text_patches,
+	                        main_text_patch_count);
+}
+
 static size_t estimate_main_lse_pool_size(struct load_results* lr)
 {
 	if (!lr->mh)
@@ -763,6 +813,12 @@ int main(int argc, char** argv, char** envp)
 
 	filename = argv[arg_idx];
 
+	{
+		struct stat binary_st;
+		if (stat(filename, &binary_st) == 0)
+			eh_frame_note_binary(filename, &binary_st);
+	}
+
 	/* Load the Mach-O binary */
 	load(filename, 0, false, argv, &machgate_load_results);
 
@@ -871,6 +927,37 @@ int main(int argc, char** argv, char** envp)
 		int rcpc_fixed = 0;
 		int tpidr_fixed = 0;
 
+		uint64_t rcpc_phase_ms = machgate_phase_now_ms();
+
+		const struct startup_cache_patch* replay_patches = NULL;
+		size_t replay_count = 0;
+		struct startup_cache_header replay_header;
+		{
+			const char* cache_path = NULL;
+			struct stat cache_st;
+			if (eh_frame_cache_context(&cache_path, &cache_st) == 0 &&
+			    startup_cache_open(&replay_header, NULL, NULL,
+			                       &replay_patches, cache_path,
+			                       &cache_st) == 0) {
+				replay_count = (size_t)replay_header.patch_count;
+			}
+		}
+
+		uintptr_t main_text_base = 0;
+		for (uint32_t li = 0; li < mh->ncmds && p < mh->sizeofcmds; li++) {
+			struct load_command* llc = (struct load_command*)(cmds + p);
+			if (llc->cmd == LC_SEGMENT_64) {
+				struct segment_command_64* lseg = (struct segment_command_64*)llc;
+				if (strcmp(lseg->segname, "__TEXT") == 0)
+					main_text_base = lseg->vmaddr;
+			}
+			p += llc->cmdsize;
+		}
+		p = 0;
+
+		if (replay_count == 0)
+			main_text_patches_alloc();
+
 		/* Allocate island pool for LSE emulation (near __TEXT for B range). */
 		uintptr_t text_begin = 0;
 		uintptr_t text_end = 0;
@@ -923,6 +1010,7 @@ int main(int argc, char** argv, char** envp)
 
 		lse_pool_cur = lse_pool;
 		lse_pool_end = lse_pool ? lse_pool + lse_pool_size / 4 : NULL;
+		size_t replay_cursor = 0;
 		for (uint32_t i = 0; i < mh->ncmds && p < mh->sizeofcmds; i++) {
 			struct load_command* lc = (struct load_command*)(cmds + p);
 			if (lc->cmd == LC_SEGMENT_64) {
@@ -944,14 +1032,44 @@ int main(int argc, char** argv, char** envp)
 						uint32_t* scode = (uint32_t*)(sect->addr + machgate_load_results.slide);
 						size_t scount = sect->size / 4;
 
-						/* RCPC: in-place downgrade */
-						for (size_t j = 0; j < scount; j++) {
-							if ((scode[j] & 0x3FFFFC00) == 0x38BFC000) {
-								scode[j] = (scode[j] & 0xC00003FF) | 0x08DFFC00;
-								rcpc_fixed++;
+						if (replay_count > 0 && replay_patches &&
+						    machgate_load_results.slide == 0) {
+							for (size_t j = 0; j < scount; j++) {
+								uint64_t offset =
+									(uint64_t)(uintptr_t)
+									((uint8_t*)&scode[j] -
+									 (uint8_t*)(uintptr_t)main_text_base);
+								while (replay_cursor < replay_count &&
+								       replay_patches[replay_cursor].text_offset < offset)
+									replay_cursor++;
+								if (replay_cursor >= replay_count)
+									continue;
+								if (replay_patches[replay_cursor].text_offset != offset)
+									continue;
+								scode[j] = replay_patches[replay_cursor].instruction;
+								if (replay_patches[replay_cursor].kind == STARTUP_CACHE_PATCH_RCPC)
+									rcpc_fixed++;
+								else
+									tpidr_fixed++;
+								replay_cursor++;
 							}
-							if (rewrite_tpidrro_read(&scode[j])) {
-								tpidr_fixed++;
+						} else {
+							for (size_t j = 0; j < scount; j++) {
+								if ((scode[j] & 0x3FFFFC00) == 0x38BFC000) {
+									scode[j] = (scode[j] & 0xC00003FF) | 0x08DFFC00;
+									record_text_patch(
+										(uint64_t)(uintptr_t)
+										((uint8_t*)&scode[j] - (uint8_t*)(uintptr_t)main_text_base),
+										scode[j], STARTUP_CACHE_PATCH_RCPC);
+									rcpc_fixed++;
+								}
+								if (rewrite_tpidrro_read(&scode[j])) {
+									record_text_patch(
+										(uint64_t)(uintptr_t)
+										((uint8_t*)&scode[j] - (uint8_t*)(uintptr_t)main_text_base),
+										scode[j], STARTUP_CACHE_PATCH_TPIDRRO);
+									tpidr_fixed++;
+								}
 							}
 						}
 
@@ -977,6 +1095,11 @@ int main(int argc, char** argv, char** envp)
 			machgate_log_startup("machgate: rewrote %d Darwin TPIDRRO reads to Linux TPIDR reads\n", tpidr_fixed);
 		if (lse_total > 0)
 			machgate_log_startup("machgate: patched %d ARMv8.1 LSE atomics with LDXR/STXR islands\n", lse_total);
+		if (replay_count > 0)
+			machgate_phase_log("machgate: text patches from cache", rcpc_phase_ms);
+		else
+			machgate_phase_log("machgate: text patch scan", rcpc_phase_ms);
+		startup_cache_close();
 	}
 
 	/* Resolve chained fixups — patch GOT with native Linux .so addresses.
@@ -985,8 +1108,10 @@ int main(int argc, char** argv, char** envp)
 	 * Order: resolve main exe first (which triggers dylib loading),
 	 * then resolve each loaded dylib's own fixups. */
 	if (machgate_load_results.mh && cfg.dylib_map) {
+		uint64_t resolver_phase_ms = machgate_phase_now_ms();
 		resolver_resolve_fixups((void*)machgate_load_results.mh,
 		                        machgate_load_results.slide, cfg.dylib_map);
+		machgate_phase_log("resolver: main executable fixups", resolver_phase_ms);
 
 		/* Resolve chained fixups for loaded Mach-O dylibs.
 		 * Each dylib has its own LC_DYLD_CHAINED_FIXUPS that need patching.
@@ -1107,8 +1232,11 @@ int main(int argc, char** argv, char** envp)
 			fixup_darwin_libc_allocator_defaults(&machgate_load_results);
 			configure_guest_cxx_allocator_hooks(&machgate_load_results);
 			setup_tlv_image(&machgate_load_results);
+			uint64_t eh_frame_phase_ms = machgate_phase_now_ms();
 			eh_frame_register_macho((void*)machgate_load_results.mh,
 			                        machgate_load_results.slide);
+			machgate_phase_log("eh_frame: total", eh_frame_phase_ms);
+			publish_main_startup_cache();
 		}
 
 		/* Run static initializers for loaded Mach-O dylibs.
@@ -1125,8 +1253,11 @@ int main(int argc, char** argv, char** envp)
 		fixup_darwin_libc_allocator_defaults(&machgate_load_results);
 		configure_guest_cxx_allocator_hooks(&machgate_load_results);
 		setup_tlv_image(&machgate_load_results);
+		uint64_t eh_frame_phase_ms = machgate_phase_now_ms();
 		eh_frame_register_macho((void*)machgate_load_results.mh,
 		                        machgate_load_results.slide);
+		machgate_phase_log("eh_frame: total", eh_frame_phase_ms);
+		publish_main_startup_cache();
 	}
 
 	/* Apply trampolines from config */
@@ -1261,8 +1392,10 @@ int main(int argc, char** argv, char** envp)
 
 	/* Register Mach-O symbols with GDB for backtraces */
 	if (machgate_load_results.mh) {
+		uint64_t gdb_jit_phase_ms = machgate_phase_now_ms();
 		gdb_jit_register_macho((void*)machgate_load_results.mh,
 		                       machgate_load_results.slide);
+		machgate_phase_log("gdb_jit: main executable symbols", gdb_jit_phase_ms);
 	}
 	for (int i = 0; i < g_num_macho_dylibs; i++) {
 		gdb_jit_register_macho((void*)g_macho_dylibs[i].mh,
