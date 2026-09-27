@@ -56,6 +56,7 @@ static int shim_startup_log_enabled(void)
 #include <poll.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <fcntl.h>
@@ -6210,12 +6211,73 @@ void quick_exit(int status)
 static int shim_errno_from_linux(int linux_errno)
 {
 	switch (linux_errno) {
-	case EAGAIN:
-		return 35;
-	case ETIMEDOUT:
-		return 60;
-	default:
-		return linux_errno;
+	case EPERM: return 1;
+	case ENOENT: return 2;
+	case ESRCH: return 3;
+	case EINTR: return 4;
+	case EIO: return 5;
+	case ENXIO: return 6;
+	case E2BIG: return 7;
+	case ENOEXEC: return 8;
+	case EBADF: return 9;
+	case ECHILD: return 10;
+	case EDEADLK: return 11;
+	case ENOMEM: return 12;
+	case EACCES: return 13;
+	case EFAULT: return 14;
+	case EBUSY: return 16;
+	case EEXIST: return 17;
+	case EXDEV: return 18;
+	case ENODEV: return 19;
+	case ENOTDIR: return 20;
+	case EISDIR: return 21;
+	case EINVAL: return 22;
+	case ENFILE: return 23;
+	case EMFILE: return 24;
+	case ENOTTY: return 25;
+	case EFBIG: return 27;
+	case ENOSPC: return 28;
+	case ESPIPE: return 29;
+	case EROFS: return 30;
+	case EMLINK: return 31;
+	case EPIPE: return 32;
+	case EDOM: return 33;
+	case ERANGE: return 34;
+	case EAGAIN: return 35;
+	case EINPROGRESS: return 36;
+	case EALREADY: return 37;
+	case ENOTSOCK: return 38;
+	case EDESTADDRREQ: return 39;
+	case EMSGSIZE: return 40;
+	case EPROTOTYPE: return 41;
+	case ENOPROTOOPT: return 42;
+	case EPROTONOSUPPORT: return 43;
+	case ENOTSUP: return 45;
+	case EAFNOSUPPORT: return 47;
+	case EADDRINUSE: return 48;
+	case EADDRNOTAVAIL: return 49;
+	case ENETDOWN: return 50;
+	case ENETUNREACH: return 51;
+	case ENETRESET: return 52;
+	case ECONNABORTED: return 53;
+	case ECONNRESET: return 54;
+	case ENOBUFS: return 55;
+	case EISCONN: return 56;
+	case ENOTCONN: return 57;
+	case ESHUTDOWN: return 58;
+	case ETIMEDOUT: return 60;
+	case ECONNREFUSED: return 61;
+	case ELOOP: return 62;
+	case ENAMETOOLONG: return 63;
+	case EHOSTUNREACH: return 65;
+	case ENOTEMPTY: return 66;
+	case EDQUOT: return 69;
+	case ESTALE: return 70;
+	case ENOLCK: return 77;
+	case EOVERFLOW: return 84;
+	case ECANCELED: return 89;
+	case EILSEQ: return 92;
+	default: return linux_errno;
 	}
 }
 
@@ -6609,6 +6671,10 @@ int shim_getpwnam_r(const char *name,
 #define DARWIN_SO_RCVLOWAT  0x1004
 #define DARWIN_SO_NOSIGPIPE 0x1022
 #define DARWIN_IP_DONTFRAG          28
+#define DARWIN_IPPROTO_TCP          6
+#define DARWIN_TCP_KEEPALIVE        0x10
+#define DARWIN_TCP_KEEPINTVL        0x101
+#define DARWIN_TCP_KEEPCNT          0x102
 #define LINUX_IP_MTU_DISCOVER       10
 #define LINUX_IP_PMTUDISC_DONT      0
 #define LINUX_IP_PMTUDISC_DO        2
@@ -6752,6 +6818,24 @@ static socklen_t shim_fill_darwin_sockaddr(const struct sockaddr* linux_addr,
 static int shim_translate_socket_option(int darwin_level, int darwin_option,
                                         int* linux_level, int* linux_option)
 {
+	if (darwin_level == DARWIN_IPPROTO_TCP) {
+		*linux_level = IPPROTO_TCP;
+		switch (darwin_option) {
+		case DARWIN_TCP_KEEPALIVE:
+			*linux_option = TCP_KEEPIDLE;
+			return 1;
+		case DARWIN_TCP_KEEPINTVL:
+			*linux_option = TCP_KEEPINTVL;
+			return 1;
+		case DARWIN_TCP_KEEPCNT:
+			*linux_option = TCP_KEEPCNT;
+			return 1;
+		default:
+			*linux_option = darwin_option;
+			return 1;
+		}
+	}
+
 	if (darwin_level != DARWIN_SOL_SOCKET) {
 		*linux_level = darwin_level;
 		*linux_option = darwin_option;
@@ -6853,14 +6937,19 @@ int shim_socket(int domain, int type, int protocol) __asm__("socket");
 int shim_socket(int domain, int type, int protocol)
 {
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_socket)
 		return -1;
 	result = shim_real_socket(shim_map_socket_domain(domain), type, protocol);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("socket caller=%p domain=%d type=%d protocol=%d -> %d errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), domain, type, protocol,
-	                  result, result < 0 ? errno : 0);
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
 	return result;
 }
 
@@ -6870,6 +6959,7 @@ int shim_bind(int sockfd, const void* darwin_addr, socklen_t darwin_len)
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = 0;
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_bind)
@@ -6880,12 +6970,17 @@ int shim_bind(int sockfd, const void* darwin_addr, socklen_t darwin_len)
 		                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, darwin_len);
 		return -1;
 	}
+	errno = 0;
 	result = shim_real_bind(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("bind caller=%p fd=%d family=%d port=%d -> %d errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
 	                  linux_addr.ss_family,
 	                  ntohs(((const struct sockaddr_in*)&linux_addr)->sin_port),
-	                  result, result < 0 ? errno : 0);
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
 	return result;
 }
 
@@ -6894,28 +6989,49 @@ int shim_connect(int sockfd, const void* darwin_addr, socklen_t darwin_len)
 {
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = 0;
+	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_connect)
 		return -1;
 	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
-	                                &linux_addr, &linux_len))
+	                                &linux_addr, &linux_len)) {
+		errno = EINVAL;
 		return -1;
-	return shim_real_connect(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+	}
+	errno = 0;
+	result = shim_real_connect(sockfd, (const struct sockaddr*)&linux_addr, linux_len);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
+	shim_fd_trace_log("connect caller=%p fd=%d family=%d port=%d -> %d errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
+	                  linux_addr.ss_family,
+	                  ntohs(((const struct sockaddr_in*)&linux_addr)->sin_port),
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
+	return result;
 }
 
 int shim_listen(int sockfd, int backlog) __asm__("listen");
 int shim_listen(int sockfd, int backlog)
 {
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_listen)
 		return -1;
+	errno = 0;
 	result = shim_real_listen(sockfd, backlog);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("listen caller=%p fd=%d backlog=%d -> %d errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, backlog,
-	                  result, result < 0 ? errno : 0);
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
 	return result;
 }
 
@@ -6925,14 +7041,23 @@ int shim_accept(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr)
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = sizeof(linux_addr);
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_accept)
 		return -1;
 
+	errno = 0;
 	result = shim_real_accept(sockfd, (struct sockaddr*)&linux_addr, &linux_len);
-	if (result < 0)
+	saved_errno = errno;
+	if (result < 0) {
+		saved_errno = shim_errno_from_linux(saved_errno);
+		shim_fd_trace_log("accept caller=%p fd=%d -> %d errno=%d\n",
+		                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, result,
+		                  saved_errno);
+		errno = saved_errno;
 		return result;
+	}
 
 	if (darwin_addr && darwin_len_ptr) {
 		socklen_t written = shim_fill_darwin_sockaddr(
@@ -6950,14 +7075,19 @@ int shim_getsockname(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr)
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = sizeof(linux_addr);
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_getsockname)
 		return -1;
 
+	errno = 0;
 	result = shim_real_getsockname(sockfd, (struct sockaddr*)&linux_addr, &linux_len);
-	if (result < 0)
+	if (result < 0) {
+		saved_errno = shim_errno_from_linux(errno);
+		errno = saved_errno;
 		return result;
+	}
 
 	if (darwin_addr && darwin_len_ptr) {
 		socklen_t written = shim_fill_darwin_sockaddr(
@@ -6975,14 +7105,19 @@ int shim_getpeername(int sockfd, void* darwin_addr, socklen_t* darwin_len_ptr)
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = sizeof(linux_addr);
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_getpeername)
 		return -1;
 
+	errno = 0;
 	result = shim_real_getpeername(sockfd, (struct sockaddr*)&linux_addr, &linux_len);
-	if (result < 0)
+	if (result < 0) {
+		saved_errno = shim_errno_from_linux(errno);
+		errno = saved_errno;
 		return result;
+	}
 
 	if (darwin_addr && darwin_len_ptr) {
 		socklen_t written = shim_fill_darwin_sockaddr(
@@ -7002,18 +7137,26 @@ ssize_t shim_sendto(int sockfd, const void* buffer, size_t length, int flags,
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = 0;
 	ssize_t result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_sendto)
 		return -1;
 	if (!shim_translate_sockaddr_in(darwin_addr, darwin_len,
-	                                &linux_addr, &linux_len))
+	                                &linux_addr, &linux_len)) {
+		errno = EINVAL;
 		return -1;
+	}
+	errno = 0;
 	result = shim_real_sendto(sockfd, buffer, length, flags,
 	                          (const struct sockaddr*)&linux_addr, linux_len);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("sendto caller=%p fd=%d len=%zu -> %zd errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, length,
-	                  result, result < 0 ? errno : 0);
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
 	return result;
 }
 
@@ -7026,6 +7169,7 @@ ssize_t shim_sendmsg(int sockfd, const void* darwin_msg_hdr, int flags)
 	socklen_t linux_len = 0;
 	struct msghdr linux_msg;
 	ssize_t result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_sendmsg)
@@ -7044,11 +7188,16 @@ ssize_t shim_sendmsg(int sockfd, const void* darwin_msg_hdr, int flags)
 	linux_msg.msg_iov = darwin_msg->msg_iov;
 	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
 	linux_msg.msg_flags = darwin_msg->msg_flags;
+	errno = 0;
 	result = shim_real_sendmsg(sockfd, &linux_msg, flags);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("sendmsg caller=%p fd=%d iovlen=%d namelen=%d -> %zd errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd,
 	                  darwin_msg->msg_iovlen, darwin_msg->msg_namelen,
-	                  result, result < 0 ? errno : 0);
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
 	return result;
 }
 
@@ -7061,6 +7210,7 @@ ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
 	struct msghdr linux_msg;
 	socklen_t darwin_capacity = darwin_msg->msg_namelen;
 	ssize_t result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_recvmsg)
@@ -7074,6 +7224,11 @@ ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
 	linux_msg.msg_control = darwin_msg->msg_control;
 	linux_msg.msg_controllen = (size_t)darwin_msg->msg_controllen;
 	result = shim_real_recvmsg(sockfd, &linux_msg, flags);
+	if (result < 0) {
+		saved_errno = shim_errno_from_linux(errno);
+		errno = saved_errno;
+		return result;
+	}
 	if (result >= 0) {
 		darwin_msg->msg_flags = linux_msg.msg_flags;
 		if (darwin_msg->msg_name && darwin_capacity >= 2) {
@@ -7102,15 +7257,20 @@ ssize_t shim_recvfrom(int sockfd, void* buffer, size_t length, int flags,
 	struct sockaddr_storage linux_addr;
 	socklen_t linux_len = sizeof(linux_addr);
 	ssize_t result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_recvfrom)
 		return -1;
 
+	errno = 0;
 	result = shim_real_recvfrom(sockfd, buffer, length, flags,
 	                            (struct sockaddr*)&linux_addr, &linux_len);
-	if (result < 0)
+	if (result < 0) {
+		saved_errno = shim_errno_from_linux(errno);
+		errno = saved_errno;
 		return result;
+	}
 
 	if (darwin_addr && darwin_len_ptr) {
 		socklen_t written = shim_fill_darwin_sockaddr(
@@ -7122,6 +7282,74 @@ ssize_t shim_recvfrom(int sockfd, void* buffer, size_t length, int flags,
 	return result;
 }
 
+ssize_t shim_recv(int sockfd, void* buffer, size_t length, int flags) __asm__("recv");
+ssize_t shim_recv(int sockfd, void* buffer, size_t length, int flags)
+{
+	ssize_t result;
+	int saved_errno;
+
+	errno = 0;
+	result = (ssize_t)syscall(SYS_recvfrom, sockfd, buffer, length, flags,
+	                         NULL, NULL);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
+	shim_fd_trace_log("recv caller=%p fd=%d len=%zu -> %zd errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, length,
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
+	return result;
+}
+
+ssize_t shim_send(int sockfd, const void* buffer, size_t length, int flags) __asm__("send");
+ssize_t shim_send(int sockfd, const void* buffer, size_t length, int flags)
+{
+	ssize_t result;
+	int saved_errno;
+
+	errno = 0;
+	result = (ssize_t)syscall(SYS_sendto, sockfd, buffer, length, flags,
+	                          NULL, 0);
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
+	shim_fd_trace_log("send caller=%p fd=%d len=%zu -> %zd errno=%d\n",
+	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, length,
+	                  result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
+	return result;
+}
+
+int inet_pton(int af, const char* src, void* dst)
+{
+	static int (*real_inet_pton)(int, const char*, void*);
+
+	if (!real_inet_pton)
+		real_inet_pton = dlsym(RTLD_NEXT, "inet_pton");
+	if (!real_inet_pton)
+		return -1;
+	if (af == DARWIN_AF_INET)
+		af = AF_INET;
+	else if (af == DARWIN_AF_INET6)
+		af = AF_INET6;
+	return real_inet_pton(af, src, dst);
+}
+
+const char* inet_ntop(int af, const void* src, char* dst, socklen_t size)
+{
+	static const char* (*real_inet_ntop)(int, const void*, char*, socklen_t);
+
+	if (!real_inet_ntop)
+		real_inet_ntop = dlsym(RTLD_NEXT, "inet_ntop");
+	if (!real_inet_ntop)
+		return NULL;
+	if (af == DARWIN_AF_INET)
+		af = AF_INET;
+	else if (af == DARWIN_AF_INET6)
+		af = AF_INET6;
+	return real_inet_ntop(af, src, dst, size);
+}
+
 int shim_setsockopt(int sockfd, int level, int option,
                    const void* value, socklen_t value_len) __asm__("setsockopt");
 int shim_setsockopt(int sockfd, int level, int option,
@@ -7130,6 +7358,7 @@ int shim_setsockopt(int sockfd, int level, int option,
 	int linux_level;
 	int linux_option;
 	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_setsockopt)
@@ -7148,11 +7377,17 @@ int shim_setsockopt(int sockfd, int level, int option,
 	}
 	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
 		result = -1;
-	else
+	else {
+		errno = 0;
 		result = shim_real_setsockopt(sockfd, linux_level, linux_option, value, value_len);
+	}
+	saved_errno = errno;
+	if (result < 0)
+		saved_errno = shim_errno_from_linux(saved_errno);
 	shim_fd_trace_log("setsockopt caller=%p fd=%d level=%d option=%d linux_level=%d linux_option=%d -> %d errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), sockfd, level, option,
-	                  linux_level, linux_option, result, result < 0 ? errno : 0);
+	                  linux_level, linux_option, result, result < 0 ? saved_errno : 0);
+	errno = saved_errno;
 	return result;
 }
 
@@ -7163,14 +7398,27 @@ int shim_getsockopt(int sockfd, int level, int option,
 {
 	int linux_level;
 	int linux_option;
+	int result;
+	int saved_errno;
 
 	shim_resolve_real_socket_calls();
 	if (!shim_real_getsockopt)
 		return -1;
 	if (!shim_translate_socket_option(level, option, &linux_level, &linux_option))
 		return -1;
-	return shim_real_getsockopt(sockfd, linux_level, linux_option,
-	                            value, value_len_ptr);
+	errno = 0;
+	result = shim_real_getsockopt(sockfd, linux_level, linux_option,
+	                              value, value_len_ptr);
+	saved_errno = errno;
+	if (result < 0) {
+		saved_errno = shim_errno_from_linux(saved_errno);
+		errno = saved_errno;
+		return result;
+	}
+	if (level == DARWIN_SOL_SOCKET && option == DARWIN_SO_ERROR &&
+	    value && value_len_ptr && *value_len_ptr >= (socklen_t)sizeof(int))
+		*(int*)value = shim_errno_from_linux(*(int*)value);
+	return result;
 }
 
 /* ===== _NSGetExecutablePath ===== */

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,6 +165,10 @@
 #define DARWIN_THSC_TIME_ENERGY_CPI_PER_PERF_LEVEL 6
 
 #define DARWIN_SOL_SOCKET 0xffff
+#define DARWIN_IPPROTO_TCP 6
+#define DARWIN_TCP_KEEPALIVE 0x10
+#define DARWIN_TCP_KEEPINTVL 0x101
+#define DARWIN_TCP_KEEPCNT 0x102
 #define DARWIN_SO_DEBUG      0x0001
 #define DARWIN_SO_ACCEPTCONN 0x0002
 #define DARWIN_SO_REUSEADDR  0x0004
@@ -505,6 +510,24 @@ static int translate_socket_domain(int darwin_domain, int* linux_domain)
 static int translate_socket_option(int darwin_level, int darwin_option,
                                    int* linux_level, int* linux_option)
 {
+	if (darwin_level == DARWIN_IPPROTO_TCP) {
+		*linux_level = IPPROTO_TCP;
+		switch (darwin_option) {
+		case DARWIN_TCP_KEEPALIVE:
+			*linux_option = TCP_KEEPIDLE;
+			return 1;
+		case DARWIN_TCP_KEEPINTVL:
+			*linux_option = TCP_KEEPINTVL;
+			return 1;
+		case DARWIN_TCP_KEEPCNT:
+			*linux_option = TCP_KEEPCNT;
+			return 1;
+		default:
+			*linux_option = darwin_option;
+			return 1;
+		}
+	}
+
 	if (darwin_level != DARWIN_SOL_SOCKET) {
 		*linux_level = darwin_level;
 		*linux_option = darwin_option;
@@ -992,6 +1015,14 @@ static void handle_getsockopt(struct syscall_gate_state* state)
 	long result = syscall(SYS_getsockopt, (int)state->x[0], linux_level,
 	                      linux_option, (void*)state->x[3],
 	                      (socklen_t*)state->x[4]);
+	if (result == 0 && (int)state->x[1] == DARWIN_SOL_SOCKET &&
+	    (int)state->x[2] == DARWIN_SO_ERROR) {
+		socklen_t* value_len_ptr = (socklen_t*)state->x[4];
+		int* value_ptr = (int*)state->x[3];
+		if (value_ptr && value_len_ptr &&
+		    *value_len_ptr >= (socklen_t)sizeof(int))
+			*value_ptr = darwin_errno_from_linux(*value_ptr);
+	}
 	finish_syscall_result(state, result);
 }
 

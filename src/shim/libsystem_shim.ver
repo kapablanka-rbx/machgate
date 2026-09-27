@@ -68,10 +68,14 @@ GLIBC_2.17 {
         getpeername;
         sendto;
         recvfrom;
+        send;
+        recv;
         sendmsg;
         recvmsg;
         setsockopt;
         getsockopt;
+        inet_pton;
+        inet_ntop;
         sysctlbyname;
         sysctlnametomib;
         uname;
