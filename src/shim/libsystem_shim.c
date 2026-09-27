@@ -11971,37 +11971,201 @@ int uname(void* buffer)
 	return 0;
 }
 
-/* ===== Blocks runtime (stubs) ===== */
+/* ===== Blocks runtime ===== */
 
-/* These are only used by Objective-C code paths (Cocoa/AppKit SDL2 backend).
- * After SDL2 trampolining, they should never be called. Provide stubs that
- * warn if hit. */
+#define BLOCK_REFCOUNT_MASK   0xffffu
+#define BLOCK_NEEDS_FREE      (1u << 24)
+#define BLOCK_HAS_COPY_DISPOSE (1u << 25)
+#define BLOCK_IS_GLOBAL       (1u << 28)
 
-void *_NSConcreteGlobalBlock = NULL;
-void *_NSConcreteStackBlock = NULL;
-void *_NSConcreteMallocBlock = NULL;
+#define BLOCK_FIELD_IS_OBJECT 3
+#define BLOCK_FIELD_IS_BLOCK  7
+#define BLOCK_FIELD_IS_BYREF  8
+#define BLOCK_FIELD_IS_WEAK   16
+#define BLOCK_BYREF_CALLER    128
+
+struct block_descriptor {
+	uint64_t reserved;
+	uint64_t size;
+	void (*copy)(void* destination, const void* source);
+	void (*dispose)(const void* block);
+};
+
+struct block_layout {
+	void* isa;
+	uint32_t flags;
+	uint32_t reserved;
+	void (*invoke)(void* block, ...);
+	const struct block_descriptor* descriptor;
+};
+
+struct block_byref {
+	void* isa;
+	struct block_byref* forwarding;
+	uint32_t flags;
+	uint32_t size;
+	void (*byref_keep)(struct block_byref* destination, struct block_byref* source);
+	void (*byref_destroy)(struct block_byref* source);
+};
+
+void* _NSConcreteGlobalBlock = NULL;
+void* _NSConcreteStackBlock = NULL;
+void* _NSConcreteMallocBlock = NULL;
+
+static int block_flags_latch_increment(uint32_t* flags)
+{
+	uint32_t previous = __sync_fetch_and_add(flags, 1);
+	if ((previous & BLOCK_REFCOUNT_MASK) == BLOCK_REFCOUNT_MASK) {
+		__sync_fetch_and_sub(flags, 1);
+		return 1;
+	}
+	return 0;
+}
+
+static void* block_copy_internal(const void* block)
+{
+	const struct block_layout* source = block;
+	struct block_layout* result;
+
+	if (!source)
+		return NULL;
+	if (source->flags & BLOCK_NEEDS_FREE) {
+		block_flags_latch_increment(&((struct block_layout*)source)->flags);
+		return (void*)source;
+	}
+	if (source->flags & BLOCK_IS_GLOBAL)
+		return (void*)source;
+
+	if (!source->descriptor || !source->invoke)
+		return NULL;
+
+	result = malloc(source->descriptor->size);
+	if (!result)
+		return NULL;
+	memmove(result, source, source->descriptor->size);
+	result->flags &= ~BLOCK_REFCOUNT_MASK;
+	result->flags |= BLOCK_NEEDS_FREE | 1;
+	result->isa = &_NSConcreteMallocBlock;
+	if (result->flags & BLOCK_HAS_COPY_DISPOSE) {
+		if (source->descriptor->copy)
+			source->descriptor->copy(result, source);
+	}
+	return result;
+}
 
 void* _Block_copy(const void* block)
 {
-	return (void*)block;
+	return block_copy_internal(block);
 }
 
-void _Block_release(const void* block)
+static void block_byref_release(const void* object);
+
+void _Block_release(void* block)
 {
-	(void)block;
+	struct block_layout* source = block;
+	uint32_t new_count;
+
+	if (!source)
+		return;
+	if (source->isa == &_NSConcreteStackBlock && !(source->flags & BLOCK_NEEDS_FREE))
+		return;
+	if (!(source->flags & BLOCK_NEEDS_FREE))
+		return;
+	new_count = __sync_fetch_and_sub(&source->flags, 1) & BLOCK_REFCOUNT_MASK;
+	if (new_count > 1)
+		return;
+	if (source->flags & BLOCK_HAS_COPY_DISPOSE) {
+		if (source->descriptor->dispose)
+			source->descriptor->dispose(source);
+	}
+	free(source);
 }
 
-void _Block_object_assign(void *dst, const void *src, int flags)
+static void block_byref_assign_copy(void* destination, const void* object)
 {
-	(void)dst; (void)src; (void)flags;
-	fprintf(stderr, "libsystem_shim: WARNING: _Block_object_assign called (ObjC code path?)\n");
+	struct block_byref** destination_slot = destination;
+	struct block_byref* source = (struct block_byref*)object;
+	struct block_byref* copy;
+
+	if (!source || !source->forwarding)
+		return;
+	if (source->forwarding->flags & BLOCK_NEEDS_FREE) {
+		block_flags_latch_increment(&source->forwarding->flags);
+		*destination_slot = source->forwarding;
+		return;
+	}
+
+	copy = malloc(source->size);
+	if (!copy)
+		return;
+	memmove(copy, source->forwarding, source->size);
+	copy->flags = source->forwarding->flags | BLOCK_NEEDS_FREE | 2;
+	copy->forwarding = copy;
+	source->forwarding = copy;
+	if (source->flags & BLOCK_HAS_COPY_DISPOSE) {
+		copy->byref_keep = source->byref_keep;
+		copy->byref_destroy = source->byref_destroy;
+		if (source->byref_keep)
+			source->byref_keep(copy, source);
+	}
+	*destination_slot = copy;
 }
 
-void _Block_object_dispose(const void *obj, int flags)
+static void block_byref_release(const void* object)
 {
-	(void)obj; (void)flags;
-	fprintf(stderr, "libsystem_shim: WARNING: _Block_object_dispose called (ObjC code path?)\n");
+	struct block_byref* shared = (struct block_byref*)object;
+
+	if (!shared || !shared->forwarding)
+		return;
+	shared = shared->forwarding;
+	if (!(shared->flags & BLOCK_NEEDS_FREE))
+		return;
+	if ((__sync_fetch_and_sub(&shared->flags, 1) & BLOCK_REFCOUNT_MASK) == 1) {
+		if ((shared->flags & BLOCK_HAS_COPY_DISPOSE) && shared->byref_destroy)
+			shared->byref_destroy(shared);
+		free(shared);
+	}
 }
+
+void _Block_object_assign(void* destination, const void* object, int flags)
+{
+	if (!destination || !object)
+		return;
+
+	if (flags & BLOCK_FIELD_IS_BYREF) {
+		if (!(flags & BLOCK_BYREF_CALLER))
+			block_byref_assign_copy(destination, object);
+		else
+			*(void**)destination = ((struct block_byref*)object)->forwarding;
+		return;
+	}
+	if ((flags & BLOCK_FIELD_IS_BLOCK) && !(flags & BLOCK_BYREF_CALLER)) {
+		*(void**)destination = block_copy_internal(object);
+		return;
+	}
+	*(void**)destination = (void*)object;
+}
+
+void _Block_object_dispose(const void* object, int flags)
+{
+	if (!object)
+		return;
+
+	if (flags & BLOCK_FIELD_IS_BYREF) {
+		block_byref_release(object);
+		return;
+	}
+	if ((flags & (BLOCK_FIELD_IS_BLOCK | BLOCK_BYREF_CALLER)) == BLOCK_FIELD_IS_BLOCK) {
+		_Block_release((void*)object);
+		return;
+	}
+}
+
+void* objc_retainBlock(void* block)
+{
+	return block_copy_internal(block);
+}
+
 
 /* ===== Grand Central Dispatch ===== */
 
@@ -12045,7 +12209,21 @@ struct dispatch_queue {
 	int type;  /* DISPATCH_OBJ_QUEUE */
 	int refcount;
 	char label[64];
+	struct dispatch_work_item* head;
+	struct dispatch_work_item* tail;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	int worker_started;
+	int serial;
 };
+
+struct dispatch_work_item {
+	void* block;
+	struct dispatch_work_item* next;
+};
+
+static void dispatch_run_block(void* block);
+
 
 /* Global queues — the binary imports _dispatch_main_q as a DATA symbol.
  * After Mach-O underscore stripping, resolver looks for "_dispatch_main_q". */
@@ -12096,12 +12274,54 @@ long dispatch_semaphore_signal(void *dsema)
 	return 0;
 }
 
-/* ---- Queues (stubs — async/sync execute inline) ---- */
+/* ---- Queues (serial: dedicated worker per created queue) ---- */
 
 void* dispatch_get_global_queue(long priority, unsigned long flags)
 {
 	(void)priority; (void)flags;
 	return &_dispatch_global_default;
+}
+
+static void* dispatch_serial_worker(void* arg)
+{
+	struct dispatch_queue* queue = arg;
+
+	for (;;) {
+		struct dispatch_work_item* item;
+
+		pthread_mutex_lock(&queue->mutex);
+		while (!queue->head)
+			pthread_cond_wait(&queue->cond, &queue->mutex);
+		item = queue->head;
+		queue->head = item->next;
+		if (!queue->head)
+			queue->tail = NULL;
+		pthread_mutex_unlock(&queue->mutex);
+
+		dispatch_run_block(item->block);
+		free(item);
+	}
+
+	return NULL;
+}
+
+static int dispatch_start_serial_worker(struct dispatch_queue* queue)
+{
+	static int (*real_pthread_create_fn)(pthread_t*, const pthread_attr_t*,
+	                                     void* (*)(void*), void*) = NULL;
+	pthread_t worker;
+
+	if (queue->worker_started)
+		return 1;
+	if (!real_pthread_create_fn)
+		real_pthread_create_fn = dlsym(RTLD_NEXT, "pthread_create");
+	if (!real_pthread_create_fn)
+		return 0;
+	if (real_pthread_create_fn(&worker, NULL, dispatch_serial_worker, queue) != 0)
+		return 0;
+	pthread_detach(worker);
+	queue->worker_started = 1;
+	return 1;
 }
 
 void* dispatch_queue_create(const char *label, void *attr)
@@ -12111,7 +12331,10 @@ void* dispatch_queue_create(const char *label, void *attr)
 	if (!q) return NULL;
 	q->type = DISPATCH_OBJ_QUEUE;
 	q->refcount = 1;
+	q->serial = 1;
 	if (label) strncpy(q->label, label, sizeof(q->label) - 1);
+	pthread_mutex_init(&q->mutex, NULL);
+	pthread_cond_init(&q->cond, NULL);
 	return q;
 }
 
@@ -12144,10 +12367,16 @@ static void dispatch_invoke_block(void* block)
 		invoke(block);
 }
 
-struct dispatch_work_item {
-	void* block;
-	struct dispatch_work_item* next;
-};
+static void dispatch_run_block(void* block)
+{
+	struct block_layout* layout = block;
+
+	if (!block)
+		return;
+	if (layout->invoke)
+		layout->invoke(block);
+	_Block_release(block);
+}
 
 static pthread_mutex_t dispatch_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t dispatch_pool_cond = PTHREAD_COND_INITIALIZER;
@@ -12172,7 +12401,7 @@ static void* dispatch_pool_worker(void* arg)
 			dispatch_pool_tail = NULL;
 		pthread_mutex_unlock(&dispatch_pool_mutex);
 
-		dispatch_invoke_block(item->block);
+		dispatch_run_block(item->block);
 		free(item);
 	}
 
@@ -12206,25 +12435,8 @@ static void dispatch_pool_start_workers(void)
 	pthread_mutex_unlock(&dispatch_pool_mutex);
 }
 
-void dispatch_async(void *queue, void *block)
+static void dispatch_pool_post(struct dispatch_work_item* item)
 {
-	struct dispatch_work_item* item;
-
-	(void)queue;
-	dispatch_pool_start_workers();
-	if (!dispatch_pool_started) {
-		dispatch_invoke_block(block);
-		return;
-	}
-
-	item = malloc(sizeof(*item));
-	if (!item) {
-		dispatch_invoke_block(block);
-		return;
-	}
-	item->block = block;
-	item->next = NULL;
-
 	pthread_mutex_lock(&dispatch_pool_mutex);
 	if (dispatch_pool_tail)
 		dispatch_pool_tail->next = item;
@@ -12233,6 +12445,57 @@ void dispatch_async(void *queue, void *block)
 	dispatch_pool_tail = item;
 	pthread_cond_signal(&dispatch_pool_cond);
 	pthread_mutex_unlock(&dispatch_pool_mutex);
+}
+
+void dispatch_async(void *queue, void *block)
+{
+	struct dispatch_queue* serial = queue;
+	struct dispatch_work_item* item;
+	void* owned;
+
+	if (queue == &_dispatch_main_q || queue == &_dispatch_global_default)
+		serial = NULL;
+
+	owned = block_copy_internal(block);
+	if (!owned) {
+		dispatch_invoke_block(block);
+		return;
+	}
+
+	if (serial && serial->type == DISPATCH_OBJ_QUEUE && serial->serial &&
+	    dispatch_start_serial_worker(serial)) {
+		item = malloc(sizeof(*item));
+		if (!item) {
+			dispatch_run_block(owned);
+			return;
+		}
+		item->block = owned;
+		item->next = NULL;
+		pthread_mutex_lock(&serial->mutex);
+		if (serial->tail)
+			serial->tail->next = item;
+		else
+			serial->head = item;
+		serial->tail = item;
+		pthread_cond_signal(&serial->cond);
+		pthread_mutex_unlock(&serial->mutex);
+		return;
+	}
+
+	dispatch_pool_start_workers();
+	if (!dispatch_pool_started) {
+		dispatch_run_block(owned);
+		return;
+	}
+
+	item = malloc(sizeof(*item));
+	if (!item) {
+		dispatch_run_block(owned);
+		return;
+	}
+	item->block = owned;
+	item->next = NULL;
+	dispatch_pool_post(item);
 }
 
 void dispatch_sync(void *queue, void *block)
@@ -12285,7 +12548,7 @@ void dispatch_source_set_event_handler(void* source_ref, void* handler)
 {
 	struct machgate_dispatch_source* source = source_ref;
 	if (source)
-		source->event_handler = handler;
+		source->event_handler = block_copy_internal(handler);
 }
 
 void dispatch_source_set_timer(void* source_ref, uint64_t start,
@@ -12302,7 +12565,7 @@ void dispatch_source_set_cancel_handler(void* source_ref, void* handler)
 	struct machgate_dispatch_source* source = source_ref;
 	if (!source)
 		return;
-	source->cancel_handler = handler;
+	source->cancel_handler = block_copy_internal(handler);
 	if (source->cancelled)
 		dispatch_invoke_block(source->cancel_handler);
 }
@@ -12322,8 +12585,7 @@ void dispatch_source_cancel(void* source_ref)
 void dispatch_after(uint64_t when, void* queue, void* block)
 {
 	(void)when;
-	(void)queue;
-	dispatch_invoke_block(block);
+	dispatch_async(queue, block);
 }
 
 void dispatch_resume(void* object)
@@ -13479,7 +13741,7 @@ int shim_close(int fd)
 int shim_pipe(int pipefd[2]) __asm__("pipe");
 int shim_pipe(int pipefd[2])
 {
-	int result = syscall(SYS_pipe2, pipefd, O_NONBLOCK);
+	int result = syscall(SYS_pipe2, pipefd, 0);
 	shim_fd_trace_log("pipe caller=%p result=%d read_fd=%d write_fd=%d errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), result,
 	                  result == 0 ? pipefd[0] : -1,
@@ -14140,8 +14402,44 @@ typedef void *(*real_realloc_fn)(void *, size_t);
 typedef int   (*real_posix_memalign_fn)(void **, size_t, size_t);
 
 static real_malloc_fn  real_malloc  = NULL;
-static real_free_fn    real_free    = NULL;
-static real_calloc_fn  real_calloc  = NULL;
+static real_free_fn real_free = NULL;
+
+#define MACHGATE_FREE_QUARANTINE_SLOTS 32768
+#define MACHGATE_FREE_QUARANTINE_MAX_CHUNK (16u << 20)
+#define MACHGATE_FREE_QUARANTINE_MIN_BUDGET (64u << 20)
+
+struct machgate_free_quarantine_slot {
+	void* ptr;
+	size_t bytes;
+};
+
+static struct machgate_free_quarantine_slot
+    free_quarantine_ring[MACHGATE_FREE_QUARANTINE_SLOTS];
+static size_t free_quarantine_head;
+static size_t free_quarantine_tail;
+static size_t quarantine_pending_bytes;
+
+static size_t machgate_free_quarantine_budget(void)
+{
+	static long configured = -1;
+
+	if (configured < 0) {
+		const char* budget_env = getenv("MACHGATE_FREE_QUARANTINE_MB");
+		long parsed = 0;
+
+		if (budget_env)
+			parsed = strtol(budget_env, NULL, 10);
+		if (parsed > 0)
+			configured = parsed << 20;
+		else
+			configured = 0;
+	}
+	if (configured == 0)
+		return MACHGATE_FREE_QUARANTINE_MIN_BUDGET;
+	return (size_t)configured;
+}
+
+static real_calloc_fn real_calloc = NULL;
 static real_realloc_fn real_realloc = NULL;
 static real_posix_memalign_fn real_posix_memalign = NULL;
 
@@ -14724,6 +15022,49 @@ static int take_allocation_record(const void* ptr, size_t* size_out,
 	return 0;
 }
 
+static void shim_free_release_oldest_locked(void)
+{
+	while (quarantine_pending_bytes > machgate_free_quarantine_budget()) {
+		struct machgate_free_quarantine_slot* slot =
+		    &free_quarantine_ring[free_quarantine_head];
+		free_quarantine_head =
+		    (free_quarantine_head + 1) % MACHGATE_FREE_QUARANTINE_SLOTS;
+		quarantine_pending_bytes -= slot->bytes;
+		real_free(slot->ptr);
+		slot->ptr = NULL;
+		slot->bytes = 0;
+	}
+}
+
+static void shim_free_quarantine_push(void* ptr, size_t bytes)
+{
+	static pthread_mutex_t quarantine_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+	if (!ptr || !bytes)
+		return;
+	if (!real_free)
+		return;
+
+	size_t slot_size = bytes > PTRDIFF_MAX ? PTRDIFF_MAX : bytes;
+	if (pthread_mutex_lock(&quarantine_mutex) != 0) {
+		real_free(ptr);
+		return;
+	}
+	struct machgate_free_quarantine_slot* slot =
+	    &free_quarantine_ring[free_quarantine_tail];
+	if (slot->ptr) {
+		quarantine_pending_bytes -= slot->bytes;
+		real_free(slot->ptr);
+	}
+	slot->ptr = ptr;
+	slot->bytes = slot_size;
+	quarantine_pending_bytes += slot_size;
+	free_quarantine_tail =
+	    (free_quarantine_tail + 1) % MACHGATE_FREE_QUARANTINE_SLOTS;
+	shim_free_release_oldest_locked();
+	pthread_mutex_unlock(&quarantine_mutex);
+}
+
 static void shim_free_impl_at(void *ptr, void* caller)
 {
 	size_t old_size = 0;
@@ -14745,7 +15086,12 @@ static void shim_free_impl_at(void *ptr, void* caller)
 		return;
 	}
 	if (!real_free) resolve_real_funcs();
-	if (real_free) real_free(ptr);
+	if (!real_free) return;
+	if (!known || old_size > MACHGATE_FREE_QUARANTINE_MAX_CHUNK) {
+		real_free(ptr);
+		return;
+	}
+	shim_free_quarantine_push(ptr, old_size ? old_size : 1);
 }
 
 void shim_free(void *ptr) __asm__("free");

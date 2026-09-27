@@ -659,5 +659,78 @@ lib.machgate_shim_guest_operator_delete_array(array_fallback_ptr)
 assert guest_delete_calls.value == 4, 'array delete did not fall back to scalar guest deleter'
 lib.machgate_shim_set_guest_cxx_allocators(None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
+# Blocks passed to dispatch_async are stack blocks at submit time. The
+# shim must _Block_copy them at submit; otherwise a worker thread runs the
+# block after its frame is gone (SurfaceControllerLifeCycle SIGBUS).
+lib._Block_copy.restype = ctypes.c_void_p
+lib._Block_copy.argtypes = [ctypes.c_void_p]
+lib._Block_release.restype = None
+lib._Block_release.argtypes = [ctypes.c_void_p]
+lib.dispatch_queue_create.restype = ctypes.c_void_p
+lib.dispatch_queue_create.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+lib.dispatch_async.restype = None
+lib.dispatch_async.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+test_queue = lib.dispatch_queue_create(b'block lifetime test queue', None)
+assert test_queue, 'dispatch_queue_create failed for block lifetime test'
+
+block_dispatch_state = {'started': threading.Event(), 'done': threading.Event()}
+
+BLOCK_INVOKE = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+@BLOCK_INVOKE
+def block_lifetime_invoke(block):
+    block_dispatch_state['started'].set()
+    block_dispatch_state['done'].set()
+
+class BlockDescriptor(ctypes.Structure):
+    _fields_ = [
+        ('reserved', ctypes.c_ulong),
+        ('size', ctypes.c_ulong),
+        ('copy', ctypes.c_void_p),
+        ('dispose', ctypes.c_void_p),
+    ]
+
+class BlockLayout(ctypes.Structure):
+    _fields_ = [
+        ('isa', ctypes.c_void_p),
+        ('flags', ctypes.c_int),
+        ('reserved', ctypes.c_int),
+        ('invoke', ctypes.c_void_p),
+        ('descriptor', ctypes.POINTER(BlockDescriptor)),
+    ]
+
+stack_descriptor = BlockDescriptor(0, ctypes.sizeof(BlockLayout), None, None)
+stack_block = BlockLayout(
+    ctypes.cast(ctypes.byref(lib._NSConcreteStackBlock), ctypes.c_void_p),
+    0, 0, ctypes.cast(block_lifetime_invoke, ctypes.c_void_p),
+    ctypes.pointer(stack_descriptor))
+lib.dispatch_async(test_queue, ctypes.byref(stack_block))
+stack_block.invoke = 0
+stack_block.descriptor = ctypes.pointer(BlockDescriptor())
+assert block_dispatch_state['started'].wait(5.0), 'dispatch_async never ran the submitted block'
+assert block_dispatch_state['done'].wait(5.0), 'dispatch_async block did not survive caller frame teardown'
+
+# _Block_copy of a stack block must produce an independent heap copy that
+# preserves the invoke pointer.
+copy_descriptor = BlockDescriptor(0, ctypes.sizeof(BlockLayout), None, None)
+copy_source = BlockLayout(
+    ctypes.cast(ctypes.byref(lib._NSConcreteStackBlock), ctypes.c_void_p),
+    0, 0, ctypes.cast(block_lifetime_invoke, ctypes.c_void_p),
+    ctypes.pointer(copy_descriptor))
+heap_block = lib._Block_copy(ctypes.byref(copy_source))
+assert heap_block and heap_block != ctypes.addressof(copy_source), '_Block_copy returned the stack block itself'
+restored = ctypes.cast(heap_block, ctypes.POINTER(BlockLayout)).contents
+assert restored.invoke == ctypes.cast(block_lifetime_invoke, ctypes.c_void_p).value, '_Block_copy lost the invoke pointer'
+lib._Block_release(heap_block)
+
+# Global blocks are returned as-is by _Block_copy.
+global_descriptor = BlockDescriptor(0, ctypes.sizeof(BlockLayout), None, None)
+global_block = BlockLayout(
+    None, 1 << 28, 0, ctypes.cast(block_lifetime_invoke, ctypes.c_void_p),
+    ctypes.pointer(global_descriptor))
+global_copy = lib._Block_copy(ctypes.byref(global_block))
+assert global_copy == ctypes.addressof(global_block), '_Block_copy must not copy global blocks'
+
 print('All libsystem_shim symbol tests passed')
 "
