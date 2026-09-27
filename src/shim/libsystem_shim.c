@@ -7915,30 +7915,15 @@ static size_t shim_repack_linux_cmsgs_to_darwin(const void* linux_control,
 		darwin_cmsg->cmsg_type = cmsg->cmsg_type;
 
 		if (darwin_cmsg->cmsg_level == IPPROTO_IP &&
-		    darwin_cmsg->cmsg_type == LINUX_IP_PKTINFO) {
+		    darwin_cmsg->cmsg_type == LINUX_IP_PKTINFO)
 			darwin_cmsg->cmsg_type = DARWIN_IP_PKTINFO;
-		} else if (darwin_cmsg->cmsg_level == DARWIN_IPPROTO_IPV6 &&
-		           darwin_cmsg->cmsg_type == LINUX_IPV6_PKTINFO &&
-		           data_length >= sizeof(struct in6_pktinfo)) {
-			unsigned char* darwin_data =
-				((unsigned char*)darwin_cmsg) +
-				sizeof(struct darwin_cmsghdr);
-			const unsigned char* linux_data =
-				(const unsigned char*)cmsg + sizeof(struct cmsghdr);
+		else if (darwin_cmsg->cmsg_level == DARWIN_IPPROTO_IPV6 &&
+		         darwin_cmsg->cmsg_type == LINUX_IPV6_PKTINFO)
 			darwin_cmsg->cmsg_type = DARWIN_IPV6_PKTINFO;
-			memcpy(darwin_data, linux_data + sizeof(unsigned int),
-			       16);
-			memcpy(darwin_data + 16, linux_data, sizeof(unsigned int));
-		}
 
-		if (data_length &&
-		    !(darwin_cmsg->cmsg_level == DARWIN_IPPROTO_IPV6 &&
-		      darwin_cmsg->cmsg_type == DARWIN_IPV6_PKTINFO &&
-		      data_length >= sizeof(struct in6_pktinfo))) {
-			memcpy(((unsigned char*)darwin_cmsg) + sizeof(struct darwin_cmsghdr),
-			       (const unsigned char*)cmsg + sizeof(struct cmsghdr),
-			       data_length);
-		}
+		memcpy(((unsigned char*)darwin_cmsg) + sizeof(struct darwin_cmsghdr),
+		       (const unsigned char*)cmsg + sizeof(struct cmsghdr),
+		       data_length);
 
 		darwin_offset += DARWIN_CMSG_ALIGN(darwin_len);
 	}
