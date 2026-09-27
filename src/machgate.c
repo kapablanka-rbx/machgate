@@ -69,6 +69,7 @@ static void fixup_darwin_pthread_data(struct load_results* lr);
 static void fixup_darwin_libc_allocator_defaults(struct load_results* lr);
 static void configure_guest_cxx_allocator_hooks(struct load_results* lr);
 static void setup_tlv_image(struct load_results* lr);
+static void register_guest_objc_classes(struct load_results* lr);
 static int native_prot(int prot);
 static void setup_space(struct load_results* lr, bool is_64_bit);
 static size_t align_page_size(size_t size);
@@ -1249,6 +1250,7 @@ int main(int argc, char** argv, char** envp)
 			fixup_darwin_libc_allocator_defaults(&machgate_load_results);
 			configure_guest_cxx_allocator_hooks(&machgate_load_results);
 			setup_tlv_image(&machgate_load_results);
+			register_guest_objc_classes(&machgate_load_results);
 			uint64_t eh_frame_phase_ms = machgate_phase_now_ms();
 			eh_frame_register_macho((void*)machgate_load_results.mh,
 			                        machgate_load_results.slide);
@@ -1270,6 +1272,7 @@ int main(int argc, char** argv, char** envp)
 		fixup_darwin_libc_allocator_defaults(&machgate_load_results);
 		configure_guest_cxx_allocator_hooks(&machgate_load_results);
 		setup_tlv_image(&machgate_load_results);
+		register_guest_objc_classes(&machgate_load_results);
 		uint64_t eh_frame_phase_ms = machgate_phase_now_ms();
 		eh_frame_register_macho((void*)machgate_load_results.mh,
 		                        machgate_load_results.slide);
@@ -1937,17 +1940,58 @@ static void setup_tlv_image(struct load_results* lr)
 	if (shim) {
 		void** p_base = (void**)dlsym(shim, "__tlv_image_base");
 		size_t* p_size = (size_t*)dlsym(shim, "__tlv_image_size");
-		size_t* p_bss = (size_t*)dlsym(shim, "__tlv_bss_size");
-		if (p_base) *p_base = tlv_image_base;
-		if (p_size) *p_size = tlv_image_size;
-		if (p_bss) *p_bss = tlv_bss_size;
-		dlclose(shim);
-		machgate_log_startup("machgate: TLV info set in shim\n");
+	size_t* p_bss = (size_t*)dlsym(shim, "__tlv_bss_size");
+	if (p_base) *p_base = tlv_image_base;
+	if (p_size) *p_size = tlv_image_size;
+	if (p_bss) *p_bss = tlv_bss_size;
+	dlclose(shim);
+	machgate_log_startup("machgate: TLV info set in shim\n");
 	} else {
 		fprintf(stderr, "machgate: WARNING: cannot find libsystem_shim.so for TLV (%s)\n",
 		        dlerror());
 	}
 }
+
+static void register_guest_objc_classes(struct load_results* lr)
+{
+	struct mach_header_64* mh = (struct mach_header_64*)lr->mh;
+	uint8_t* cmds = (uint8_t*)(mh + 1);
+	uint32_t p = 0;
+	int registered = 0;
+
+	void (*register_class)(void*) =
+		(void (*)(void*))dlsym(RTLD_DEFAULT,
+		                       "machgate_shim_register_objc_class");
+	if (!register_class || !lr->mh)
+		return;
+
+	for (uint32_t i = 0; i < mh->ncmds && p < mh->sizeofcmds; i++) {
+		struct load_command* lc = (struct load_command*)&cmds[p];
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64* seg = (struct segment_command_64*)lc;
+			struct section_64* sect = (struct section_64*)(seg + 1);
+			for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
+				/* S_REGULAR in __DATA_CONST named __objc_classlist */
+				if (strncmp(sect->sectname, "__objc_classlist", 16) != 0)
+					continue;
+				uintptr_t list = sect->addr + lr->slide;
+				size_t count = sect->size / sizeof(uint64_t);
+				for (size_t c = 0; c < count; c++) {
+					uint64_t class_addr = *(uint64_t*)list;
+					if (class_addr)
+						register_class((void*)class_addr);
+					list += sizeof(uint64_t);
+					registered++;
+				}
+			}
+		}
+		p += lc->cmdsize;
+	}
+
+	machgate_log_startup("machgate: registered %d guest ObjC classes\n",
+	                     registered);
+}
+
 
 typedef void (*dyld_init_func_t)(int, char**, char**, char**);
 

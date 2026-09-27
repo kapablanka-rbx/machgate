@@ -562,14 +562,41 @@ int vm_protect(uint32_t target_task, uint64_t address, uint64_t size,
 	return 2;
 }
 
+#define DARWIN_HOST_VM_INFO 4
+#define DARWIN_HOST_SCHED_INFO 2
+
 int host_statistics(uint32_t host_priv, int flavor, void* host_info_out,
                     uint32_t* host_info_count)
 {
 	(void)host_priv;
-	(void)flavor;
 
-	if (host_info_out && host_info_count)
-		memset(host_info_out, 0, (size_t)*host_info_count * sizeof(int));
+	if (!host_info_out || !host_info_count)
+		return 1;
+
+	if (flavor == DARWIN_HOST_VM_INFO || flavor == DARWIN_HOST_SCHED_INFO) {
+		struct sysinfo linux_info;
+		unsigned int page_count;
+		unsigned int* counts = host_info_out;
+		uint32_t capacity = *host_info_count;
+		unsigned long page_size = (unsigned long)sysconf(_SC_PAGESIZE);
+
+		if (sysinfo(&linux_info) != 0)
+			return 5;
+		page_size = page_size ? page_size : 4096;
+		memset(host_info_out, 0,
+		       (size_t)capacity * sizeof(unsigned int));
+		if (capacity < 3)
+			return 0;
+		page_count = (unsigned int)(linux_info.freeram / page_size);
+		counts[0] = page_count > 64 ? page_count - 64 : page_count;
+		page_count = (unsigned int)((linux_info.totalram - linux_info.freeram) / page_size / 4);
+		counts[1] = page_count;
+		page_count = (unsigned int)(linux_info.freeram / page_size / 8);
+		counts[2] = page_count;
+		return 0;
+	}
+
+	memset(host_info_out, 0, (size_t)*host_info_count * sizeof(int));
 	return 0;
 }
 
@@ -7011,7 +7038,8 @@ static void tlv_print_exit_backtrace(void)
 void _Exit(int status)
 {
 	trace_process_exit_code("_Exit", status, SHIM_CALLER_RETURN_ADDRESS());
-	tlv_print_exit_backtrace();
+	if (shim_trace_enabled())
+		tlv_print_exit_backtrace();
 	syscall(SYS_exit_group, status);
 	__builtin_unreachable();
 }
@@ -16937,40 +16965,52 @@ static int guest_objc_readable(const void* address, size_t size)
 	if (!address)
 		return 0;
 
-	pthread_mutex_lock(&maps_mutex);
-	if (!maps_loaded) {
-		FILE* maps = fopen("/proc/self/maps", "r");
-		if (maps) {
-			char line[512];
-			while (fgets(line, sizeof(line), maps)) {
-				uintptr_t start;
-				uintptr_t end;
-				if (sscanf(line, "%lx-%lx", &start, &end) != 2)
-					continue;
-				if (map_range_count == map_range_capacity) {
-					size_t capacity = map_range_capacity ? map_range_capacity * 2 : 512;
-					uintptr_t* ranges = realloc(map_ranges, capacity * 2 * sizeof(uintptr_t));
-					if (!ranges)
-						break;
-					map_ranges = ranges;
-					map_range_capacity = capacity;
-				}
-				map_ranges[map_range_count * 2] = start;
-				map_ranges[map_range_count * 2 + 1] = end;
-				map_range_count++;
-			}
-			fclose(maps);
-		}
-		maps_loaded = 1;
-	}
-	pthread_mutex_unlock(&maps_mutex);
+	int attempts;
 
-	uintptr_t address_start = (uintptr_t)address;
-	uintptr_t address_end = address_start + size;
-	for (size_t index = 0; index < map_range_count; index++) {
-		if (address_start >= map_ranges[index * 2] &&
-		    address_end <= map_ranges[index * 2 + 1])
-			return 1;
+	if (!address)
+		return 0;
+
+	for (attempts = 0; attempts < 2; attempts++) {
+		pthread_mutex_lock(&maps_mutex);
+		if (!maps_loaded) {
+			FILE* maps = fopen("/proc/self/maps", "r");
+			if (maps) {
+				char line[512];
+				while (fgets(line, sizeof(line), maps)) {
+					uintptr_t start;
+					uintptr_t end;
+					if (sscanf(line, "%lx-%lx", &start, &end) != 2)
+						continue;
+					if (map_range_count == map_range_capacity) {
+						size_t capacity = map_range_capacity ? map_range_capacity * 2 : 512;
+						uintptr_t* ranges = realloc(map_ranges, capacity * 2 * sizeof(uintptr_t));
+						if (!ranges)
+							break;
+						map_ranges = ranges;
+						map_range_capacity = capacity;
+					}
+					map_ranges[map_range_count * 2] = start;
+					map_ranges[map_range_count * 2 + 1] = end;
+					map_range_count++;
+				}
+				fclose(maps);
+			}
+			maps_loaded = 1;
+		}
+		pthread_mutex_unlock(&maps_mutex);
+
+		uintptr_t address_start = (uintptr_t)address;
+		uintptr_t address_end = address_start + size;
+		for (size_t index = 0; index < map_range_count; index++) {
+			if (address_start >= map_ranges[index * 2] &&
+			    address_end <= map_ranges[index * 2 + 1])
+				return 1;
+		}
+
+		pthread_mutex_lock(&maps_mutex);
+		map_range_count = 0;
+		maps_loaded = 0;
+		pthread_mutex_unlock(&maps_mutex);
 	}
 	return 0;
 }
@@ -17205,6 +17245,23 @@ void* shim_objc_msgSend_call_guest_imp(void* imp, void* receiver, void* sel,
 #endif
 }
 
+static void* guest_objc_alloc_instance(void* class_object)
+{
+	struct guest_objc_layout* layout = class_object;
+	uint64_t data_bits = layout->data_bits & ~7ULL;
+	uint32_t* class_ro = (uint32_t*)data_bits;
+	uint32_t instance_size = class_ro[2];
+	void* instance;
+
+	if (instance_size < 64)
+		instance_size = 64;
+	instance = calloc(1, instance_size);
+	if (!instance)
+		return NULL;
+	*(void**)instance = class_object;
+	return instance;
+}
+
 static int shim_objc_guest_handled(void* receiver)
 {
 	void* class_ptr;
@@ -17217,6 +17274,48 @@ static int shim_objc_guest_handled(void* receiver)
 	return guest_objc_find_class(class_ptr) != NULL;
 }
 
+static void* guest_objc_lookup_imp_chained(void* start_class,
+                                           int use_class_methods,
+                                           const char* selector)
+{
+	struct guest_objc_layout* layout = start_class;
+	void* class_ptr = start_class;
+
+	for (int depth = 0; depth < 16 && class_ptr; depth++) {
+		struct guest_objc_class_entry* entry =
+			guest_objc_find_class(class_ptr);
+		if (entry) {
+			void* imp = guest_objc_lookup_imp(entry, use_class_methods,
+			                                   selector);
+			if (imp)
+				return imp;
+		}
+		if (!guest_objc_readable((char*)class_ptr + 8, sizeof(void*)))
+			return NULL;
+		class_ptr = *(void**)((char*)class_ptr + 8);
+	}
+	(void)layout;
+	return NULL;
+}
+
+static void* shim_objc_guest_root_fallback(void* receiver, void* class_ptr,
+                                          const char* selector)
+{
+	if (strcmp(selector, "class") == 0)
+		return class_ptr ? class_ptr : receiver;
+	if (strcmp(selector, "init") == 0 ||
+	    strcmp(selector, "retain") == 0 ||
+	    strcmp(selector, "autorelease") == 0)
+		return receiver;
+	if (strcmp(selector, "hash") == 0)
+		return (void*)(uintptr_t)(uintptr_t)receiver;
+	if (strcmp(selector, "alloc") == 0 ||
+	    strcmp(selector, "allocWithZone:") == 0 ||
+	    strcmp(selector, "new") == 0)
+		return guest_objc_alloc_instance(class_ptr ? class_ptr : receiver);
+	return NULL;
+}
+
 static void* shim_objc_try_guest_dispatch(void* receiver, const char* selector,
                                           void* sret,
                                           const uintptr_t* register_args,
@@ -17224,28 +17323,33 @@ static void* shim_objc_try_guest_dispatch(void* receiver, const char* selector,
 {
 	struct guest_objc_class_entry* entry;
 	void* imp;
+	void* class_ptr;
 
 	if (!receiver || !selector)
 		return NULL;
 
 	entry = guest_objc_find_class(receiver);
 	if (entry) {
-		imp = guest_objc_lookup_imp(entry, 1, selector);
+		imp = guest_objc_lookup_imp_chained(receiver, 1, selector);
 		if (imp)
 			return shim_objc_msgSend_call_guest_imp(
 				imp, receiver, (void*)selector, sret,
 				register_args, guest_stack_args);
-		return NULL;
+		return shim_objc_guest_root_fallback(receiver, receiver, selector);
 	}
 
-	void* class_ptr = *(void**)receiver;
+	if (!guest_objc_readable(receiver, sizeof(void*)))
+		return NULL;
+	class_ptr = *(void**)receiver;
 	entry = guest_objc_find_class(class_ptr);
 	if (entry) {
-		imp = guest_objc_lookup_imp(entry, 0, selector);
+		imp = guest_objc_lookup_imp_chained(class_ptr, 0, selector);
 		if (imp)
 			return shim_objc_msgSend_call_guest_imp(
 				imp, receiver, (void*)selector, sret,
 				register_args, guest_stack_args);
+		return shim_objc_guest_root_fallback(receiver, class_ptr,
+		                                     selector);
 	}
 	return NULL;
 }
@@ -17280,6 +17384,14 @@ enum shim_objc_kind {
 	SHIM_OBJC_INSTANCE_NSERROR,
 	SHIM_OBJC_CLASS_NSUSERDEFAULTS,
 	SHIM_OBJC_INSTANCE_NSUSERDEFAULTS,
+	SHIM_OBJC_CLASS_NSNUMBER,
+	SHIM_OBJC_INSTANCE_NSNUMBER,
+	SHIM_OBJC_CLASS_NSARRAY,
+	SHIM_OBJC_CLASS_NSMUTABLEARRAY,
+	SHIM_OBJC_INSTANCE_NSMUTABLEARRAY,
+	SHIM_OBJC_CLASS_NSDICTIONARY,
+	SHIM_OBJC_CLASS_NSJSONSERIALIZATION,
+	SHIM_OBJC_CLASS_NSMUTABLESTRING,
 };
 
 struct shim_objc_header {
@@ -17671,6 +17783,345 @@ struct shim_objc_userdefaults {
 	struct shim_objc_header header;
 	struct shim_objc_dictionary* values;
 };
+
+struct shim_objc_number {
+	struct shim_objc_header header;
+	union {
+		long long integer_value;
+		double double_value;
+	} value;
+	int is_floating;
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSNumber = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSNUMBER,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSArray = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSARRAY,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSMutableArray = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSMUTABLEARRAY,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSDictionary = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSDICTIONARY,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSJSONSerialization = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSJSONSERIALIZATION,
+};
+
+static void* shim_objc_make_number(long long integer_value)
+{
+	struct shim_objc_number* result = malloc(sizeof(*result));
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_INSTANCE_NSNUMBER;
+	result->value.integer_value = integer_value;
+	result->is_floating = 0;
+	return result;
+}
+
+static void shim_objc_dictionary_set(struct shim_objc_dictionary* dictionary,
+                                     void* key, void* value)
+{
+	for (uint32_t pair_index = 0; pair_index < dictionary->pair_count;
+	     pair_index++) {
+		if (dictionary->keys[pair_index * 2] == key) {
+			dictionary->keys[pair_index * 2 + 1] = value;
+			return;
+		}
+	}
+	if (dictionary->pair_count >= dictionary->pair_capacity) {
+		uint32_t capacity = dictionary->pair_capacity * 2;
+		struct shim_objc_dictionary* grown =
+			realloc(dictionary,
+			        sizeof(*dictionary) + sizeof(void*) * 2 * capacity);
+		if (!grown)
+			return;
+		grown->pair_capacity = capacity;
+		dictionary = grown;
+	}
+	dictionary->keys[dictionary->pair_count * 2] = key;
+	dictionary->keys[dictionary->pair_count * 2 + 1] = value;
+	dictionary->pair_count++;
+}
+
+static void* shim_objc_dictionary_get(
+	const struct shim_objc_dictionary* dictionary, void* key)
+{
+	for (uint32_t pair_index = 0; pair_index < dictionary->pair_count;
+	     pair_index++) {
+		if (dictionary->keys[pair_index * 2] == key)
+			return dictionary->keys[pair_index * 2 + 1];
+	}
+	return NULL;
+}
+
+static void* shim_objc_array_append(struct shim_objc_array* array, void* value)
+{
+	struct shim_objc_array* grown;
+	uint32_t new_count;
+
+	if (!array)
+		return NULL;
+	grown = realloc(array, sizeof(*array) + sizeof(void*) * (array->count + 1));
+	if (!grown)
+		return array;
+	grown->count++;
+	grown->elements[grown->count - 1] = value;
+	return grown;
+}
+
+static void shim_json_escape_append(const char* text, char* out,
+                                    size_t out_size, size_t* position)
+{
+	for (const char* cursor = text; *cursor; cursor++) {
+		char ch = *cursor;
+		if (ch == '"' || ch == '\\') {
+			if (*position + 2 >= out_size)
+				return;
+			out[(*position)++] = '\\';
+			out[(*position)++] = ch;
+		} else if ((unsigned char)ch < 0x20) {
+			if (*position + 6 >= out_size)
+				return;
+			*position += (size_t)snprintf(out + *position,
+			                              out_size - *position, "\\u%04x", ch);
+		} else {
+			if (*position + 1 >= out_size)
+				return;
+			out[(*position)++] = ch;
+		}
+	}
+	out[*position] = '\0';
+}
+
+static char* shim_json_serialize_object(void* object, int depth);
+
+static char* shim_json_serialize_object(void* object, int depth)
+{
+	size_t capacity = 4096;
+	char* out;
+	size_t position = 0;
+
+	if (depth > 8)
+		return NULL;
+	out = malloc(capacity);
+	if (!out)
+		return NULL;
+	out[0] = '\0';
+
+	if (shim_objc_is_object(object, SHIM_OBJC_STRING)) {
+		const char* text = ((struct shim_objc_string*)object)->utf8;
+		out[position++] = '"';
+		shim_json_escape_append(text, out, capacity, &position);
+		out[position++] = '"';
+		out[position] = '\0';
+		return out;
+	}
+	if (shim_objc_is_object(object, SHIM_OBJC_INSTANCE_NSNUMBER)) {
+		const struct shim_objc_number* number = object;
+		if (number->is_floating)
+			snprintf(out, capacity, "%g", number->value.double_value);
+		else
+			snprintf(out, capacity, "%lld", number->value.integer_value);
+		return out;
+	}
+	if (shim_objc_is_object(object, SHIM_OBJC_ARRAY)) {
+		const struct shim_objc_array* array = object;
+		out[position++] = '[';
+		for (uint32_t index = 0; index < array->count; index++) {
+			char* element = shim_json_serialize_object(
+				array->elements[index], depth + 1);
+			if (!element) {
+				free(out);
+				return NULL;
+			}
+			if (index > 0)
+				out[position++] = ',';
+			size_t length = strlen(element);
+			if (position + length + 2 >= capacity) {
+				free(element);
+				free(out);
+				return NULL;
+			}
+			memcpy(out + position, element, length);
+			position += length;
+			free(element);
+		}
+		out[position++] = ']';
+		out[position] = '\0';
+		return out;
+	}
+	if (shim_objc_is_object(object, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
+		const struct shim_objc_dictionary* dictionary = object;
+		out[position++] = '{';
+		for (uint32_t pair_index = 0;
+		     pair_index < dictionary->pair_count; pair_index++) {
+			if (pair_index > 0)
+				out[position++] = ',';
+			char* key_text = shim_json_serialize_object(
+				dictionary->keys[pair_index * 2], depth + 1);
+			char* value_text = shim_json_serialize_object(
+				dictionary->keys[pair_index * 2 + 1], depth + 1);
+			if (!key_text || !value_text) {
+				free(key_text);
+				free(value_text);
+				free(out);
+				return NULL;
+			}
+			size_t length = strlen(key_text) + strlen(value_text);
+			if (position + length + 3 >= capacity) {
+				free(key_text);
+				free(value_text);
+				free(out);
+				return NULL;
+			}
+			memcpy(out + position, key_text, strlen(key_text));
+			position += strlen(key_text);
+			out[position++] = ':';
+			memcpy(out + position, value_text, strlen(value_text));
+			position += strlen(value_text);
+			free(key_text);
+			free(value_text);
+		}
+		out[position++] = '}';
+		out[position] = '\0';
+		return out;
+	}
+	if (!object) {
+		snprintf(out, capacity, "null");
+		return out;
+	}
+	free(out);
+	return NULL;
+}
+
+static int shim_json_match(const char** cursor, char expected)
+{
+	while (**cursor == ' ' || **cursor == '\t' || **cursor == '\n' ||
+	       **cursor == '\r')
+		(*cursor)++;
+	if (**cursor != expected)
+		return 0;
+	(*cursor)++;
+	return 1;
+}
+
+static char* shim_json_read_string(const char** cursor)
+{
+	const char* start;
+	size_t length;
+	char* out;
+	size_t position = 0;
+
+	while (**cursor == ' ' || **cursor == '\t')
+		(*cursor)++;
+	if (**cursor != '"')
+		return NULL;
+	(*cursor)++;
+	start = *cursor;
+	while (**cursor && **cursor != '"') {
+		if (**cursor == '\\' && *(*cursor + 1))
+			(*cursor)++;
+		(*cursor)++;
+	}
+	length = (size_t)(*cursor - start);
+	out = malloc(length + 1);
+	if (!out)
+		return NULL;
+	for (size_t index = 0; index < length; index++) {
+		char ch = start[index];
+		if (ch == '\\' && index + 1 < length)
+			ch = start[++index];
+		out[position++] = ch;
+	}
+	out[position] = '\0';
+	if (**cursor == '"')
+		(*cursor)++;
+	return out;
+}
+
+static void* shim_json_parse_value(const char** cursor, int depth);
+
+static void* shim_json_parse_value(const char** cursor, int depth)
+{
+	while (**cursor == ' ' || **cursor == '\t' || **cursor == '\n' ||
+	       **cursor == '\r')
+		(*cursor)++;
+
+	if (depth > 8)
+		return NULL;
+	if (**cursor == '"') {
+		char* text = shim_json_read_string(cursor);
+		if (!text)
+			return NULL;
+		void* result = shim_objc_make_string(text);
+		free(text);
+		return result;
+	}
+	if (strncmp(*cursor, "true", 4) == 0) {
+		*cursor += 4;
+		return shim_objc_make_number(1);
+	}
+	if (strncmp(*cursor, "false", 5) == 0) {
+		*cursor += 5;
+		return shim_objc_make_number(0);
+	}
+	if (strncmp(*cursor, "null", 4) == 0) {
+		*cursor += 4;
+		return NULL;
+	}
+	if (**cursor == '[') {
+		(*cursor)++;
+		struct shim_objc_array* array =
+			shim_objc_make_array(NULL, 0);
+		if (!array)
+			return NULL;
+		while (**cursor && **cursor != ']') {
+			void* value = shim_json_parse_value(cursor, depth + 1);
+			if (value)
+				array = shim_objc_array_append(array, value);
+			while (**cursor == ' ' || **cursor == ',')
+				(*cursor)++;
+		}
+		if (**cursor == ']')
+			(*cursor)++;
+		return array;
+	}
+	if (**cursor == '{') {
+		(*cursor)++;
+		struct shim_objc_dictionary* dictionary =
+			shim_objc_make_dictionary(NULL, NULL, 0);
+		if (!dictionary)
+			return NULL;
+		while (**cursor && **cursor != '}') {
+			char* key_text = shim_json_read_string(cursor);
+			if (!key_text)
+				break;
+			shim_json_match(cursor, ':');
+			void* value = shim_json_parse_value(cursor, depth + 1);
+			void* key = shim_objc_make_string(key_text);
+			free(key_text);
+			if (key)
+				shim_objc_dictionary_set(dictionary, key, value);
+			while (**cursor == ' ' || **cursor == ',')
+				(*cursor)++;
+		}
+		if (**cursor == '}')
+			(*cursor)++;
+		return dictionary;
+	}
+	if (**cursor == '-' || (**cursor >= '0' && **cursor <= '9')) {
+		long long value = strtoll(*cursor, (char**)cursor, 10);
+		return shim_objc_make_number(value);
+	}
+	return NULL;
+}
 
 struct shim_objc_header OBJC_CLASS_$_NSUserDefaults = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSUSERDEFAULTS,
@@ -18077,13 +18528,21 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 	register_args[4] = a6;
 	register_args[5] = a7;
 
-	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND"))
-		fprintf(stderr, "libsystem_shim: objc_msgSend [%s] recv=%p\n",
-		        selector, receiver);
+	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND")) {
+		void* trace_isa = guest_objc_readable(receiver, sizeof(void*))
+			? *(void**)receiver : NULL;
+		fprintf(stderr,
+		        "libsystem_shim: objc_msgSend [%s] recv=%p isa=%p\n",
+		        selector, receiver, trace_isa);
+	}
 
 	guest_result = shim_objc_try_guest_dispatch(receiver, selector, sret,
 	                                            register_args,
 	                                            guest_stack_args);
+	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND") && shim_objc_guest_handled(receiver))
+		fprintf(stderr,
+		        "libsystem_shim:   guest dispatch [%s] recv=%p -> %p\n",
+		        selector, receiver, guest_result);
 	if (guest_result || shim_objc_guest_handled(receiver))
 		return guest_result;
 
@@ -18977,6 +19436,170 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			const char* text = ((struct shim_objc_string*)receiver)->utf8;
 			return (void*)(uintptr_t)(other && strcmp(text, other) == 0);
 		}
+	} else if (strcmp(selector, "numberWithBool:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSNUMBER))
+			return shim_objc_make_number(a2 ? 1 : 0);
+	} else if (strcmp(selector, "numberWithInteger:") == 0 ||
+	           strcmp(selector, "numberWithInt:") == 0 ||
+	           strcmp(selector, "numberWithLong:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSNUMBER))
+			return shim_objc_make_number((long long)(intptr_t)a2);
+	} else if (strcmp(selector, "numberWithDouble:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSNUMBER)) {
+			struct shim_objc_number* result = malloc(sizeof(*result));
+			if (!result)
+				return NULL;
+			result->header.magic = SHIM_OBJC_MAGIC;
+			result->header.kind = SHIM_OBJC_INSTANCE_NSNUMBER;
+			memcpy(&result->value, &a2, sizeof(double));
+			result->is_floating = 1;
+			return result;
+		}
+	} else if (strcmp(selector, "boolValue") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSNUMBER))
+			return (void*)(uintptr_t)(
+				((struct shim_objc_number*)receiver)->value.integer_value != 0);
+	} else if (strcmp(selector, "integerValue") == 0 ||
+	           strcmp(selector, "intValue") == 0 ||
+	           strcmp(selector, "longLongValue") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSNUMBER))
+			return (void*)(intptr_t)(
+				((struct shim_objc_number*)receiver)->value.integer_value);
+	} else if (strcmp(selector, "arrayWithObjects:count:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSARRAY)) {
+			void** elements = (void**)a2;
+			uintptr_t count = a3;
+			struct shim_objc_array* result =
+				shim_objc_make_array(NULL, 0);
+			if (!result)
+				return NULL;
+			for (uintptr_t index = 0; index < count; index++)
+				result = shim_objc_array_append(result, elements[index]);
+			return result;
+		}
+	} else if (strcmp(selector, "array") == 0 ||
+	           strcmp(selector, "arrayWithCapacity:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSARRAY)) {
+			struct shim_objc_array* result =
+				shim_objc_make_array(NULL, 0);
+			if (result)
+				result->header.kind = SHIM_OBJC_ARRAY;
+			return result;
+		}
+	} else if (strcmp(selector, "dictionaryWithObjects:forKeys:count:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY) ||
+		    shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSDICTIONARY)) {
+			void** objects = (void**)a2;
+			void** keys = (void**)a3;
+			uintptr_t count = a4;
+			struct shim_objc_dictionary* result =
+				shim_objc_make_dictionary(NULL, NULL, 0);
+			if (!result)
+				return NULL;
+			for (uintptr_t index = 0; index < count; index++)
+				shim_objc_dictionary_set(result, keys[index],
+				                         objects[index]);
+			return result;
+		}
+	} else if (strcmp(selector, "dictionary") == 0 ||
+	           strcmp(selector, "dictionaryWithCapacity:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY) ||
+		    shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSDICTIONARY))
+			return shim_objc_make_dictionary(NULL, NULL, 0);
+	} else if (strcmp(selector, "addObject:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			struct shim_objc_array* grown =
+				shim_objc_array_append(receiver, (void*)a2);
+			if (grown != receiver) {
+				memcpy(receiver, grown, sizeof(struct shim_objc_header));
+				((struct shim_objc_array*)receiver)->count = grown->count;
+				((struct shim_objc_array*)receiver)->elements[0] =
+					grown->elements[grown->count - 1];
+			}
+			return NULL;
+		}
+	} else if (strcmp(selector, "setObject:forKeyedSubscript:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
+			shim_objc_dictionary_set(receiver, (void*)a3, (void*)a2);
+			return NULL;
+		}
+	} else if (strcmp(selector, "objectForKey:") == 0 ||
+	           strcmp(selector, "objectForKeyedSubscript:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY))
+			return shim_objc_dictionary_get(receiver, (void*)a2);
+	} else if (strcmp(selector, "objectAtIndexedSubscript:") == 0 ||
+	           strcmp(selector, "objectAtIndex:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			const struct shim_objc_array* array = receiver;
+			if (a2 < array->count)
+				return array->elements[a2];
+		}
+	} else if (strcmp(selector, "count") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY))
+			return (void*)(uintptr_t)(
+				((struct shim_objc_dictionary*)receiver)->pair_count);
+	} else if (strcmp(selector, "dataWithJSONObject:options:error:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSJSONSERIALIZATION)) {
+			if (a5)
+				*(void**)a5 = NULL;
+			char* json = shim_json_serialize_object((void*)a2, 0);
+			if (!json)
+				return NULL;
+			struct shim_objc_data* data =
+				malloc(sizeof(*data) + strlen(json) + 1);
+			if (!data) {
+				free(json);
+				return NULL;
+			}
+			data->header.magic = SHIM_OBJC_MAGIC;
+			data->header.kind = SHIM_OBJC_INSTANCE_NSDATA;
+			data->length = strlen(json);
+			memcpy(data->bytes, json, data->length + 1);
+			free(json);
+			return data;
+		}
+	} else if (strcmp(selector, "JSONObjectWithData:options:error:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSJSONSERIALIZATION)) {
+			if (a5)
+				*(void**)a5 = NULL;
+			if (!shim_objc_is_object((void*)a2, SHIM_OBJC_INSTANCE_NSDATA))
+				return NULL;
+			const struct shim_objc_data* data = (const void*)a2;
+			const char* json = (const char*)data->bytes;
+			void* result = shim_json_parse_value(&json, 0);
+			if (!result)
+				return shim_objc_make_dictionary(NULL, NULL, 0);
+			return result;
+		}
+	} else if (strcmp(selector, "initWithData:encoding:") == 0) {
+		if (shim_objc_is_object((void*)a2, SHIM_OBJC_INSTANCE_NSDATA)) {
+			const struct shim_objc_data* data = (const void*)a2;
+			struct shim_objc_string* result =
+				malloc(sizeof(*result) + data->length + 1);
+			if (!result)
+				return NULL;
+			result->header.magic = SHIM_OBJC_MAGIC;
+			result->header.kind = SHIM_OBJC_STRING;
+			memcpy(result->utf8, data->bytes, data->length);
+			result->utf8[data->length] = '\0';
+			return result;
+		}
+	} else if (strcmp(selector, "copy") == 0 ||
+	           strcmp(selector, "mutableCopy") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			const struct shim_objc_array* array = receiver;
+			return shim_objc_make_array((struct shim_objc_string**)array->elements,
+			                            array->count);
+		}
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
+			return shim_objc_make_string(
+				((struct shim_objc_string*)receiver)->utf8);
+	} else if (strcmp(selector, "characterAtIndex:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
+			const char* text = ((struct shim_objc_string*)receiver)->utf8;
+			if (a2 < strlen(text))
+				return (void*)(uintptr_t)(unsigned char)text[a2];
+		}
 	}
 
 	if (shim_trace_enabled())
@@ -19098,6 +19721,16 @@ void* objc_getClass(const char* name)
 	if (strcmp(name, "NSData") == 0 ||
 	    strcmp(name, "NSMutableData") == 0)
 		return &OBJC_CLASS_$_NSData;
+	if (strcmp(name, "NSNumber") == 0)
+		return &OBJC_CLASS_$_NSNumber;
+	if (strcmp(name, "NSArray") == 0 ||
+	    strcmp(name, "NSMutableArray") == 0)
+		return &OBJC_CLASS_$_NSArray;
+	if (strcmp(name, "NSDictionary") == 0 ||
+	    strcmp(name, "NSMutableDictionary") == 0)
+		return &OBJC_CLASS_$_NSMutableDictionary;
+	if (strcmp(name, "NSJSONSerialization") == 0)
+		return &OBJC_CLASS_$_NSJSONSerialization;
 	if (shim_trace_enabled())
 		fprintf(stderr, "libsystem_shim: objc_getClass unknown '%s'\n", name);
 	return NULL;
@@ -19106,23 +19739,6 @@ void* objc_getClass(const char* name)
 void* objc_lookUpClass(const char* name)
 {
 	return objc_getClass(name);
-}
-
-static void* guest_objc_alloc_instance(void* class_object)
-{
-	struct guest_objc_layout* layout = class_object;
-	uint64_t data_bits = layout->data_bits & ~7ULL;
-	uint32_t* class_ro = (uint32_t*)data_bits;
-	uint32_t instance_size = class_ro[2];
-	void* instance;
-
-	if (instance_size < 64)
-		instance_size = 64;
-	instance = calloc(1, instance_size);
-	if (!instance)
-		return NULL;
-	*(void**)instance = class_object;
-	return instance;
 }
 
 void* objc_alloc(void* class_object)
@@ -19144,8 +19760,15 @@ void* objc_alloc(void* class_object)
 		}
 		return defaults;
 	}
-	if (guest_objc_find_class(class_object))
-		return guest_objc_alloc_instance(class_object);
+	if (guest_objc_find_class(class_object)) {
+		void* instance = guest_objc_alloc_instance(class_object);
+		if (getenv("MACHGATE_TRACE_OBJC_MSGSEND"))
+			fprintf(stderr,
+			        "libsystem_shim: objc_alloc guest class=%p -> %p isa=%p\n",
+			        class_object, instance,
+			        instance ? *(void**)instance : NULL);
+		return instance;
+	}
 	return shim_objc_make_string("");
 }
 
@@ -19221,12 +19844,19 @@ void* objc_msgSendSuper2(struct guest_objc_super* super_data, void* sel, ...)
 	struct guest_objc_class_entry* entry;
 	const char* selector;
 	void* imp;
+	void* superclass;
 
 	if (!super_data || !sel)
 		return NULL;
 
 	selector = sel;
-	void* superclass = *(void**)((char*)super_data->class_ptr + 8);
+	superclass = *(void**)((char*)super_data->class_ptr + 8);
+	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND"))
+		fprintf(stderr,
+		        "libsystem_shim: msgSendSuper2 [%s] recv=%p class=%p super=%p\n",
+		        selector, super_data->receiver, super_data->class_ptr,
+		        superclass);
+
 	entry = guest_objc_find_class(superclass);
 	if (entry) {
 		imp = guest_objc_lookup_imp(entry, 0, selector);

@@ -651,7 +651,8 @@ static int trace_binding_symbol(const char* lookup_name)
 	       strcmp(lookup_name, "sigaltstack") == 0 ||
 	       strcmp(lookup_name, "pthread_create") == 0 ||
 	       strcmp(lookup_name, "pthread_detach") == 0 ||
-	       strcmp(lookup_name, "pthread_setname_np") == 0;
+	       strcmp(lookup_name, "pthread_setname_np") == 0 ||
+	       strcmp(lookup_name, "dlsym") == 0;
 }
 
 static void trace_target_binding(const char* context,
@@ -768,7 +769,8 @@ static int is_darwin_runtime_symbol(const char* lookup_name)
 	       strcmp(lookup_name, "sigaction") == 0 ||
 	       strcmp(lookup_name, "sigaltstack") == 0 ||
 	       strcmp(lookup_name, "popen") == 0 ||
-	       strcmp(lookup_name, "pclose") == 0;
+	       strcmp(lookup_name, "pclose") == 0 ||
+	       strcmp(lookup_name, "dlsym") == 0;
 }
 
 static int is_darwin_allocator_symbol(const char* lookup_name)
@@ -2315,14 +2317,13 @@ static int process_chained_fixups(struct resolver_state* rs)
 
 	struct dyld_chained_fixups_header* header = (struct dyld_chained_fixups_header*)chain_data;
 
-	fprintf(stderr, "resolver: fixups version=%u, imports_count=%u, imports_format=%u\n",
-			header->fixups_version, header->imports_count, header->imports_format);
+
 
 	/* Get the starts-in-image structure */
 	struct dyld_chained_starts_in_image* starts =
 		(struct dyld_chained_starts_in_image*)(chain_data + header->starts_offset);
 
-	fprintf(stderr, "resolver: %u segments with fixup chains\n", starts->seg_count);
+
 
 	/* Walk each segment's chains */
 	for (uint32_t seg = 0; seg < starts->seg_count; seg++) {
@@ -2333,10 +2334,6 @@ static int process_chained_fixups(struct resolver_state* rs)
 			(struct dyld_chained_starts_in_segment*)(
 				(char*)starts + starts->seg_info_offset[seg]);
 
-		fprintf(stderr, "resolver: segment %u: page_size=0x%x, pointer_format=%u, "
-				"segment_offset=0x%lx, page_count=%u\n",
-				seg, seg_starts->page_size, seg_starts->pointer_format,
-				(unsigned long)seg_starts->segment_offset, seg_starts->page_count);
 
 		if (seg_starts->pointer_format != DYLD_CHAINED_PTR_64 &&
 		    seg_starts->pointer_format != DYLD_CHAINED_PTR_64_OFFSET) {
@@ -2585,9 +2582,6 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 		}
 	}
 
-	if (strstr(sym_name, "registr") && strstr(sym_name, "s_instance") && !strstr(sym_name, "ZGV"))
-		fprintf(stderr, "resolver: TRACE s_instance: ordinal=%u lib_ordinal=%d weak=%d name='%s'\n",
-				ordinal, lib_ordinal, weak, sym_name);
 
 	/* Hook LuaJIT functions for profiler injection.
 	 * The game (via sol2) opens individual Lua libraries instead of calling
@@ -2707,8 +2701,6 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 				uintptr_t slot = (uintptr_t)(weak_pool + weak_pool_used);
 				weak_pool_used += slot_size;
 				rs->binds_stubbed++;
-				if (strstr(sym_name, "s_instance"))
-					fprintf(stderr, "resolver: WEAK POOL gave %s -> %p\n", sym_name, (void*)slot);
 				trace_target_binding("chained-weak-lookup", sym_name, lookup_name,
 				                     lib_ordinal, NULL, slot_addr, slot,
 				                     "stub/fail", "weak stub pool");
@@ -2734,8 +2726,6 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 	uintptr_t non_gui_data = resolve_non_gui_framework_data(de, sym_name);
 	if (non_gui_data) {
 		uintptr_t result = non_gui_data + addend;
-		fprintf(stderr, "resolver: non-GUI data stub: %s from %s\n",
-		        sym_name, de->name);
 		trace_target_binding("chained-non-gui-data", sym_name, lookup_name,
 		                     lib_ordinal, de, slot_addr, result,
 		                     "stub/fail", "non-GUI data stub");
@@ -3128,8 +3118,6 @@ static uintptr_t resolve_bind_by_name(struct resolver_state* rs,
 	uintptr_t non_gui_data = resolve_non_gui_framework_data(de, sym_name);
 	if (non_gui_data) {
 		uintptr_t result = non_gui_data + addend;
-		fprintf(stderr, "resolver: non-GUI data stub: %s from %s\n",
-		        sym_name, de->name);
 		trace_target_binding("dyld-info-non-gui-data", sym_name, lookup_name,
 		                     lib_ordinal, de, slot_addr, result,
 		                     "stub/fail", "non-GUI data stub");

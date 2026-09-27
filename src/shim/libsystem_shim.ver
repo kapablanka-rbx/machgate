@@ -10,6 +10,13 @@ GLIBC_2.17 {
         pthread_mutexattr_setpolicy_np;
         objc_msgSend;
         shim_objc_msgSend_impl;
+        machgate_shim_register_objc_class;
+        objc_msgSendSuper2;
+        objc_getProperty;
+        objc_setProperty_atomic;
+        objc_setProperty_nonatomic;
+        objc_setProperty_nonatomic_copy;
+        objc_retainBlock;
         objc_alloc;
         objc_allocWithZone;
         objc_getClass;
