@@ -15650,11 +15650,17 @@ static void shim_free_impl_at(void *ptr, void* caller)
 	}
 	if (!real_free) resolve_real_funcs();
 	if (!real_free) return;
-	if (!known || old_size > MACHGATE_FREE_QUARANTINE_MAX_CHUNK) {
+	size_t quarantine_size = known ? old_size : 0;
+	if (!quarantine_size) {
+		quarantine_size = malloc_usable_size(ptr);
+		if (ptr != bootstrap_buf)
+			known = quarantine_size > 0;
+	}
+	if (!known || quarantine_size > MACHGATE_FREE_QUARANTINE_MAX_CHUNK) {
 		real_free(ptr);
 		return;
 	}
-	shim_free_quarantine_push(ptr, old_size ? old_size : 1);
+	shim_free_quarantine_push(ptr, quarantine_size ? quarantine_size : 1);
 }
 
 void shim_free(void *ptr) __asm__("free");
@@ -16871,6 +16877,379 @@ size_t malloc_size(const void* ptr)
 	return result;
 }
 
+/* ===== Guest Objective-C class dispatch =====
+ *
+ * Guest images define their own ObjC classes (RBMessageBus,
+ * RBContactsProtocol, mock implementations). objc_msgSend receives their
+ * class objects or instances but the shim object model cannot answer; the
+ * real runtime would walk the class metadata. machgate core registers each
+ * __objc_classlist entry (and its metaclass) here, and msgSend falls back
+ * to a method-list lookup that tail-calls the guest IMP with the original
+ * argument registers restored.
+ */
+
+#define GUEST_OBJC_MAX_CLASSES 4096
+#define GUEST_OBJC_MAX_STACK_ARGS 16
+
+struct guest_objc_method {
+	const char* selector;
+	void* imp;
+};
+
+struct guest_objc_class_entry {
+	void* class_ptr;
+	void* metaclass_ptr;
+	struct guest_objc_method* instance_methods;
+	int instance_method_count;
+	struct guest_objc_method* class_methods;
+	int class_method_count;
+	void** cached_superclass;
+};
+
+static struct guest_objc_class_entry guest_objc_classes[GUEST_OBJC_MAX_CLASSES];
+static int guest_objc_class_count;
+static pthread_mutex_t guest_objc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct guest_objc_layout {
+	void* isa;
+	void* superclass;
+	void* cache[2];
+	uint64_t data_bits;
+};
+
+static struct guest_objc_class_entry* guest_objc_find_class(void* class_ptr)
+{
+	for (int index = 0; index < guest_objc_class_count; index++) {
+		if (guest_objc_classes[index].class_ptr == class_ptr)
+			return &guest_objc_classes[index];
+	}
+	return NULL;
+}
+
+static int guest_objc_readable(const void* address, size_t size)
+{
+	static pthread_mutex_t maps_mutex = PTHREAD_MUTEX_INITIALIZER;
+	static uintptr_t* map_ranges;
+	static size_t map_range_count;
+	static size_t map_range_capacity;
+	static int maps_loaded;
+
+	if (!address)
+		return 0;
+
+	pthread_mutex_lock(&maps_mutex);
+	if (!maps_loaded) {
+		FILE* maps = fopen("/proc/self/maps", "r");
+		if (maps) {
+			char line[512];
+			while (fgets(line, sizeof(line), maps)) {
+				uintptr_t start;
+				uintptr_t end;
+				if (sscanf(line, "%lx-%lx", &start, &end) != 2)
+					continue;
+				if (map_range_count == map_range_capacity) {
+					size_t capacity = map_range_capacity ? map_range_capacity * 2 : 512;
+					uintptr_t* ranges = realloc(map_ranges, capacity * 2 * sizeof(uintptr_t));
+					if (!ranges)
+						break;
+					map_ranges = ranges;
+					map_range_capacity = capacity;
+				}
+				map_ranges[map_range_count * 2] = start;
+				map_ranges[map_range_count * 2 + 1] = end;
+				map_range_count++;
+			}
+			fclose(maps);
+		}
+		maps_loaded = 1;
+	}
+	pthread_mutex_unlock(&maps_mutex);
+
+	uintptr_t address_start = (uintptr_t)address;
+	uintptr_t address_end = address_start + size;
+	for (size_t index = 0; index < map_range_count; index++) {
+		if (address_start >= map_ranges[index * 2] &&
+		    address_end <= map_ranges[index * 2 + 1])
+			return 1;
+	}
+	return 0;
+}
+
+static struct guest_objc_method* guest_objc_parse_methods(void* class_ptr,
+                                                          int* method_count)
+{
+#define SHIM_OBJC_MAGIC_FORWARD 0x4F424A43
+	struct shim_objc_header_forward {
+		uint32_t magic;
+	};
+	struct shim_objc_header_forward* shim_header = class_ptr;
+	struct guest_objc_layout* layout = class_ptr;
+
+	if (shim_header && shim_header->magic == SHIM_OBJC_MAGIC_FORWARD)
+		return NULL;
+	uint64_t data_bits;
+	uint32_t* class_ro;
+	uint64_t* base_methods_slot;
+	uint32_t* method_list;
+	struct guest_objc_method* methods;
+	int count;
+	int entsize;
+	int relative;
+
+	*method_count = 0;
+	if (!guest_objc_readable(class_ptr, sizeof(*layout)))
+		return NULL;
+
+	data_bits = layout->data_bits & ~7ULL;
+	if (data_bits < 0x1000 || !guest_objc_readable((void*)data_bits, 48))
+		return NULL;
+
+	class_ro = (uint32_t*)data_bits;
+	base_methods_slot = (uint64_t*)((char*)class_ro + 32);
+	if (!*base_methods_slot || !guest_objc_readable((void*)*base_methods_slot, 8))
+		return NULL;
+
+	method_list = (uint32_t*)*base_methods_slot;
+	entsize = method_list[0] & 0xffffu;
+	relative = (method_list[0] & 0x80000000u) != 0;
+	count = (int)method_list[1];
+	if (count <= 0 || count > 4096 || entsize < 12)
+		return NULL;
+	if (!guest_objc_readable(method_list, 8 + count * entsize))
+		return NULL;
+
+	methods = calloc(count, sizeof(*methods));
+	if (!methods)
+		return NULL;
+
+	for (int index = 0; index < count; index++) {
+		char* entry = (char*)method_list + 8 + index * entsize;
+		const char* selector;
+		void* imp;
+
+		if (relative) {
+			int32_t selector_offset = *(int32_t*)entry;
+			int32_t imp_offset = *(int32_t*)(entry + 8);
+			void** selector_ref = (void**)(entry + selector_offset);
+			if (!guest_objc_readable(selector_ref, sizeof(void*))) {
+				methods[index].selector = NULL;
+				methods[index].imp = NULL;
+				continue;
+			}
+			selector = (const char*)*selector_ref;
+			if (selector && !guest_objc_readable(selector, 1))
+				selector = NULL;
+			imp = entry + 8 + imp_offset;
+		} else {
+			selector = *(const char**)entry;
+			imp = *(void**)(entry + 16);
+			if (selector && !guest_objc_readable(selector, 1)) {
+				methods[index].selector = NULL;
+				methods[index].imp = NULL;
+				continue;
+			}
+		}
+		methods[index].selector = selector;
+		methods[index].imp = imp;
+	}
+
+	*method_count = count;
+	return methods;
+}
+
+static void guest_objc_register_one(void* class_ptr)
+{
+	struct guest_objc_layout* layout = class_ptr;
+	struct guest_objc_class_entry* entry;
+
+	if (!class_ptr || guest_objc_class_count >= GUEST_OBJC_MAX_CLASSES)
+		return;
+	if (!guest_objc_readable(class_ptr, sizeof(*layout)))
+		return;
+
+	pthread_mutex_lock(&guest_objc_mutex);
+	if (guest_objc_find_class(class_ptr)) {
+		pthread_mutex_unlock(&guest_objc_mutex);
+		return;
+	}
+
+	entry = &guest_objc_classes[guest_objc_class_count++];
+	entry->class_ptr = class_ptr;
+	entry->metaclass_ptr = layout->isa;
+	entry->instance_methods = guest_objc_parse_methods(
+		class_ptr, &entry->instance_method_count);
+	entry->class_methods = guest_objc_parse_methods(
+		layout->isa, &entry->class_method_count);
+	pthread_mutex_unlock(&guest_objc_mutex);
+}
+
+void machgate_shim_register_objc_class(void* class_ptr)
+{
+	struct guest_objc_layout* layout = class_ptr;
+
+	if (!class_ptr)
+		return;
+	guest_objc_register_one(class_ptr);
+	guest_objc_register_one(layout->isa);
+}
+
+static void* guest_objc_lookup_imp(struct guest_objc_class_entry* entry,
+                                   int use_class_methods, const char* selector)
+{
+	struct guest_objc_method* methods;
+	int method_count;
+
+	if (!entry || !selector)
+		return NULL;
+
+	methods = use_class_methods ? entry->class_methods
+	                            : entry->instance_methods;
+	method_count = use_class_methods ? entry->class_method_count
+	                                  : entry->instance_method_count;
+	for (int index = 0; index < method_count; index++) {
+		if (methods[index].selector &&
+		    strcmp(methods[index].selector, selector) == 0)
+			return methods[index].imp;
+	}
+	return NULL;
+}
+
+struct shim_objc_forwarder_args {
+	void* imp;
+	uint64_t stack_arg_count;
+	void* receiver;
+	void* sel;
+	void* sret;
+	uintptr_t a2;
+	uintptr_t a3;
+	uintptr_t a4;
+	uintptr_t a5;
+	uintptr_t a6;
+	uintptr_t a7;
+	const uintptr_t* guest_sp;
+};
+
+#if defined(__aarch64__)
+void* shim_objc_forwarder(void* args);
+__asm__(
+	".text\n"
+	".global shim_objc_forwarder\n"
+	".type shim_objc_forwarder, %function\n"
+	"shim_objc_forwarder:\n"
+	"stp x29, x30, [sp, #-208]!\n"
+	"mov x29, sp\n"
+	"stp x19, x20, [sp, #16]\n"
+	"stp x21, x22, [sp, #32]\n"
+	"mov x20, x0\n"
+	"sub sp, sp, #160\n"
+	"ldr x9, [x20, #8]\n"
+	"mov x11, #0\n"
+	"cmp x9, #16\n"
+	"bhi 1f\n"
+	"ldr x10, [x20, #88]\n"
+	"2:\n"
+	"cmp x11, x9\n"
+	"b.eq 1f\n"
+	"ldr x12, [x10, x11, lsl #3]\n"
+	"str x12, [sp, x11, lsl #3]\n"
+	"add x11, x11, #1\n"
+	"b 2b\n"
+	"1:\n"
+	"ldr x0, [x20, #16]\n"
+	"ldr x1, [x20, #24]\n"
+	"ldr x2, [x20, #40]\n"
+	"ldr x3, [x20, #48]\n"
+	"ldr x4, [x20, #56]\n"
+	"ldr x5, [x20, #64]\n"
+	"ldr x6, [x20, #72]\n"
+	"ldr x7, [x20, #80]\n"
+	"ldr x8, [x20, #32]\n"
+	"ldr x9, [x20, #0]\n"
+	"blr x9\n"
+	"mov sp, x29\n"
+	"ldp x19, x20, [sp, #16]\n"
+	"ldp x21, x22, [sp, #32]\n"
+	"ldp x29, x30, [sp], #208\n"
+	"ret\n"
+);
+#endif
+
+void* shim_objc_msgSend_call_guest_imp(void* imp, void* receiver, void* sel,
+                                       void* sret,
+                                       const uintptr_t* register_args,
+                                       const uintptr_t* guest_stack_args)
+{
+#if defined(__aarch64__)
+	struct shim_objc_forwarder_args forwarder_args;
+
+	forwarder_args.imp = imp;
+	forwarder_args.stack_arg_count = 0;
+	forwarder_args.receiver = receiver;
+	forwarder_args.sel = sel;
+	forwarder_args.sret = sret;
+	forwarder_args.a2 = register_args[0];
+	forwarder_args.a3 = register_args[1];
+	forwarder_args.a4 = register_args[2];
+	forwarder_args.a5 = register_args[3];
+	forwarder_args.a6 = register_args[4];
+	forwarder_args.a7 = register_args[5];
+	forwarder_args.guest_sp = guest_stack_args;
+	if (guest_stack_args)
+		forwarder_args.stack_arg_count = GUEST_OBJC_MAX_STACK_ARGS;
+	return shim_objc_forwarder(&forwarder_args);
+#else
+	typedef void* (*imp_fn)(void*, void*, ...);
+	imp_fn guest_imp = (imp_fn)imp;
+	return guest_imp(receiver, sel, register_args[0], register_args[1],
+	                 register_args[2], register_args[3], register_args[4]);
+#endif
+}
+
+static int shim_objc_guest_handled(void* receiver)
+{
+	void* class_ptr;
+
+	if (!receiver)
+		return 0;
+	if (guest_objc_find_class(receiver))
+		return 1;
+	class_ptr = *(void**)receiver;
+	return guest_objc_find_class(class_ptr) != NULL;
+}
+
+static void* shim_objc_try_guest_dispatch(void* receiver, const char* selector,
+                                          void* sret,
+                                          const uintptr_t* register_args,
+                                          const uintptr_t* guest_stack_args)
+{
+	struct guest_objc_class_entry* entry;
+	void* imp;
+
+	if (!receiver || !selector)
+		return NULL;
+
+	entry = guest_objc_find_class(receiver);
+	if (entry) {
+		imp = guest_objc_lookup_imp(entry, 1, selector);
+		if (imp)
+			return shim_objc_msgSend_call_guest_imp(
+				imp, receiver, (void*)selector, sret,
+				register_args, guest_stack_args);
+		return NULL;
+	}
+
+	void* class_ptr = *(void**)receiver;
+	entry = guest_objc_find_class(class_ptr);
+	if (entry) {
+		imp = guest_objc_lookup_imp(entry, 0, selector);
+		if (imp)
+			return shim_objc_msgSend_call_guest_imp(
+				imp, receiver, (void*)selector, sret,
+				register_args, guest_stack_args);
+	}
+	return NULL;
+}
+
 #define SHIM_OBJC_MAGIC 0x4F424A43
 
 enum shim_objc_kind {
@@ -16899,6 +17278,8 @@ enum shim_objc_kind {
 	SHIM_OBJC_INSTANCE_NSDATA,
 	SHIM_OBJC_CLASS_NSDATE,
 	SHIM_OBJC_INSTANCE_NSERROR,
+	SHIM_OBJC_CLASS_NSUSERDEFAULTS,
+	SHIM_OBJC_INSTANCE_NSUSERDEFAULTS,
 };
 
 struct shim_objc_header {
@@ -16951,34 +17332,6 @@ struct shim_objc_header OBJC_CLASS_$_NSProcessInfo = {
 
 struct shim_objc_header OBJC_CLASS_$_NSString = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSSTRING,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSHTTPCookie = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSHTTPCOOKIE,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSHTTPCookieStorage = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSURL = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSURL,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSMutableDictionary = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSCharacterSet = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSCHARACTERSET,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSURLComponents = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSURLCOMPONENTS,
-};
-
-struct shim_objc_header OBJC_CLASS_$_NSDate = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSDATE,
 };
 
 #define SHIM_COOKIE_PROPERTY(variable, text) \
@@ -17314,6 +17667,174 @@ static void* shim_objc_make_dictionary(struct shim_objc_string** keys,
 	return result;
 }
 
+struct shim_objc_userdefaults {
+	struct shim_objc_header header;
+	struct shim_objc_dictionary* values;
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSUserDefaults = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSUSERDEFAULTS,
+};
+
+#define SHIM_USERDEFAULTS_MAX_SUITES 64
+
+struct shim_userdefaults_suite {
+	char name[256];
+	struct shim_objc_userdefaults* instance;
+	int in_use;
+};
+
+static struct shim_userdefaults_suite shim_userdefaults_suites[SHIM_USERDEFAULTS_MAX_SUITES];
+static pthread_mutex_t shim_userdefaults_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct shim_objc_userdefaults* shim_userdefaults_for_suite(const char* suite_name)
+{
+	struct shim_objc_userdefaults* instance;
+	int index;
+
+	if (!suite_name)
+		suite_name = "";
+
+	for (index = 0; index < SHIM_USERDEFAULTS_MAX_SUITES; index++) {
+		if (shim_userdefaults_suites[index].in_use &&
+		    strcmp(shim_userdefaults_suites[index].name, suite_name) == 0)
+			return shim_userdefaults_suites[index].instance;
+	}
+
+	for (index = 0; index < SHIM_USERDEFAULTS_MAX_SUITES; index++) {
+		if (!shim_userdefaults_suites[index].in_use)
+			break;
+	}
+	if (index == SHIM_USERDEFAULTS_MAX_SUITES)
+		return NULL;
+
+	instance = malloc(sizeof(*instance));
+	if (!instance)
+		return NULL;
+	instance->header.magic = SHIM_OBJC_MAGIC;
+	instance->header.kind = SHIM_OBJC_INSTANCE_NSUSERDEFAULTS;
+	instance->values = shim_objc_make_dictionary(NULL, NULL, 0);
+	if (!instance->values) {
+		free(instance);
+		return NULL;
+	}
+
+	shim_userdefaults_suites[index].in_use = 1;
+	snprintf(shim_userdefaults_suites[index].name,
+	         sizeof(shim_userdefaults_suites[index].name), "%s",
+	         suite_name);
+	shim_userdefaults_suites[index].instance = instance;
+	return instance;
+}
+
+static void shim_userdefaults_set(struct shim_objc_userdefaults* defaults,
+                                  struct shim_objc_string* key,
+                                  struct shim_objc_string* value)
+{
+	struct shim_objc_dictionary* dict = defaults->values;
+	const char* key_text = shim_objc_string_utf8(key);
+	uint32_t pair_index;
+
+	if (!key_text)
+		return;
+
+	for (pair_index = 0; pair_index < dict->pair_count; pair_index++) {
+		const char* existing = shim_objc_string_utf8(dict->keys[pair_index * 2]);
+		if (existing && strcmp(existing, key_text) == 0) {
+			dict->keys[pair_index * 2 + 1] = value;
+			return;
+		}
+	}
+	if (dict->pair_count < dict->pair_capacity) {
+		dict->keys[dict->pair_count * 2] = key;
+		dict->keys[dict->pair_count * 2 + 1] = value;
+		dict->pair_count++;
+		return;
+	}
+
+	struct shim_objc_dictionary* grown =
+		malloc(sizeof(*grown) +
+		       sizeof(*dict->keys) * 2 * dict->pair_capacity * 2);
+	if (!grown)
+		return;
+	memcpy(grown, dict,
+	       sizeof(*dict) + sizeof(*dict->keys) * 2 * dict->pair_count);
+	grown->pair_capacity = dict->pair_capacity * 2;
+	grown->keys[grown->pair_count * 2] = key;
+	grown->keys[grown->pair_count * 2 + 1] = value;
+	grown->pair_count++;
+	free(dict);
+	defaults->values = grown;
+}
+
+static struct shim_objc_string* shim_userdefaults_get(
+	struct shim_objc_userdefaults* defaults, struct shim_objc_string* key)
+{
+	const struct shim_objc_dictionary* dict = defaults->values;
+	const char* key_text = shim_objc_string_utf8(key);
+	uint32_t pair_index;
+
+	if (!key_text)
+		return NULL;
+
+	for (pair_index = 0; pair_index < dict->pair_count; pair_index++) {
+		const char* existing = shim_objc_string_utf8(dict->keys[pair_index * 2]);
+		if (existing && strcmp(existing, key_text) == 0)
+			return dict->keys[pair_index * 2 + 1];
+	}
+	return NULL;
+}
+
+static void shim_userdefaults_remove(struct shim_objc_userdefaults* defaults,
+                                     struct shim_objc_string* key)
+{
+	struct shim_objc_dictionary* dict = defaults->values;
+	const char* key_text = shim_objc_string_utf8(key);
+	uint32_t pair_index;
+
+	if (!key_text)
+		return;
+
+	for (pair_index = 0; pair_index < dict->pair_count; pair_index++) {
+		const char* existing = shim_objc_string_utf8(dict->keys[pair_index * 2]);
+		if (existing && strcmp(existing, key_text) == 0) {
+			uint32_t last = dict->pair_count - 1;
+			dict->keys[pair_index * 2] = dict->keys[last * 2];
+			dict->keys[pair_index * 2 + 1] = dict->keys[last * 2 + 1];
+			dict->pair_count--;
+			return;
+		}
+	}
+}
+
+struct shim_objc_header OBJC_CLASS_$_NSHTTPCookie = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSHTTPCOOKIE,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSHTTPCookieStorage = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSURL = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSURL,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSMutableDictionary = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSCharacterSet = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSCHARACTERSET,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSURLComponents = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSURLCOMPONENTS,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSDate = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSDATE,
+};
+
 static void* shim_cookie_jar_matching_array(const char* url)
 {
 	char host[256];
@@ -17539,13 +18060,32 @@ static void* shim_cookie_request_header_fields(void* cookies_array)
 }
 
 void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t a3,
-                             uintptr_t a4, uintptr_t a5, uintptr_t a6, void* sret,
-                             const uintptr_t* guest_stack_args)
+                             uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                             void* sret, const uintptr_t* guest_stack_args)
 {
 	const char* selector = sel;
+	uintptr_t register_args[6];
+	void* guest_result;
 
 	if (!receiver || !selector)
 		return NULL;
+
+	register_args[0] = a2;
+	register_args[1] = a3;
+	register_args[2] = a4;
+	register_args[3] = a5;
+	register_args[4] = a6;
+	register_args[5] = a7;
+
+	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND"))
+		fprintf(stderr, "libsystem_shim: objc_msgSend [%s] recv=%p\n",
+		        selector, receiver);
+
+	guest_result = shim_objc_try_guest_dispatch(receiver, selector, sret,
+	                                            register_args,
+	                                            guest_stack_args);
+	if (guest_result || shim_objc_guest_handled(receiver))
+		return guest_result;
 
 	if (strcmp(selector, "processInfo") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSPROCESSINFO))
@@ -17578,9 +18118,11 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 	} else if (strcmp(selector, "UTF8String") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return ((struct shim_objc_string*)receiver)->utf8;
+		return (void*)shim_objc_string_utf8(receiver);
 	} else if (strcmp(selector, "cStringUsingEncoding:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return ((struct shim_objc_string*)receiver)->utf8;
+		return (void*)shim_objc_string_utf8(receiver);
 	} else if (strcmp(selector, "length") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return (void*)(uintptr_t)strlen(((struct shim_objc_string*)receiver)->utf8);
@@ -18060,6 +18602,13 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			return shim_objc_make_dictionary(no_keys, no_values, 0);
 		}
 	} else if (strcmp(selector, "setObject:forKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSUSERDEFAULTS)) {
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			shim_userdefaults_set(receiver, (struct shim_objc_string*)a3,
+			                      (struct shim_objc_string*)a2);
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return NULL;
+		}
 		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
 			struct shim_objc_dictionary* dict = receiver;
 			uint32_t pair_index;
@@ -18080,6 +18629,13 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 		}
 	} else if (strcmp(selector, "objectForKeyedSubscript:") == 0 ||
 	           strcmp(selector, "objectForKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSUSERDEFAULTS)) {
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			void* stored = shim_userdefaults_get(
+				receiver, (struct shim_objc_string*)a2);
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return stored;
+		}
 		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
 			const struct shim_objc_dictionary* dict = receiver;
 			const char* wanted_key = shim_objc_string_utf8((void*)a2);
@@ -18311,9 +18867,70 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			return shim_objc_make_url_components();
 		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY))
 			return shim_objc_make_dictionary(NULL, NULL, 0);
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSUSERDEFAULTS)) {
+			struct shim_objc_userdefaults* defaults = malloc(sizeof(*defaults));
+			if (!defaults)
+				return NULL;
+			defaults->header.magic = SHIM_OBJC_MAGIC;
+			defaults->header.kind = SHIM_OBJC_INSTANCE_NSUSERDEFAULTS;
+			defaults->values = shim_objc_make_dictionary(NULL, NULL, 0);
+			if (!defaults->values) {
+				free(defaults);
+				return NULL;
+			}
+			return defaults;
+		}
 		return shim_objc_make_string("");
 	} else if (strcmp(selector, "init") == 0) {
 		return receiver;
+	} else if (strcmp(selector, "standardUserDefaults") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSUSERDEFAULTS)) {
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			void* result = shim_userdefaults_for_suite("");
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return result;
+		}
+	} else if (strcmp(selector, "initWithSuiteName:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSUSERDEFAULTS)) {
+			const char* suite_name = shim_objc_string_utf8((void*)a2);
+			struct shim_objc_userdefaults* allocated = receiver;
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			struct shim_objc_userdefaults* shared =
+				shim_userdefaults_for_suite(suite_name ? suite_name : "");
+			if (!shared) {
+				pthread_mutex_unlock(&shim_userdefaults_mutex);
+				return NULL;
+			}
+			free(allocated->values);
+			free(allocated);
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return shared;
+		}
+	} else if (strcmp(selector, "setObject:forKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSUSERDEFAULTS)) {
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			shim_userdefaults_set(receiver, (struct shim_objc_string*)a3,
+			                      (struct shim_objc_string*)a2);
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return NULL;
+		}
+	} else if (strcmp(selector, "stringForKey:") == 0 ||
+	           strcmp(selector, "objectForKey:") == 0 ||
+	           strcmp(selector, "stringArrayForKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSUSERDEFAULTS)) {
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			void* result = shim_userdefaults_get(
+				receiver, (struct shim_objc_string*)a2);
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return result;
+		}
+	} else if (strcmp(selector, "removeObjectForKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSUSERDEFAULTS)) {
+			pthread_mutex_lock(&shim_userdefaults_mutex);
+			shim_userdefaults_remove(receiver, (struct shim_objc_string*)a2);
+			pthread_mutex_unlock(&shim_userdefaults_mutex);
+			return NULL;
+		}
 	} else if (strcmp(selector, "initWithBytes:length:encoding:") == 0) {
 		const char* bytes = (const char*)a2;
 		size_t byte_length = (size_t)a3;
@@ -18374,8 +18991,8 @@ struct shim_objc_msgsend_result {
 };
 
 struct shim_objc_msgsend_result shim_objc_msgSend_struct_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t a3,
-                                                              uintptr_t a4, uintptr_t a5, uintptr_t a6, void* sret,
-                                                              const uintptr_t* guest_stack_args)
+                                                              uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                                                              void* sret, const uintptr_t* guest_stack_args)
 {
 	struct shim_objc_msgsend_result result = {NULL, 0.0};
 	const char* selector = sel;
@@ -18391,7 +19008,7 @@ struct shim_objc_msgsend_result shim_objc_msgSend_struct_impl(void* receiver, vo
 	}
 
 	result.pointer = shim_objc_msgSend_impl(receiver, sel, a2, a3, a4, a5,
-	                                       a6, sret, guest_stack_args);
+	                                       a6, a7, sret, guest_stack_args);
 	return result;
 }
 
@@ -18417,7 +19034,7 @@ static struct shim_objc_msgsend_result shim_objc_msgSend_dispatch(
 	return shim_objc_msgSend_struct_impl((void*)args->receiver,
 	                                     (void*)args->sel,
 	                                     args->a2, args->a3, args->a4,
-	                                     args->a5, args->a6,
+	                                     args->a5, args->a6, args->a7,
 	                                     (void*)args->sret,
 	                                     (const uintptr_t*)args->guest_sp);
 }
@@ -18455,6 +19072,8 @@ void* objc_getClass(const char* name)
 		return NULL;
 	if (strcmp(name, "NSProcessInfo") == 0)
 		return &OBJC_CLASS_$_NSProcessInfo;
+	if (strcmp(name, "NSUserDefaults") == 0)
+		return &OBJC_CLASS_$_NSUserDefaults;
 	if (strcmp(name, "NSString") == 0)
 		return &OBJC_CLASS_$_NSString;
 	if (strcmp(name, "NSHTTPCookie") == 0)
@@ -18489,12 +19108,44 @@ void* objc_lookUpClass(const char* name)
 	return objc_getClass(name);
 }
 
+static void* guest_objc_alloc_instance(void* class_object)
+{
+	struct guest_objc_layout* layout = class_object;
+	uint64_t data_bits = layout->data_bits & ~7ULL;
+	uint32_t* class_ro = (uint32_t*)data_bits;
+	uint32_t instance_size = class_ro[2];
+	void* instance;
+
+	if (instance_size < 64)
+		instance_size = 64;
+	instance = calloc(1, instance_size);
+	if (!instance)
+		return NULL;
+	*(void**)instance = class_object;
+	return instance;
+}
+
 void* objc_alloc(void* class_object)
 {
 	if (shim_objc_is_object(class_object, SHIM_OBJC_CLASS_NSURLCOMPONENTS))
 		return shim_objc_make_url_components();
 	if (shim_objc_is_object(class_object, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY))
 		return shim_objc_make_dictionary(NULL, NULL, 0);
+	if (shim_objc_is_object(class_object, SHIM_OBJC_CLASS_NSUSERDEFAULTS)) {
+		struct shim_objc_userdefaults* defaults = malloc(sizeof(*defaults));
+		if (!defaults)
+			return NULL;
+		defaults->header.magic = SHIM_OBJC_MAGIC;
+		defaults->header.kind = SHIM_OBJC_INSTANCE_NSUSERDEFAULTS;
+		defaults->values = shim_objc_make_dictionary(NULL, NULL, 0);
+		if (!defaults->values) {
+			free(defaults);
+			return NULL;
+		}
+		return defaults;
+	}
+	if (guest_objc_find_class(class_object))
+		return guest_objc_alloc_instance(class_object);
 	return shim_objc_make_string("");
 }
 
@@ -18558,4 +19209,68 @@ void objc_storeStrong(void** location, void* object)
 {
 	if (location)
 		*location = object;
+}
+
+struct guest_objc_super {
+	void* receiver;
+	void* class_ptr;
+};
+
+void* objc_msgSendSuper2(struct guest_objc_super* super_data, void* sel, ...)
+{
+	struct guest_objc_class_entry* entry;
+	const char* selector;
+	void* imp;
+
+	if (!super_data || !sel)
+		return NULL;
+
+	selector = sel;
+	void* superclass = *(void**)((char*)super_data->class_ptr + 8);
+	entry = guest_objc_find_class(superclass);
+	if (entry) {
+		imp = guest_objc_lookup_imp(entry, 0, selector);
+		if (!imp)
+			return NULL;
+		uintptr_t register_args[6] = {0, 0, 0, 0, 0, 0};
+		return shim_objc_msgSend_call_guest_imp(imp, super_data->receiver,
+		                                        sel, NULL, register_args,
+		                                        NULL);
+	}
+
+	if (strcmp(selector, "init") == 0)
+		return super_data->receiver;
+	return NULL;
+}
+
+void* objc_getProperty(void* receiver, void* sel, void* value,
+                       uintptr_t offset, int atomic_flag)
+{
+	(void)sel;
+	(void)value;
+	(void)atomic_flag;
+	if (!receiver)
+		return NULL;
+	return *(void**)((char*)receiver + offset);
+}
+
+void objc_setProperty_atomic(void* receiver, void* sel, void* value,
+                             uintptr_t offset)
+{
+	(void)sel;
+	if (!receiver)
+		return;
+	*(void**)((char*)receiver + offset) = value;
+}
+
+void objc_setProperty_nonatomic(void* receiver, void* sel, void* value,
+                                uintptr_t offset)
+{
+	objc_setProperty_atomic(receiver, sel, value, offset);
+}
+
+void objc_setProperty_nonatomic_copy(void* receiver, void* sel, void* value,
+                                     uintptr_t offset)
+{
+	objc_setProperty_atomic(receiver, sel, value, offset);
 }
