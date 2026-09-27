@@ -506,6 +506,45 @@ struct resolver_state {
 static struct resolver_bind_slot_info bind_slot_registry[BIND_SLOT_REGISTRY_MAX];
 static int bind_slot_registry_count;
 
+#define BIND_SLOT_HASH_BUCKETS 65536
+static int32_t bind_slot_hash_slot[BIND_SLOT_HASH_BUCKETS];
+
+static uint32_t slot_addr_hash(uintptr_t slot_addr)
+{
+	uint64_t hash = (uint64_t)slot_addr;
+	hash ^= hash >> 33;
+	hash *= UINT64_C(0xff51afd7ed558ccd);
+	hash ^= hash >> 33;
+	return (uint32_t)hash & (BIND_SLOT_HASH_BUCKETS - 1);
+}
+
+static void bind_slot_hash_rebuild(void)
+{
+	for (int i = 0; i < BIND_SLOT_HASH_BUCKETS; i++)
+		bind_slot_hash_slot[i] = -1;
+	for (int i = 0; i < bind_slot_registry_count; i++) {
+		uint32_t bucket = slot_addr_hash(bind_slot_registry[i].slot_addr);
+		bind_slot_registry[i].hash_next = bind_slot_hash_slot[bucket];
+		bind_slot_hash_slot[bucket] = i;
+	}
+}
+
+static struct resolver_bind_slot_info* bind_slot_find(uintptr_t slot_addr)
+{
+	static int hash_initialized;
+	if (!hash_initialized) {
+		hash_initialized = 1;
+		bind_slot_hash_rebuild();
+	}
+	int32_t index = bind_slot_hash_slot[slot_addr_hash(slot_addr)];
+	while (index >= 0) {
+		if (bind_slot_registry[index].slot_addr == slot_addr)
+			return &bind_slot_registry[index];
+		index = bind_slot_registry[index].hash_next;
+	}
+	return NULL;
+}
+
 static void register_bind_slot(const char* context,
                                const char* sym_name,
                                const char* lookup_name,
@@ -518,18 +557,17 @@ static void register_bind_slot(const char* context,
 	if (!slot_addr)
 		return;
 
-	struct resolver_bind_slot_info* info = NULL;
-	for (int i = bind_slot_registry_count - 1; i >= 0; i--) {
-		if (bind_slot_registry[i].slot_addr == slot_addr) {
-			info = &bind_slot_registry[i];
-			break;
-		}
-	}
+	struct resolver_bind_slot_info* info = bind_slot_find(slot_addr);
 
 	if (!info) {
 		if (bind_slot_registry_count >= BIND_SLOT_REGISTRY_MAX)
 			return;
 		info = &bind_slot_registry[bind_slot_registry_count++];
+		info->slot_addr = slot_addr;
+		info->hash_next = -1;
+		uint32_t bucket = slot_addr_hash(slot_addr);
+		info->hash_next = bind_slot_hash_slot[bucket];
+		bind_slot_hash_slot[bucket] = (int32_t)(info - bind_slot_registry);
 	}
 
 	info->slot_addr = slot_addr;
@@ -548,11 +586,10 @@ int resolver_lookup_bind_slot(uintptr_t slot_addr,
 	if (!slot_addr || !out_info)
 		return -1;
 
-	for (int i = bind_slot_registry_count - 1; i >= 0; i--) {
-		if (bind_slot_registry[i].slot_addr == slot_addr) {
-			*out_info = bind_slot_registry[i];
-			return 0;
-		}
+	const struct resolver_bind_slot_info* info = bind_slot_find(slot_addr);
+	if (info) {
+		*out_info = *info;
+		return 0;
 	}
 	return -1;
 }
@@ -1258,9 +1295,110 @@ struct macho_symbol_result {
 	uint8_t sect;
 };
 
+/* ---- Mach-O symbol table hash index ----
+ * lookup_macho_symbol_result is called tens of thousands of times per
+ * boot (every bind, every allocator hook). A linear scan of 762K nlist
+ * entries per lookup dominated startup. The index is built once per
+ * (mach header, symtab) pair and cached; entries are name-hash buckets
+ * chaining through symbol indices. */
+
+#define MACHO_SYM_INDEX_BUCKETS (256 * 1024)
+
+struct macho_sym_index {
+	struct mach_header_64* mh;
+	struct nlist_64* syms;
+	uint32_t nsyms;
+	char* strtab;
+	uint32_t strsize;
+	int32_t* buckets;
+	int32_t* chain;
+	struct macho_sym_index* next;
+};
+
+static struct macho_sym_index* macho_sym_indexes;
+
+static uint32_t macho_name_hash(const char* name)
+{
+	uint64_t hash = UINT64_C(1469598103934665603);
+	for (const unsigned char* cursor = (const unsigned char*)name;
+	     *cursor; cursor++) {
+		hash ^= *cursor;
+		hash *= UINT64_C(1099511628211);
+	}
+	return (uint32_t)hash & (MACHO_SYM_INDEX_BUCKETS - 1);
+}
+
+static int macho_sym_index_build(struct mach_header_64* mh,
+                                 struct nlist_64* syms, uint32_t nsyms,
+                                 char* strtab, uint32_t strsize,
+                                 struct macho_sym_index* index)
+{
+	index->buckets = (int32_t*)malloc(
+		(size_t)MACHO_SYM_INDEX_BUCKETS * sizeof(int32_t));
+	index->chain = (int32_t*)malloc((size_t)nsyms * sizeof(int32_t));
+	if (!index->buckets || !index->chain) {
+		free(index->buckets);
+		free(index->chain);
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < MACHO_SYM_INDEX_BUCKETS; i++)
+		index->buckets[i] = -1;
+
+	for (uint32_t i = 0; i < nsyms; i++) {
+		struct nlist_64* nl = &syms[i];
+		if (nl->n_type & N_STAB)
+			continue;
+		if ((nl->n_type & N_TYPE) != N_SECT)
+			continue;
+		if (nl->n_strx == 0 || nl->n_strx >= strsize)
+			continue;
+		const char* sym = &strtab[nl->n_strx];
+		if (!sym[0])
+			continue;
+
+		uint32_t bucket = macho_name_hash(sym);
+		index->chain[i] = index->buckets[bucket];
+		index->buckets[bucket] = (int32_t)i;
+	}
+	return 0;
+}
+
+static struct macho_sym_index* macho_sym_index_for(struct mach_header_64* mh,
+                                                   struct nlist_64* syms,
+                                                   uint32_t nsyms,
+                                                   char* strtab,
+                                                   uint32_t strsize)
+{
+	for (struct macho_sym_index* index = macho_sym_indexes; index;
+	     index = index->next) {
+		if (index->mh == mh)
+			return index;
+	}
+
+	struct macho_sym_index* index =
+		(struct macho_sym_index*)calloc(1, sizeof(*index));
+	if (!index)
+		return NULL;
+	index->mh = mh;
+	index->syms = syms;
+	index->nsyms = nsyms;
+	index->strtab = strtab;
+	index->strsize = strsize;
+
+	if (macho_sym_index_build(mh, syms, nsyms, strtab, strsize, index) < 0) {
+		free(index);
+		return NULL;
+	}
+
+	index->next = macho_sym_indexes;
+	macho_sym_indexes = index;
+	return index;
+}
+
 static int lookup_macho_symbol_result(struct resolver_state* rs,
-                                      const char* name,
-                                      struct macho_symbol_result* result)
+                                       const char* name,
+                                       struct macho_symbol_result* result)
 {
 	struct mach_header_64* mh = rs->mh;
 	uint8_t* cmds = (uint8_t*)(mh + 1);
@@ -1275,11 +1413,9 @@ static int lookup_macho_symbol_result(struct resolver_state* rs,
 	}
 	if (!symtab) return 0;
 
-	/* Convert file offsets to memory addresses using segment mappings */
 	struct nlist_64* syms = NULL;
 	char* strtab = NULL;
 
-	/* Find LINKEDIT segment to convert file offsets */
 	p = 0;
 	for (uint32_t i = 0; i < mh->ncmds && p < mh->sizeofcmds; i++) {
 		struct load_command* lc = (struct load_command*)&cmds[p];
@@ -1295,6 +1431,26 @@ static int lookup_macho_symbol_result(struct resolver_state* rs,
 		p += lc->cmdsize;
 	}
 	if (!syms || !strtab) return 0;
+
+	struct macho_sym_index* index = macho_sym_index_for(
+		mh, syms, symtab->nsyms, strtab, symtab->strsize);
+	if (index) {
+		int32_t candidate = index->buckets[macho_name_hash(name)];
+		while (candidate >= 0) {
+			struct nlist_64* nl = &syms[candidate];
+			if (strcmp(&strtab[nl->n_strx], name) == 0) {
+				if (result) {
+					result->addr = nl->n_value + rs->slide;
+					result->type = nl->n_type;
+					result->desc = nl->n_desc;
+					result->sect = nl->n_sect;
+				}
+				return 1;
+			}
+			candidate = index->chain[candidate];
+		}
+		return 0;
+	}
 
 	for (uint32_t i = 0; i < symtab->nsyms; i++) {
 		struct nlist_64* nl = &syms[i];

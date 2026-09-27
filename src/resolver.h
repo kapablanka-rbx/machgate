@@ -48,6 +48,7 @@ int resolver_symbol_extent(void* mh, uintptr_t slide, const char* name,
 struct resolver_bind_slot_info {
 	uintptr_t slot_addr;
 	uintptr_t resolved;
+	int32_t hash_next;
 	const char* context;
 	const char* sym_name;
 	const char* lookup_name;
