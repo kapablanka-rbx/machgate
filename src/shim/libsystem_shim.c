@@ -16142,6 +16142,9 @@ static const uint32_t shim_objc_os_version[3] = {15, 0, 0};
 static int shim_objc_is_object(const void* receiver, uint32_t kind)
 {
 	const struct shim_objc_header* header = receiver;
+
+	if (!header)
+		return 0;
 	return header->magic == SHIM_OBJC_MAGIC && header->kind == kind;
 }
 
@@ -16650,12 +16653,13 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			void* result;
 			if (!format)
 				return NULL;
-			uintptr_t stack_values[8] = {0};
+			uintptr_t call_values[9] = {0};
 			if (guest_stack_args) {
 				for (int value_index = 0; value_index < 8; value_index++)
-					stack_values[value_index] = guest_stack_args[value_index];
+					call_values[value_index] =
+						guest_stack_args[value_index];
 			}
-			text = shim_objc_format_values(format, stack_values, 8);
+			text = shim_objc_format_values(format, call_values, 8);
 			if (!text)
 				return NULL;
 			result = shim_objc_make_string(text);
@@ -17184,6 +17188,12 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			return NULL;
 		}
 	} else if (strcmp(selector, "path") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSURLCOMPONENTS)) {
+			struct shim_objc_url_components* components = receiver;
+			if (!components->path)
+				return NULL;
+			return shim_objc_make_string(components->path->utf8);
+		}
 		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSURL)) {
 			const char* text = shim_objc_url_string(receiver);
 			if (!text)
@@ -17341,15 +17351,16 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 	} else if (strcmp(selector, "cookieWithProperties:") == 0) {
 		const struct shim_objc_dictionary* properties = (const void*)a2;
 		struct shim_cookie cookie;
+		const char* origin_url = NULL;
 		memset(&cookie, 0, sizeof(cookie));
 		if (properties &&
 		    shim_objc_is_object(properties, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
 			for (uint32_t pair_index = 0;
 			     pair_index < properties->pair_count; pair_index++) {
 				const char* key =
-					shim_objc_string_utf8(properties->keys[pair_index * 2 + 1]);
-				const char* value =
 					shim_objc_string_utf8(properties->keys[pair_index * 2]);
+				const char* value =
+					shim_objc_string_utf8(properties->keys[pair_index * 2 + 1]);
 				if (!key || !value)
 					continue;
 				if (strcmp(key, "Name") == 0)
@@ -17360,8 +17371,12 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 					shim_copy_cstring(cookie.path, sizeof(cookie.path), value);
 				else if (strcmp(key, "Domain") == 0)
 					shim_copy_cstring(cookie.domain, sizeof(cookie.domain), value);
+				else if (strcmp(key, "OriginURL") == 0)
+					origin_url = shim_objc_url_string((void*)properties->keys[pair_index * 2 + 1]);
 			}
 		}
+		if (cookie.domain[0] == '\0' && origin_url)
+			shim_parse_url_host(origin_url, cookie.domain, sizeof(cookie.domain));
 		return shim_objc_make_cookie(&cookie);
 	} else if (strcmp(selector, "setCookie:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE)) {
@@ -17385,10 +17400,8 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 	} else if (strcmp(selector, "init") == 0) {
 		return receiver;
 	} else if (strcmp(selector, "initWithBytes:length:encoding:") == 0) {
-		const char* bytes = (const char*)guest_stack_args ?
-			(const char*)guest_stack_args[0] : (const char*)a2;
-		size_t byte_length = guest_stack_args ?
-			(size_t)guest_stack_args[1] : (size_t)a3;
+		const char* bytes = (const char*)a2;
+		size_t byte_length = (size_t)a3;
 		struct shim_objc_string* result;
 		if (!bytes || byte_length > (1 << 20))
 			return NULL;
@@ -17468,14 +17481,50 @@ struct shim_objc_msgsend_result shim_objc_msgSend_struct_impl(void* receiver, vo
 }
 
 #if defined(__aarch64__)
+struct shim_objc_msgsend_args {
+	uintptr_t a2;
+	uintptr_t a3;
+	uintptr_t a4;
+	uintptr_t a5;
+	uintptr_t a6;
+	uintptr_t a7;
+	uintptr_t receiver;
+	uintptr_t sel;
+	uintptr_t guest_sp;
+	uintptr_t sret;
+};
+
+static struct shim_objc_msgsend_result shim_objc_msgSend_dispatch(
+	const struct shim_objc_msgsend_args* args) __attribute__((used));
+static struct shim_objc_msgsend_result shim_objc_msgSend_dispatch(
+	const struct shim_objc_msgsend_args* args)
+{
+	return shim_objc_msgSend_struct_impl((void*)args->receiver,
+	                                     (void*)args->sel,
+	                                     args->a2, args->a3, args->a4,
+	                                     args->a5, args->a6,
+	                                     (void*)args->sret,
+	                                     (const uintptr_t*)args->guest_sp);
+}
+
 __asm__(
 	".text\n"
 	".global objc_msgSend\n"
 	".type objc_msgSend, %function\n"
 	"objc_msgSend:\n"
-	"mov x7, x8\n"
-	"mov x8, sp\n"
-	"b shim_objc_msgSend_struct_impl\n"
+	"stp x29, x30, [sp, #-0x70]!\n"
+	"stp x2, x3, [sp, #0x10]\n"
+	"stp x4, x5, [sp, #0x20]\n"
+	"stp x6, x7, [sp, #0x30]\n"
+	"stp x0, x1, [sp, #0x40]\n"
+	"add x9, sp, #0x70\n"
+	"str x9, [sp, #0x50]\n"
+	"str x8, [sp, #0x58]\n"
+	"add x0, sp, #0x10\n"
+	"bl shim_objc_msgSend_dispatch\n"
+	".p2align 4\n"
+	"ldp x29, x30, [sp], #0x70\n"
+	"ret\n"
 );
 #else
 void* objc_msgSend(void* receiver, void* sel, ...)
