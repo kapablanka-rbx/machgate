@@ -9187,21 +9187,66 @@ static inline void fixup_cond(pthread_cond_t *cond)
 	}
 }
 
-#define ATTR_SLOT_COUNT 64
-
 struct pthread_attr_slot {
 	const void* key;
 	pthread_attr_t native;
 	int used;
 };
 
-static struct pthread_attr_slot pthread_attr_slots[ATTR_SLOT_COUNT];
+#define ATTR_SLOT_CHUNK_SLOTS 256
+#define ATTR_SLOT_CHUNK_COUNT 128
+
+struct pthread_attr_chunk {
+	struct pthread_attr_slot slots[ATTR_SLOT_CHUNK_SLOTS];
+};
+
+static struct pthread_attr_chunk* pthread_attr_chunks[ATTR_SLOT_CHUNK_COUNT];
+static volatile int pthread_attr_slot_lock;
+
+static int real_pthread_attr_init_for_create(pthread_attr_t* attr)
+{
+	static int (*real_pthread_attr_init)(pthread_attr_t*) = NULL;
+
+	if (!real_pthread_attr_init)
+		real_pthread_attr_init = dlsym(RTLD_NEXT, "pthread_attr_init");
+	if (!real_pthread_attr_init)
+		return ENOSYS;
+	return real_pthread_attr_init(attr);
+}
+
+static int real_pthread_attr_destroy_for_create(pthread_attr_t* attr)
+{
+	static int (*real_pthread_attr_destroy)(pthread_attr_t*) = NULL;
+
+	if (!real_pthread_attr_destroy)
+		real_pthread_attr_destroy = dlsym(RTLD_NEXT, "pthread_attr_destroy");
+	if (!real_pthread_attr_destroy)
+		return ENOSYS;
+	return real_pthread_attr_destroy(attr);
+}
+
+static void lock_pthread_attr_slots(void)
+{
+	while (__sync_lock_test_and_set(&pthread_attr_slot_lock, 1))
+		sched_yield();
+}
+
+static void unlock_pthread_attr_slots(void)
+{
+	__sync_lock_release(&pthread_attr_slot_lock);
+}
 
 static struct pthread_attr_slot* pthread_attr_slot_find(const void* key)
 {
-	for (int i = 0; i < ATTR_SLOT_COUNT; i++) {
-		if (pthread_attr_slots[i].used && pthread_attr_slots[i].key == key)
-			return &pthread_attr_slots[i];
+	for (int chunk_index = 0; chunk_index < ATTR_SLOT_CHUNK_COUNT; chunk_index++) {
+		struct pthread_attr_chunk* chunk = pthread_attr_chunks[chunk_index];
+		if (!chunk)
+			continue;
+		for (int slot_index = 0; slot_index < ATTR_SLOT_CHUNK_SLOTS; slot_index++) {
+			struct pthread_attr_slot* slot = &chunk->slots[slot_index];
+			if (slot->used && slot->key == key)
+				return slot;
+		}
 	}
 	return NULL;
 }
@@ -9212,12 +9257,25 @@ static struct pthread_attr_slot* pthread_attr_slot_alloc(const void* key)
 	if (slot)
 		return slot;
 
-	for (int i = 0; i < ATTR_SLOT_COUNT; i++) {
-		if (!pthread_attr_slots[i].used) {
-			pthread_attr_slots[i].used = 1;
-			pthread_attr_slots[i].key = key;
-			return &pthread_attr_slots[i];
+	for (int chunk_index = 0; chunk_index < ATTR_SLOT_CHUNK_COUNT; chunk_index++) {
+		struct pthread_attr_chunk* chunk = pthread_attr_chunks[chunk_index];
+		if (chunk) {
+			for (int slot_index = 0; slot_index < ATTR_SLOT_CHUNK_SLOTS; slot_index++) {
+				if (!chunk->slots[slot_index].used) {
+					chunk->slots[slot_index].used = 1;
+					chunk->slots[slot_index].key = key;
+					return &chunk->slots[slot_index];
+				}
+			}
+			continue;
 		}
+		chunk = calloc(1, sizeof(*chunk));
+		if (!chunk)
+			return NULL;
+		pthread_attr_chunks[chunk_index] = chunk;
+		chunk->slots[0].used = 1;
+		chunk->slots[0].key = key;
+		return &chunk->slots[0];
 	}
 	return NULL;
 }
@@ -9225,12 +9283,16 @@ static struct pthread_attr_slot* pthread_attr_slot_alloc(const void* key)
 int pthread_attr_init(pthread_attr_t* attr)
 {
 	static int (*real_pthread_attr_init)(pthread_attr_t*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_alloc(attr);
+	struct pthread_attr_slot* slot;
 
 	if (!real_pthread_attr_init)
 		real_pthread_attr_init = dlsym(RTLD_NEXT, "pthread_attr_init");
 	if (!real_pthread_attr_init)
 		return ENOSYS;
+
+	lock_pthread_attr_slots();
+	slot = pthread_attr_slot_alloc(attr);
+	unlock_pthread_attr_slots();
 	if (!slot)
 		return ENOMEM;
 
@@ -9243,49 +9305,62 @@ int pthread_attr_init(pthread_attr_t* attr)
 int pthread_attr_destroy(pthread_attr_t* attr)
 {
 	static int (*real_pthread_attr_destroy)(pthread_attr_t*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
 
 	if (!real_pthread_attr_destroy)
 		real_pthread_attr_destroy = dlsym(RTLD_NEXT, "pthread_attr_destroy");
 	if (!real_pthread_attr_destroy)
 		return ENOSYS;
-	if (!slot)
+
+	lock_pthread_attr_slots();
+	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
+	if (!slot) {
+		unlock_pthread_attr_slots();
 		return real_pthread_attr_destroy(attr);
+	}
 
 	int result = real_pthread_attr_destroy(&slot->native);
 	slot->used = 0;
 	slot->key = NULL;
+	unlock_pthread_attr_slots();
 	return result;
+}
+
+static pthread_attr_t* pthread_attr_target(pthread_attr_t* attr)
+{
+	struct pthread_attr_slot* slot;
+
+	lock_pthread_attr_slots();
+	slot = pthread_attr_slot_find(attr);
+	unlock_pthread_attr_slots();
+	return slot ? &slot->native : attr;
 }
 
 int pthread_attr_setstacksize(pthread_attr_t* attr, size_t stack_size)
 {
 	static int (*real_pthread_attr_setstacksize)(pthread_attr_t*, size_t) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
 
 	if (!real_pthread_attr_setstacksize)
 		real_pthread_attr_setstacksize = dlsym(RTLD_NEXT, "pthread_attr_setstacksize");
 	if (!real_pthread_attr_setstacksize)
 		return ENOSYS;
-	return real_pthread_attr_setstacksize(slot ? &slot->native : attr, stack_size);
+	return real_pthread_attr_setstacksize(pthread_attr_target(attr), stack_size);
 }
 
 int pthread_attr_getstacksize(const pthread_attr_t* attr, size_t* stack_size)
 {
 	static int (*real_pthread_attr_getstacksize)(const pthread_attr_t*, size_t*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
 
 	if (!real_pthread_attr_getstacksize)
 		real_pthread_attr_getstacksize = dlsym(RTLD_NEXT, "pthread_attr_getstacksize");
 	if (!real_pthread_attr_getstacksize)
 		return ENOSYS;
-	return real_pthread_attr_getstacksize(slot ? &slot->native : attr, stack_size);
+	return real_pthread_attr_getstacksize(
+		pthread_attr_target((pthread_attr_t*)attr), stack_size);
 }
 
 int pthread_attr_setdetachstate(pthread_attr_t* attr, int detach_state)
 {
 	static int (*real_pthread_attr_setdetachstate)(pthread_attr_t*, int) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
 	int linux_state = detach_state;
 
 	if (!real_pthread_attr_setdetachstate)
@@ -9297,7 +9372,102 @@ int pthread_attr_setdetachstate(pthread_attr_t* attr, int detach_state)
 		linux_state = PTHREAD_CREATE_JOINABLE;
 	else if (detach_state == 2)
 		linux_state = PTHREAD_CREATE_DETACHED;
-	return real_pthread_attr_setdetachstate(slot ? &slot->native : attr, linux_state);
+	return real_pthread_attr_setdetachstate(pthread_attr_target(attr), linux_state);
+}
+
+int pthread_attr_getdetachstate(const pthread_attr_t* attr, int* detach_state)
+{
+	static int (*real_pthread_attr_getdetachstate)(const pthread_attr_t*, int*) = NULL;
+	int result;
+	int linux_state = 0;
+
+	if (!real_pthread_attr_getdetachstate)
+		real_pthread_attr_getdetachstate = dlsym(RTLD_NEXT, "pthread_attr_getdetachstate");
+	if (!real_pthread_attr_getdetachstate)
+		return ENOSYS;
+
+	result = real_pthread_attr_getdetachstate(
+		pthread_attr_target((pthread_attr_t*)attr), &linux_state);
+	if (result == 0 && detach_state) {
+		if (linux_state == PTHREAD_CREATE_DETACHED)
+			*detach_state = 2;
+		else
+			*detach_state = 1;
+	}
+	return result;
+}
+
+int pthread_attr_setschedparam(pthread_attr_t* attr,
+                               const struct sched_param* sched_param)
+{
+	static int (*real_pthread_attr_setschedparam)(pthread_attr_t*,
+		const struct sched_param*) = NULL;
+	struct sched_param linux_param;
+
+	if (!real_pthread_attr_setschedparam)
+		real_pthread_attr_setschedparam = dlsym(RTLD_NEXT, "pthread_attr_setschedparam");
+	if (!real_pthread_attr_setschedparam || !sched_param)
+		return EINVAL;
+
+	memset(&linux_param, 0, sizeof(linux_param));
+	linux_param.sched_priority = sched_param->sched_priority;
+	return real_pthread_attr_setschedparam(pthread_attr_target(attr), &linux_param);
+}
+
+int pthread_attr_getschedparam(const pthread_attr_t* attr,
+                               struct sched_param* sched_param)
+{
+	static int (*real_pthread_attr_getschedparam)(const pthread_attr_t*,
+		struct sched_param*) = NULL;
+	int result;
+
+	if (!real_pthread_attr_getschedparam)
+		real_pthread_attr_getschedparam = dlsym(RTLD_NEXT, "pthread_attr_getschedparam");
+	if (!real_pthread_attr_getschedparam || !sched_param)
+		return EINVAL;
+
+	result = real_pthread_attr_getschedparam(
+		pthread_attr_target((pthread_attr_t*)attr), sched_param);
+	return result;
+}
+
+int pthread_attr_setschedpolicy(pthread_attr_t* attr, int policy)
+{
+	static int (*real_pthread_attr_setschedpolicy)(pthread_attr_t*, int) = NULL;
+	int linux_policy;
+
+	if (!real_pthread_attr_setschedpolicy)
+		real_pthread_attr_setschedpolicy = dlsym(RTLD_NEXT, "pthread_attr_setschedpolicy");
+	if (!real_pthread_attr_setschedpolicy)
+		return ENOSYS;
+
+	switch (policy) {
+	case 1:
+		linux_policy = SCHED_OTHER;
+		break;
+	case 2:
+		linux_policy = SCHED_FIFO;
+		break;
+	case 3:
+		linux_policy = SCHED_RR;
+		break;
+	default:
+		return EINVAL;
+	}
+	return real_pthread_attr_setschedpolicy(pthread_attr_target(attr), linux_policy);
+}
+
+int pthread_attr_setstack(pthread_attr_t* attr, void* stack_base,
+                          size_t stack_size)
+{
+	static int (*real_pthread_attr_setstack)(pthread_attr_t*, void*, size_t) = NULL;
+
+	if (!real_pthread_attr_setstack)
+		real_pthread_attr_setstack = dlsym(RTLD_NEXT, "pthread_attr_setstack");
+	if (!real_pthread_attr_setstack)
+		return ENOSYS;
+	return real_pthread_attr_setstack(pthread_attr_target(attr), stack_base,
+	                                   stack_size);
 }
 
 static struct shim_thread_start_context* alloc_thread_start_context(
@@ -9344,8 +9514,8 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
 {
 	static int (*real_pthread_create)(pthread_t*, const pthread_attr_t*,
 	                                  void* (*)(void*), void*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
 	struct shim_thread_start_context* context;
+	pthread_attr_t native_attr;
 	int result;
 
 	if (!real_pthread_create)
@@ -9355,11 +9525,26 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
 	context = alloc_thread_start_context(start_routine, arg);
 	if (!context)
 		return EAGAIN;
+
+	lock_pthread_attr_slots();
+	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
+	unlock_pthread_attr_slots();
+
+	pthread_attr_t* native = slot ? &slot->native : NULL;
+	if (!native && attr) {
+		if (shim_trace_enabled())
+			fprintf(stderr, "libsystem_shim: pthread_create unregistered attr=%p replaced with default\n",
+			        attr);
+		if (real_pthread_attr_init_for_create(&native_attr) == 0)
+			native = &native_attr;
+		else
+			native = NULL;
+	}
+
 	if (shim_trace_enabled())
 		fprintf(stderr, "libsystem_shim: pthread_create(start=%p arg=%p attr=%p native=%p)\n",
-		        start_routine, arg, attr, slot ? (void*)&slot->native : NULL);
-	result = real_pthread_create(thread, slot ? &slot->native : attr,
-	                             shim_pthread_start, context);
+		        start_routine, arg, attr, (void*)native);
+	result = real_pthread_create(thread, native, shim_pthread_start, context);
 	if (result != 0) {
 		if (shim_trace_enabled())
 			fprintf(stderr, "libsystem_shim: pthread_create FAILED result=%d attr=%p slot=%p\n",
@@ -9367,9 +9552,8 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
 		free_thread_start_context(context);
 		return result;
 	}
-	if (!slot && attr && shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_create unregistered attr=%p passed raw\n",
-		        attr);
+	if (native == &native_attr)
+		real_pthread_attr_destroy_for_create(&native_attr);
 	pthread_identity_for_thread(*thread);
 	return 0;
 }
