@@ -12396,6 +12396,7 @@ void _Unwind_Resume(void* exception_object)
 #define DARWIN_F_GETPATH    50  /* implement via /proc */
 #define DARWIN_F_FULLFSYNC  51  /* implement via fsync */
 #define DARWIN_F_DUPFD_CLOEXEC 67
+#define DARWIN_F_PREALLOCATE 42  /* implement via fallocate/ftruncate */
 
 #define DARWIN_FIOCLEX      0x20006601u
 #define DARWIN_FIONCLEX     0x20006602u
@@ -12727,10 +12728,39 @@ static int shim_fcntl_fixed(int fd, int cmd, unsigned long arg)
 	case DARWIN_F_DUPFD_CLOEXEC:
 		linux_cmd = F_DUPFD_CLOEXEC;
 		break;
-	case DARWIN_F_FULLFSYNC:
-		/* Best-effort: Linux fsync flushes data + metadata */
-		return fsync(fd);
-	case DARWIN_F_NOCACHE:
+ 	case DARWIN_F_FULLFSYNC:
+ 		/* Best-effort: Linux fsync flushes data + metadata */
+ 		return fsync(fd);
+	case DARWIN_F_PREALLOCATE: {
+		struct darwin_fstore_shim {
+			uint32_t fst_flags;
+			int32_t fst_posmode;
+			int64_t fst_offset;
+			int64_t fst_length;
+			int32_t fst_bytesalloc;
+			int32_t fst_pad;
+		};
+		const struct darwin_fstore_shim* store =
+		    (const struct darwin_fstore_shim*)arg;
+		if (!store)
+			return -1;
+		struct stat file_stat;
+		if (fstat(fd, &file_stat) != 0)
+			return -1;
+		if (store->fst_posmode != 3 && store->fst_posmode != 0)
+			return -1;
+		off_t allocate_from = store->fst_posmode == 3
+		                          ? file_stat.st_size
+		                          : store->fst_offset;
+		off_t allocate_end = allocate_from + store->fst_length;
+		if (store->fst_flags & 0x04) {
+			if (allocate_end > file_stat.st_size)
+				return ftruncate(fd, allocate_end);
+			return 0;
+		}
+		return posix_fallocate(fd, allocate_from, store->fst_length);
+	}
+ 	case DARWIN_F_NOCACHE:
 	case DARWIN_F_RDADVISE:
 	case DARWIN_F_RDAHEAD:
 		/* No Linux equivalent; succeed silently */
@@ -15475,6 +15505,14 @@ enum shim_objc_kind {
 	SHIM_OBJC_CLASS_NSSTRING,
 	SHIM_OBJC_STRING,
 	SHIM_OBJC_ARRAY,
+	SHIM_OBJC_CLASS_NSHTTPCOOKIE,
+	SHIM_OBJC_INSTANCE_NSHTTPCOOKIE,
+	SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE,
+	SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE,
+	SHIM_OBJC_CLASS_NSURL,
+	SHIM_OBJC_INSTANCE_NSURL,
+	SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY,
+	SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY,
 };
 
 struct shim_objc_header {
@@ -15493,6 +15531,27 @@ struct shim_objc_array {
 	struct shim_objc_string* elements[];
 };
 
+struct shim_cookie {
+	char name[256];
+	char value[2048];
+	char domain[256];
+	char path[1024];
+	int secure;
+	int http_only;
+};
+
+struct shim_objc_cookie {
+	struct shim_objc_header header;
+	struct shim_cookie cookie;
+};
+
+struct shim_objc_dictionary {
+	struct shim_objc_header header;
+	uint32_t pair_count;
+	uint32_t pair_capacity;
+	struct shim_objc_string* keys[];
+};
+
 struct shim_objc_header OBJC_CLASS_$_NSProcessInfo = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSPROCESSINFO,
 };
@@ -15501,9 +15560,33 @@ struct shim_objc_header OBJC_CLASS_$_NSString = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSSTRING,
 };
 
+struct shim_objc_header OBJC_CLASS_$_NSHTTPCookie = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSHTTPCOOKIE,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSHTTPCookieStorage = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSURL = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSURL,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSMutableDictionary = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY,
+};
+
 static struct shim_objc_header shim_processinfo_singleton = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSPROCESSINFO,
 };
+
+static struct shim_objc_header shim_cookie_storage_singleton = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE,
+};
+
+static pthread_mutex_t shim_cookie_jar_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct shim_cookie shim_cookie_jar[256];
+static uint32_t shim_cookie_jar_count;
 
 static const uint32_t shim_objc_os_version[3] = {15, 0, 0};
 
@@ -15608,6 +15691,359 @@ static const char* shim_objc_string_utf8(void* object)
 	return chars;
 }
 
+static void shim_parse_url_host(const char* url, char* host, size_t host_size)
+{
+	const char* scheme_end = strstr(url, "://");
+	const char* host_start = scheme_end ? scheme_end + 3 : url;
+	const char* host_end = strchr(host_start, '/');
+
+	if (!host_end)
+		host_end = host_start + strlen(host_start);
+	if (!host_end)
+		host_end = host_start;
+	size_t length = (size_t)(host_end - host_start);
+	if (length >= host_size)
+		length = host_size - 1;
+	memcpy(host, host_start, length);
+	host[length] = '\0';
+}
+
+static int shim_domain_matches_host(const char* domain, const char* host)
+{
+	size_t domain_length = strlen(domain);
+	size_t host_length = strlen(host);
+
+	if (domain_length == 0 || host_length == 0)
+		return 0;
+
+	if (strcmp(domain, host) == 0)
+		return 1;
+
+	if (domain[0] != '.')
+		return 0;
+
+	if (host_length >= domain_length &&
+	    strcmp(host + host_length - domain_length, domain) == 0)
+		return 1;
+
+	return host_length + 1 == domain_length &&
+	       strncmp(domain + 1, host, host_length) == 0;
+}
+
+static void shim_copy_cstring(char* destination, size_t destination_size,
+                              const char* source)
+{
+	size_t length = strlen(source);
+
+	if (length >= destination_size)
+		length = destination_size - 1;
+	memcpy(destination, source, length);
+	destination[length] = '\0';
+}
+
+static int shim_cookie_equals(const struct shim_cookie* left,
+                              const struct shim_cookie* right)
+{
+	return strcmp(left->name, right->name) == 0 &&
+	       strcmp(left->domain, right->domain) == 0 &&
+	       strcmp(left->path, right->path) == 0;
+}
+
+static void shim_cookie_jar_remove(const struct shim_cookie* cookie)
+{
+	for (uint32_t index = 0; index < shim_cookie_jar_count; index++) {
+		if (!shim_cookie_equals(&shim_cookie_jar[index], cookie))
+			continue;
+		for (uint32_t shift = index; shift + 1 < shim_cookie_jar_count; shift++)
+			shim_cookie_jar[shift] = shim_cookie_jar[shift + 1];
+		shim_cookie_jar_count--;
+		return;
+	}
+}
+
+static void shim_cookie_jar_store(const struct shim_cookie* cookie)
+{
+	shim_cookie_jar_remove(cookie);
+	if (shim_cookie_jar_count >= 256)
+		return;
+	shim_cookie_jar[shim_cookie_jar_count++] = *cookie;
+}
+
+static void* shim_objc_make_cookie(const struct shim_cookie* cookie)
+{
+	struct shim_objc_cookie* result = malloc(sizeof(*result));
+
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_INSTANCE_NSHTTPCOOKIE;
+	result->cookie = *cookie;
+	return result;
+}
+
+static void* shim_objc_make_url(const char* url)
+{
+	struct shim_objc_string* result =
+		shim_objc_make_string(url);
+
+	if (!result)
+		return NULL;
+	result->header.kind = SHIM_OBJC_INSTANCE_NSURL;
+	return result;
+}
+
+static const char* shim_objc_url_string(void* url)
+{
+	if (!shim_objc_is_object(url, SHIM_OBJC_INSTANCE_NSURL))
+		return NULL;
+	return ((struct shim_objc_string*)url)->utf8;
+}
+
+static void* shim_objc_make_dictionary(struct shim_objc_string** keys,
+                                       struct shim_objc_string** values,
+                                       uint32_t pair_count)
+{
+	uint32_t capacity = pair_count < 8 ? 8 : pair_count;
+	struct shim_objc_dictionary* result =
+		malloc(sizeof(*result) + sizeof(*keys) * 2 * capacity);
+
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY;
+	result->pair_count = pair_count;
+	result->pair_capacity = capacity;
+	for (uint32_t pair_index = 0; pair_index < pair_count; pair_index++) {
+		result->keys[pair_index * 2] = keys[pair_index];
+		result->keys[pair_index * 2 + 1] = values[pair_index];
+	}
+	return result;
+}
+
+static void* shim_cookie_jar_matching_array(const char* url)
+{
+	char host[256];
+	struct shim_objc_cookie** cookies;
+	uint32_t match_count = 0;
+
+	shim_parse_url_host(url ? url : "", host, sizeof(host));
+	cookies = malloc(sizeof(*cookies) * (shim_cookie_jar_count ? shim_cookie_jar_count : 1));
+	if (!cookies)
+		return NULL;
+
+	for (uint32_t index = 0; index < shim_cookie_jar_count; index++) {
+		if (!shim_domain_matches_host(shim_cookie_jar[index].domain, host))
+			continue;
+		void* cookie = shim_objc_make_cookie(&shim_cookie_jar[index]);
+		if (!cookie)
+			continue;
+		cookies[match_count++] = cookie;
+	}
+
+	struct shim_objc_array* result =
+		malloc(sizeof(*result) + sizeof(*cookies) * (match_count ? match_count : 1));
+	if (!result) {
+		free(cookies);
+		return NULL;
+	}
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_ARRAY;
+	result->count = match_count;
+	for (uint32_t index = 0; index < match_count; index++)
+		((struct shim_objc_string**)result->elements)[index] =
+			(struct shim_objc_string*)cookies[index];
+	free(cookies);
+	return result;
+}
+
+static void* shim_cookie_jar_all_array(void)
+{
+	struct shim_objc_array* result =
+		malloc(sizeof(*result) +
+		       sizeof(struct shim_objc_string*) * (shim_cookie_jar_count ? shim_cookie_jar_count : 1));
+
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_ARRAY;
+	result->count = shim_cookie_jar_count;
+	for (uint32_t index = 0; index < shim_cookie_jar_count; index++) {
+		void* cookie = shim_objc_make_cookie(&shim_cookie_jar[index]);
+		if (!cookie)
+			cookie = shim_objc_make_string("");
+		((struct shim_objc_string**)result->elements)[index] = cookie;
+	}
+	return result;
+}
+
+static void shim_parse_set_cookie_header(const char* header, struct shim_cookie* cookie)
+{
+	const char* separator = strchr(header, ';');
+	size_t name_value_length = separator ? (size_t)(separator - header) : strlen(header);
+	char name_value[2304];
+	const char* equals_sign;
+
+	if (name_value_length >= sizeof(name_value))
+		name_value_length = sizeof(name_value) - 1;
+	memcpy(name_value, header, name_value_length);
+	name_value[name_value_length] = '\0';
+
+	memset(cookie, 0, sizeof(*cookie));
+	shim_copy_cstring(cookie->path, sizeof(cookie->path), "/");
+
+	equals_sign = strchr(name_value, '=');
+	if (!equals_sign) {
+		shim_copy_cstring(cookie->name, sizeof(cookie->name), name_value);
+		return;
+	}
+	size_t name_length = (size_t)(equals_sign - name_value);
+	if (name_length >= sizeof(cookie->name))
+		name_length = sizeof(cookie->name) - 1;
+	memcpy(cookie->name, name_value, name_length);
+	cookie->name[name_length] = '\0';
+	shim_copy_cstring(cookie->value, sizeof(cookie->value), equals_sign + 1);
+
+	const char* attribute = separator;
+	while (attribute) {
+		attribute++;
+		while (*attribute == ' ')
+			attribute++;
+		if (strncasecmp(attribute, "domain=", 7) == 0) {
+			const char* domain = attribute + 7;
+			char domain_buffer[254];
+			size_t domain_length = 0;
+			while (domain[domain_length] && domain[domain_length] != ';' &&
+			       domain_length < sizeof(domain_buffer) - 1) {
+				domain_buffer[domain_length] = domain[domain_length];
+				domain_length++;
+			}
+			domain_buffer[domain_length] = '\0';
+			if (domain_length > 0) {
+				if (domain_buffer[0] == '.')
+					shim_copy_cstring(cookie->domain, sizeof(cookie->domain),
+					                  domain_buffer);
+				else
+					snprintf(cookie->domain, sizeof(cookie->domain), ".%s",
+					         domain_buffer);
+			}
+		} else if (strncasecmp(attribute, "path=", 5) == 0) {
+			const char* path = attribute + 5;
+			size_t path_length = 0;
+			while (path[path_length] && path[path_length] != ';' &&
+			       path_length < sizeof(cookie->path) - 1) {
+				cookie->path[path_length] = path[path_length];
+				path_length++;
+			}
+			cookie->path[path_length] = '\0';
+		} else if (strncasecmp(attribute, "secure", 6) == 0) {
+			cookie->secure = 1;
+		} else if (strncasecmp(attribute, "httponly", 8) == 0) {
+			cookie->http_only = 1;
+		}
+		attribute = strchr(attribute, ';');
+	}
+}
+
+static void* shim_parse_response_header_cookies(void* header_fields, void* url)
+{
+	const struct shim_objc_dictionary* fields = header_fields;
+	const char* set_cookie_value = NULL;
+	const char* url_text = shim_objc_url_string(url);
+	struct shim_cookie cookie;
+	char host[256];
+
+	if (!fields || !shim_objc_is_object(fields, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY))
+		return NULL;
+
+	for (uint32_t pair_index = 0; pair_index < fields->pair_count; pair_index++) {
+		const char* key = shim_objc_string_utf8(fields->keys[pair_index * 2]);
+		if (key && strcasecmp(key, "Set-Cookie") == 0) {
+			set_cookie_value = shim_objc_string_utf8(fields->keys[pair_index * 2 + 1]);
+			break;
+		}
+	}
+	if (!set_cookie_value)
+		return NULL;
+
+	shim_parse_set_cookie_header(set_cookie_value, &cookie);
+	if (cookie.domain[0] == '\0') {
+		shim_parse_url_host(url_text ? url_text : "", host, sizeof(host));
+		shim_copy_cstring(cookie.domain, sizeof(cookie.domain), host);
+	}
+
+	struct shim_objc_array* result =
+		malloc(sizeof(*result) + sizeof(struct shim_objc_string*));
+	if (!result)
+		return NULL;
+	result->header.magic = SHIM_OBJC_MAGIC;
+	result->header.kind = SHIM_OBJC_ARRAY;
+	result->count = 1;
+	result->elements[0] = shim_objc_make_cookie(&cookie);
+	if (!result->elements[0]) {
+		free(result);
+		return NULL;
+	}
+	return result;
+}
+
+static void* shim_cookie_request_header_fields(void* cookies_array)
+{
+	struct shim_objc_array* array = cookies_array;
+	char* joined = NULL;
+	size_t joined_length = 0;
+	void* result;
+
+	if (!array || !shim_objc_is_object(array, SHIM_OBJC_ARRAY) || array->count == 0)
+		return NULL;
+
+	for (uint32_t index = 0; index < array->count; index++) {
+		struct shim_objc_cookie* cookie = (struct shim_objc_cookie*)array->elements[index];
+		if (!cookie || !shim_objc_is_object(cookie, SHIM_OBJC_INSTANCE_NSHTTPCOOKIE))
+			continue;
+		size_t entry_length = strlen(cookie->cookie.name) + 1 +
+		                      strlen(cookie->cookie.value) + 3;
+		size_t separator_length = joined_length > 0 ? 2 : 0;
+		size_t needed = joined_length + separator_length + entry_length;
+		char* reallocated = realloc(joined, needed);
+		if (!reallocated) {
+			free(joined);
+			return NULL;
+		}
+		joined = reallocated;
+		if (separator_length == 2) {
+			joined[joined_length++] = ';';
+			joined[joined_length++] = ' ';
+		}
+		int written = snprintf(joined + joined_length, needed - joined_length,
+		                       "%s=%s", cookie->cookie.name, cookie->cookie.value);
+		if (written < 0) {
+			free(joined);
+			return NULL;
+		}
+		joined_length += (size_t)written;
+	}
+	if (!joined)
+		return NULL;
+
+	struct shim_objc_string* header_value = shim_objc_make_string(joined);
+	free(joined);
+	if (!header_value)
+		return NULL;
+
+	struct shim_objc_string* header_key = shim_objc_make_string("Cookie");
+	if (!header_key) {
+		free(header_value);
+		return NULL;
+	}
+
+	result = shim_objc_make_dictionary(&header_key, &header_value, 1);
+	if (!result) {
+		free(header_key);
+		free(header_value);
+	}
+	return result;
+}
+
 void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t a3,
                              uintptr_t a4, uintptr_t a5, uintptr_t a6, void* sret)
 {
@@ -15652,6 +16088,38 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 	} else if (strcmp(selector, "count") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY))
 			return (void*)(uintptr_t)((struct shim_objc_array*)receiver)->count;
+	} else if (strcmp(selector, "countByEnumeratingWithState:objects:count:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
+			struct shim_objc_array* array = receiver;
+			struct {
+				unsigned long state;
+				void** items_ptr;
+				unsigned long* mutations_ptr;
+				unsigned long extra[5];
+			}* enumeration_state = (void*)a2;
+			void** buffer = (void**)a3;
+			unsigned long buffer_capacity = (unsigned long)a4;
+			unsigned long copied = 0;
+
+			if (!enumeration_state || !buffer || buffer_capacity == 0)
+				return NULL;
+			if (array->count == 0)
+				return NULL;
+
+			if (enumeration_state->state == 0) {
+				enumeration_state->state = 1;
+				enumeration_state->extra[0] = 0;
+				enumeration_state->mutations_ptr = &enumeration_state->extra[0];
+				for (uint32_t index = 0; index < array->count && index < buffer_capacity; index++)
+					buffer[index] = array->elements[index];
+				copied = array->count < buffer_capacity ? array->count : buffer_capacity;
+				enumeration_state->items_ptr = buffer;
+			} else {
+				enumeration_state->state = 0;
+				copied = 0;
+			}
+			return (void*)(uintptr_t)copied;
+		}
 	} else if (strcmp(selector, "objectAtIndex:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_ARRAY)) {
 			const struct shim_objc_array* array = receiver;
@@ -15669,6 +16137,171 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			const struct shim_objc_array* array = receiver;
 			if (array->count > 0)
 				return array->elements[array->count - 1];
+		}
+	} else if (strcmp(selector, "sharedHTTPCookieStorage") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE))
+			return &shim_cookie_storage_singleton;
+	} else if (strcmp(selector, "cookies") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE)) {
+			pthread_mutex_lock(&shim_cookie_jar_mutex);
+			void* result = shim_cookie_jar_all_array();
+			pthread_mutex_unlock(&shim_cookie_jar_mutex);
+			return result;
+		}
+	} else if (strcmp(selector, "cookiesForURL:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE)) {
+			const char* url_text = shim_objc_url_string((void*)a2);
+			pthread_mutex_lock(&shim_cookie_jar_mutex);
+			void* result = shim_cookie_jar_matching_array(url_text);
+			pthread_mutex_unlock(&shim_cookie_jar_mutex);
+			return result;
+		}
+	} else if (strcmp(selector, "setCookies:forURL:mainDocumentURL:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE)) {
+			const struct shim_objc_array* array = (const struct shim_objc_array*)a2;
+			const char* url_text = shim_objc_url_string((void*)a3);
+			if (array && shim_objc_is_object(array, SHIM_OBJC_ARRAY)) {
+				pthread_mutex_lock(&shim_cookie_jar_mutex);
+				for (uint32_t index = 0; index < array->count; index++) {
+					const struct shim_objc_cookie* cookie =
+						(const struct shim_objc_cookie*)array->elements[index];
+					if (!cookie ||
+					    !shim_objc_is_object(cookie, SHIM_OBJC_INSTANCE_NSHTTPCOOKIE))
+						continue;
+					struct shim_cookie stored = cookie->cookie;
+					if (stored.domain[0] == '\0' && url_text) {
+						char host[256];
+						shim_parse_url_host(url_text, host, sizeof(host));
+						shim_copy_cstring(stored.domain, sizeof(stored.domain), host);
+					}
+					shim_cookie_jar_store(&stored);
+				}
+				pthread_mutex_unlock(&shim_cookie_jar_mutex);
+			}
+			return NULL;
+		}
+	} else if (strcmp(selector, "deleteCookie:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE)) {
+			const struct shim_objc_cookie* cookie =
+				(const struct shim_objc_cookie*)a2;
+			if (cookie && shim_objc_is_object(cookie, SHIM_OBJC_INSTANCE_NSHTTPCOOKIE)) {
+				pthread_mutex_lock(&shim_cookie_jar_mutex);
+				shim_cookie_jar_remove(&cookie->cookie);
+				pthread_mutex_unlock(&shim_cookie_jar_mutex);
+			}
+			return NULL;
+		}
+	} else if (strcmp(selector, "cookiesWithResponseHeaderFields:forURL:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSHTTPCOOKIE))
+			return shim_parse_response_header_cookies((void*)a2, (void*)a3);
+	} else if (strcmp(selector, "requestHeaderFieldsWithCookies:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSHTTPCOOKIE))
+			return shim_cookie_request_header_fields((void*)a2);
+	} else if (strcmp(selector, "name") == 0) {
+		const struct shim_objc_cookie* cookie = receiver;
+		if (shim_objc_is_object(cookie, SHIM_OBJC_INSTANCE_NSHTTPCOOKIE))
+			return shim_objc_make_string(cookie->cookie.name);
+	} else if (strcmp(selector, "value") == 0) {
+		const struct shim_objc_cookie* cookie = receiver;
+		if (shim_objc_is_object(cookie, SHIM_OBJC_INSTANCE_NSHTTPCOOKIE))
+			return shim_objc_make_string(cookie->cookie.value);
+	} else if (strcmp(selector, "URLWithString:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSURL)) {
+			const char* url_text = shim_objc_string_utf8((void*)a2);
+			if (!url_text)
+				return NULL;
+			return shim_objc_make_url(url_text);
+		}
+	} else if (strcmp(selector, "dictionary") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY)) {
+			struct shim_objc_string** no_keys = NULL;
+			struct shim_objc_string** no_values = NULL;
+			return shim_objc_make_dictionary(no_keys, no_values, 0);
+		}
+	} else if (strcmp(selector, "setObject:forKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
+			struct shim_objc_dictionary* dict = receiver;
+			uint32_t pair_index;
+			for (pair_index = 0; pair_index < dict->pair_count; pair_index++) {
+				const char* key = shim_objc_string_utf8(dict->keys[pair_index * 2]);
+				const char* new_key = shim_objc_string_utf8((void*)a3);
+				if (key && new_key && strcmp(key, new_key) == 0) {
+					dict->keys[pair_index * 2 + 1] = (struct shim_objc_string*)a2;
+					return NULL;
+				}
+			}
+			if (dict->pair_count < dict->pair_capacity) {
+				dict->keys[dict->pair_count * 2] = (struct shim_objc_string*)a3;
+				dict->keys[dict->pair_count * 2 + 1] = (struct shim_objc_string*)a2;
+				dict->pair_count++;
+			}
+			return NULL;
+		}
+	} else if (strcmp(selector, "objectForKeyedSubscript:") == 0 ||
+	           strcmp(selector, "objectForKey:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
+			const struct shim_objc_dictionary* dict = receiver;
+			const char* wanted_key = shim_objc_string_utf8((void*)a2);
+			if (!wanted_key)
+				return NULL;
+			for (uint32_t pair_index = 0; pair_index < dict->pair_count; pair_index++) {
+				const char* key = shim_objc_string_utf8(dict->keys[pair_index * 2]);
+				if (key && strcmp(key, wanted_key) == 0)
+					return dict->keys[pair_index * 2 + 1];
+			}
+			return NULL;
+		}
+	} else if (strcmp(selector, "alloc") == 0 ||
+	           strcmp(selector, "allocWithZone:") == 0 ||
+	           strcmp(selector, "new") == 0) {
+		return shim_objc_make_string("");
+	} else if (strcmp(selector, "init") == 0) {
+		return receiver;
+	} else if (strcmp(selector, "initWithBytes:length:encoding:") == 0) {
+		const char* bytes = (const char*)a2;
+		size_t byte_length = (size_t)a3;
+		struct shim_objc_string* result;
+		if (!bytes || byte_length > (1 << 20))
+			return NULL;
+		result = malloc(sizeof(*result) + byte_length + 1);
+		if (!result)
+			return NULL;
+		result->header.magic = SHIM_OBJC_MAGIC;
+		result->header.kind = SHIM_OBJC_STRING;
+		memcpy(result->utf8, bytes, byte_length);
+		result->utf8[byte_length] = '\0';
+		return result;
+	} else if (strcmp(selector, "initWithUTF8String:") == 0) {
+		if (!a2)
+			return NULL;
+		return shim_objc_make_string((const char*)a2);
+	} else if (strcmp(selector, "stringWithUTF8String:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSSTRING)) {
+			if (!a2)
+				return NULL;
+			return shim_objc_make_string((const char*)a2);
+		}
+	} else if (strcmp(selector, "hasPrefix:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
+			const char* prefix = shim_objc_string_utf8((void*)a2);
+			const char* text = ((struct shim_objc_string*)receiver)->utf8;
+			if (!prefix)
+				return NULL;
+			return (void*)(uintptr_t)(strncmp(text, prefix, strlen(prefix)) == 0);
+		}
+	} else if (strcmp(selector, "substringFromIndex:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
+			const char* text = ((struct shim_objc_string*)receiver)->utf8;
+			size_t length = strlen(text);
+			if (a2 > length)
+				return NULL;
+			return shim_objc_make_string(text + a2);
+		}
+	} else if (strcmp(selector, "isEqualToString:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
+			const char* other = shim_objc_string_utf8((void*)a2);
+			const char* text = ((struct shim_objc_string*)receiver)->utf8;
+			return (void*)(uintptr_t)(other && strcmp(text, other) == 0);
 		}
 	}
 
@@ -15703,6 +16336,15 @@ void* objc_getClass(const char* name)
 		return &OBJC_CLASS_$_NSProcessInfo;
 	if (strcmp(name, "NSString") == 0)
 		return &OBJC_CLASS_$_NSString;
+	if (strcmp(name, "NSHTTPCookie") == 0)
+		return &OBJC_CLASS_$_NSHTTPCookie;
+	if (strcmp(name, "NSHTTPCookieStorage") == 0)
+		return &OBJC_CLASS_$_NSHTTPCookieStorage;
+	if (strcmp(name, "NSURL") == 0)
+		return &OBJC_CLASS_$_NSURL;
+	if (strcmp(name, "NSMutableDictionary") == 0 ||
+	    strcmp(name, "NSDictionary") == 0)
+		return &OBJC_CLASS_$_NSMutableDictionary;
 	if (shim_trace_enabled())
 		fprintf(stderr, "libsystem_shim: objc_getClass unknown '%s'\n", name);
 	return NULL;
@@ -15711,6 +16353,17 @@ void* objc_getClass(const char* name)
 void* objc_lookUpClass(const char* name)
 {
 	return objc_getClass(name);
+}
+
+void* objc_alloc(void* class_object)
+{
+	return shim_objc_make_string("");
+}
+
+void* objc_allocWithZone(void* class_object, void* zone)
+{
+	(void)zone;
+	return shim_objc_make_string("");
 }
 
 void* objc_retain(void* object)
@@ -15731,6 +16384,31 @@ void* objc_autorelease(void* object)
 void* objc_retainAutoreleasedReturnValue(void* object)
 {
 	return object;
+}
+
+void* objc_retainAutorelease(void* object)
+{
+	return object;
+}
+
+void* objc_retainAutoreleaseReturnValue(void* object)
+{
+	return object;
+}
+
+void* objc_autoreleasePoolPush(void)
+{
+	return (void*)(uintptr_t)1;
+}
+
+void objc_autoreleasePoolPop(void* pool)
+{
+	(void)pool;
+}
+
+void objc_enumerationMutation(void* object)
+{
+	(void)object;
 }
 
 void* objc_autoreleaseReturnValue(void* object)

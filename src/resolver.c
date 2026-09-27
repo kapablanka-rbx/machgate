@@ -712,6 +712,27 @@ static uintptr_t resolve_asan_data_symbol(const char* sym_name)
 	return 0;
 }
 
+static int is_shim_objc_class_symbol(const char* sym_name)
+{
+	const char* class_marker = strstr(sym_name, "OBJC_CLASS_$_");
+
+	return class_marker == sym_name || class_marker == sym_name + 1;
+}
+
+static uintptr_t resolve_shim_objc_class_symbol(const char* sym_name)
+{
+	const char* lookup = sym_name;
+
+	if (lookup[0] == '_')
+		lookup++;
+
+	void* class_object = dlsym(RTLD_DEFAULT, lookup);
+
+	if (!class_object)
+		return 0;
+	return (uintptr_t)class_object;
+}
+
 static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
                                                 const char* sym_name)
 {
@@ -729,6 +750,8 @@ static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
 	    strcmp(sym_name, "_NSPasteboardTypeString") == 0)
 		return (uintptr_t)&ns_pasteboard_type_string;
 
+	if (is_shim_objc_class_symbol(sym_name))
+		return resolve_shim_objc_class_symbol(sym_name);
 	if (strstr(de->name, "libclang_rt.asan"))
 		return resolve_asan_data_symbol(sym_name);
 
