@@ -40,6 +40,13 @@ GLIBC_2.17 {
         OBJC_CLASS_$_NSCharacterSet;
         OBJC_CLASS_$_NSURLComponents;
         OBJC_CLASS_$_NSDate;
+        OBJC_CLASS_$_NSNumber;
+        OBJC_CLASS_$_NSArray;
+        OBJC_CLASS_$_NSDictionary;
+        OBJC_CLASS_$_NSJSONSerialization;
+        __NSDictionary0__;
+        __NSArray0__;
+        __CFConstantStringClassReference;
         NSHTTPCookieDomain;
         NSHTTPCookieExpires;
         NSHTTPCookieName;

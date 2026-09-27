@@ -77,6 +77,7 @@ extern char **environ;
 
 static int shim_hw_ncpu(void);
 static int shim_trace_enabled(void);
+static int shim_objc_msgsend_trace_enabled(void);
 static int shim_cxx_init_full_trace_enabled(void);
 static int shim_delta_vm_trace_enabled(void);
 static int shim_wait_trace_enabled(void);
@@ -12734,6 +12735,9 @@ void* dispatch_queue_create(const char *label, void *attr)
 	if (label) strncpy(q->label, label, sizeof(q->label) - 1);
 	pthread_mutex_init(&q->mutex, NULL);
 	pthread_cond_init(&q->cond, NULL);
+	if (shim_objc_msgsend_trace_enabled())
+		fprintf(stderr, "libsystem_shim: dispatch_queue_create(%s) -> %p\n",
+		        label ? label : "(nil)", q);
 	return q;
 }
 
@@ -12851,6 +12855,11 @@ void dispatch_async(void *queue, void *block)
 	struct dispatch_queue* serial = queue;
 	struct dispatch_work_item* item;
 	void* owned;
+
+	if (shim_objc_msgsend_trace_enabled())
+		fprintf(stderr,
+		        "libsystem_shim: dispatch_async(queue=%p, block=%p) caller=%p\n",
+		        queue, block, MACHGATE_SHIM_CALLER());
 
 	if (shim_trace_enabled() && serial && serial->type == DISPATCH_OBJ_QUEUE)
 		fprintf(stderr, "libsystem_shim: dispatch_async queue=%s block=%p\n",
@@ -17262,6 +17271,17 @@ static void* guest_objc_alloc_instance(void* class_object)
 	return instance;
 }
 
+static int shim_objc_msgsend_trace_enabled(void)
+{
+	static int cached_result = -1;
+
+	if (cached_result < 0) {
+		const char* value = getenv("MACHGATE_TRACE_OBJC_MSGSEND");
+		cached_result = value && value[0] && strcmp(value, "0") != 0;
+	}
+	return cached_result;
+}
+
 static int shim_objc_guest_handled(void* receiver)
 {
 	void* class_ptr;
@@ -17813,6 +17833,18 @@ struct shim_objc_header OBJC_CLASS_$_NSJSONSerialization = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSJSONSERIALIZATION,
 };
 
+void* __NSDictionary0__;
+void* __NSArray0__;
+
+__attribute__((constructor))
+static void shim_init_empty_collection_singletons(void)
+{
+	if (!__NSDictionary0__)
+		__NSDictionary0__ = shim_objc_make_dictionary(NULL, NULL, 0);
+	if (!__NSArray0__)
+		__NSArray0__ = shim_objc_make_array(NULL, 0);
+}
+
 static void* shim_objc_make_number(long long integer_value)
 {
 	struct shim_objc_number* result = malloc(sizeof(*result));
@@ -17902,6 +17934,26 @@ static void shim_json_escape_append(const char* text, char* out,
 
 static char* shim_json_serialize_object(void* object, int depth);
 
+static int shim_json_serializable(const void* object)
+{
+	if (!object)
+		return 1;
+	if (!guest_objc_readable(object, sizeof(struct shim_objc_header)))
+		return 0;
+	if (shim_objc_is_object((void*)object, SHIM_OBJC_STRING) ||
+	    shim_objc_is_object((void*)object, SHIM_OBJC_INSTANCE_NSNUMBER) ||
+	    shim_objc_is_object((void*)object, SHIM_OBJC_ARRAY) ||
+	    shim_objc_is_object((void*)object,
+	                        SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY))
+		return 1;
+	const char* chars = *(const char**)((const char*)object + 16);
+	size_t length = *(const size_t*)((const char*)object + 24);
+	if ((uintptr_t)chars > 0x1000 && length > 0 && length <= (1 << 20) &&
+	    guest_objc_readable(chars, length + 1) && chars[length] == '\0')
+		return 1;
+	return 0;
+}
+
 static char* shim_json_serialize_object(void* object, int depth)
 {
 	size_t capacity = 4096;
@@ -17910,6 +17962,17 @@ static char* shim_json_serialize_object(void* object, int depth)
 
 	if (depth > 8)
 		return NULL;
+	if (!shim_json_serializable(object)) {
+		if (object && guest_objc_readable(object, sizeof(void*))) {
+			void* class_ptr = *(void**)object;
+			if (guest_objc_find_class(class_ptr))
+				return NULL;
+		}
+		if (!object)
+			object = NULL;
+		else
+			return NULL;
+	}
 	out = malloc(capacity);
 	if (!out)
 		return NULL;
@@ -18532,14 +18595,15 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 		void* trace_isa = guest_objc_readable(receiver, sizeof(void*))
 			? *(void**)receiver : NULL;
 		fprintf(stderr,
-		        "libsystem_shim: objc_msgSend [%s] recv=%p isa=%p\n",
-		        selector, receiver, trace_isa);
+		        "libsystem_shim: objc_msgSend [%s] recv=%p isa=%p a2=%p a3=%p a4=%p a5=%p a6=%p a7=%p\n",
+		        selector, receiver, trace_isa, (void*)a2, (void*)a3,
+		        (void*)a4, (void*)a5, (void*)a6, (void*)a7);
 	}
 
 	guest_result = shim_objc_try_guest_dispatch(receiver, selector, sret,
 	                                            register_args,
 	                                            guest_stack_args);
-	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND") && shim_objc_guest_handled(receiver))
+	if (shim_objc_msgsend_trace_enabled() && shim_objc_guest_handled(receiver))
 		fprintf(stderr,
 		        "libsystem_shim:   guest dispatch [%s] recv=%p -> %p\n",
 		        selector, receiver, guest_result);
@@ -19540,8 +19604,8 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 				((struct shim_objc_dictionary*)receiver)->pair_count);
 	} else if (strcmp(selector, "dataWithJSONObject:options:error:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSJSONSERIALIZATION)) {
-			if (a5)
-				*(void**)a5 = NULL;
+			if (a4)
+				*(void**)a4 = NULL;
 			char* json = shim_json_serialize_object((void*)a2, 0);
 			if (!json)
 				return NULL;
@@ -19560,8 +19624,8 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 		}
 	} else if (strcmp(selector, "JSONObjectWithData:options:error:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSJSONSERIALIZATION)) {
-			if (a5)
-				*(void**)a5 = NULL;
+			if (a4)
+				*(void**)a4 = NULL;
 			if (!shim_objc_is_object((void*)a2, SHIM_OBJC_INSTANCE_NSDATA))
 				return NULL;
 			const struct shim_objc_data* data = (const void*)a2;
@@ -19762,7 +19826,7 @@ void* objc_alloc(void* class_object)
 	}
 	if (guest_objc_find_class(class_object)) {
 		void* instance = guest_objc_alloc_instance(class_object);
-		if (getenv("MACHGATE_TRACE_OBJC_MSGSEND"))
+		if (shim_objc_msgsend_trace_enabled())
 			fprintf(stderr,
 			        "libsystem_shim: objc_alloc guest class=%p -> %p isa=%p\n",
 			        class_object, instance,
@@ -19851,7 +19915,7 @@ void* objc_msgSendSuper2(struct guest_objc_super* super_data, void* sel, ...)
 
 	selector = sel;
 	superclass = *(void**)((char*)super_data->class_ptr + 8);
-	if (getenv("MACHGATE_TRACE_OBJC_MSGSEND"))
+	if (shim_objc_msgsend_trace_enabled())
 		fprintf(stderr,
 		        "libsystem_shim: msgSendSuper2 [%s] recv=%p class=%p super=%p\n",
 		        selector, super_data->receiver, super_data->class_ptr,
