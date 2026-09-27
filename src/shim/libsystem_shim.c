@@ -1693,11 +1693,60 @@ CFStringRef CFBundleCopyExecutableURL(CFStringRef bundle)
 	return CFStringCreateCopy(NULL, bundle);
 }
 
+static void shim_fill_random_bytes(void* buffer, size_t length)
+{
+	unsigned char* bytes = buffer;
+	size_t offset = 0;
+
+	while (offset < length) {
+		long result = syscall(SYS_getrandom, bytes + offset, length - offset, 0);
+		if (result > 0) {
+			offset += (size_t)result;
+			continue;
+		}
+		if (result < 0 && errno == EINTR)
+			continue;
+		int fd = libc_open("/dev/urandom", O_RDONLY | O_CLOEXEC, 0);
+		if (fd < 0)
+			abort();
+		while (offset < length) {
+			ssize_t nread = read(fd, bytes + offset, length - offset);
+			if (nread < 0 && errno == EINTR)
+				continue;
+			if (nread <= 0)
+				abort();
+			offset += (size_t)nread;
+		}
+		close(fd);
+		return;
+	}
+}
+
+static void shim_format_random_uuid(char output[37])
+{
+	unsigned char raw[16];
+
+	shim_fill_random_bytes(raw, sizeof(raw));
+	raw[6] = (unsigned char)((raw[6] & 0x0f) | 0x40);
+	raw[8] = (unsigned char)((raw[8] & 0x3f) | 0x80);
+	static const char hex_digits[] = "0123456789abcdef";
+	size_t position = 0;
+	for (size_t byte_index = 0; byte_index < sizeof(raw); byte_index++) {
+		if (byte_index == 4 || byte_index == 6 || byte_index == 8 ||
+		    byte_index == 10)
+			output[position++] = '-';
+		output[position++] = hex_digits[raw[byte_index] >> 4];
+		output[position++] = hex_digits[raw[byte_index] & 0x0f];
+	}
+	output[position] = '\0';
+}
+
 CFStringRef CFUUIDCreate(CFAllocatorRef allocator)
 {
-	return CFStringCreateWithCString(allocator,
-	                                 "00000000-0000-0000-0000-000000000000",
-	                                 0);
+	char uuid_string[37];
+
+	shim_format_random_uuid(uuid_string);
+	return CFStringCreateWithCString(allocator, uuid_string, 0);
 }
 
 CFStringRef CFUUIDCreateString(CFAllocatorRef allocator, CFStringRef uuid)
