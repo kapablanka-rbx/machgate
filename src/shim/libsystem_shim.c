@@ -15539,6 +15539,26 @@ static char* shim_objc_format_integers(const char* format, uintptr_t a3, uintptr
 	return result;
 }
 
+static const char* shim_objc_string_utf8(void* object)
+{
+	struct shim_objc_string* shim_string;
+	const char* chars;
+	size_t length;
+
+	if (!object)
+		return NULL;
+	if (shim_objc_is_object(object, SHIM_OBJC_STRING))
+		return ((struct shim_objc_string*)object)->utf8;
+
+	chars = *(const char**)((const char*)object + 16);
+	length = *(const size_t*)((const char*)object + 24);
+	if ((uintptr_t)chars < 0x1000 || length == 0 || length > (1 << 20))
+		return NULL;
+	if (chars[length] != '\0')
+		return NULL;
+	return chars;
+}
+
 void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t a3,
                              uintptr_t a4, uintptr_t a5, uintptr_t a6, void* sret)
 {
@@ -15557,8 +15577,12 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 		}
 	} else if (strcmp(selector, "stringWithFormat:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSSTRING)) {
-			char* text = shim_objc_format_integers((const char*)a2, a3, a4, a5, a6);
+			const char* format = shim_objc_string_utf8((void*)a2);
+			char* text;
 			void* result;
+			if (!format)
+				return NULL;
+			text = shim_objc_format_integers(format, a3, a4, a5, a6);
 			if (!text)
 				return NULL;
 			result = shim_objc_make_string(text);

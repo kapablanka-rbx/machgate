@@ -9,6 +9,7 @@ GLIBC_2.17 {
         pthread_cpu_number_np;
         pthread_mutexattr_setpolicy_np;
         objc_msgSend;
+        shim_objc_msgSend_impl;
         objc_getClass;
         objc_lookUpClass;
         objc_retain;
@@ -47,6 +48,11 @@ GLIBC_2.17 {
         pthread_attr_setstacksize;
         pthread_attr_getstacksize;
         pthread_attr_setdetachstate;
+        pthread_attr_getdetachstate;
+        pthread_attr_setschedparam;
+        pthread_attr_getschedparam;
+        pthread_attr_setschedpolicy;
+        pthread_attr_setstack;
         pthread_get_stackaddr_np;
         pthread_get_stacksize_np;
         pthread_jit_write_protect_np;
