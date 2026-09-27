@@ -6923,6 +6923,52 @@ static int shim_map_socket_domain(int darwin_domain)
 	}
 }
 
+#define DARWIN_MSG_OOB        0x0001
+#define DARWIN_MSG_PEEK       0x0002
+#define DARWIN_MSG_DONTROUTE  0x0004
+#define DARWIN_MSG_EOR        0x0008
+#define DARWIN_MSG_TRUNC      0x0010
+#define DARWIN_MSG_CTRUNC     0x0020
+#define DARWIN_MSG_WAITALL    0x0040
+#define DARWIN_MSG_DONTWAIT   0x0080
+#define DARWIN_MSG_NOSIGNAL   0x80000
+
+static int shim_send_flags_to_linux(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT)
+		linux_flags |= MSG_DONTWAIT;
+	if (darwin_flags & DARWIN_MSG_NOSIGNAL)
+		linux_flags |= MSG_NOSIGNAL;
+	return linux_flags;
+}
+
+static int shim_recv_flags_to_linux(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_PEEK)
+		linux_flags |= MSG_PEEK;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_TRUNC)
+		linux_flags |= MSG_TRUNC;
+	if (darwin_flags & DARWIN_MSG_CTRUNC)
+		linux_flags |= MSG_CTRUNC;
+	if (darwin_flags & DARWIN_MSG_WAITALL)
+		linux_flags |= MSG_WAITALL;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT)
+		linux_flags |= MSG_DONTWAIT;
+	return linux_flags;
+}
+
 static int shim_socket_domain_is_known(int domain)
 {
 	return domain == DARWIN_AF_UNIX || domain == DARWIN_AF_INET ||
@@ -7378,8 +7424,9 @@ ssize_t shim_sendto(int sockfd, const void* buffer, size_t length, int flags,
 		return -1;
 	}
 	errno = 0;
-	result = shim_real_sendto(sockfd, buffer, length, flags,
-	                          (const struct sockaddr*)&linux_addr, linux_len);
+	result = shim_real_sendto(sockfd, buffer, length,
+	                         shim_send_flags_to_linux(flags),
+	                         (const struct sockaddr*)&linux_addr, linux_len);
 	saved_errno = errno;
 	if (result < 0)
 		saved_errno = shim_errno_from_linux(saved_errno);
@@ -7419,7 +7466,8 @@ ssize_t shim_sendmsg(int sockfd, const void* darwin_msg_hdr, int flags)
 	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
 	linux_msg.msg_flags = darwin_msg->msg_flags;
 	errno = 0;
-	result = shim_real_sendmsg(sockfd, &linux_msg, flags);
+	result = shim_real_sendmsg(sockfd, &linux_msg,
+	                          shim_send_flags_to_linux(flags));
 	saved_errno = errno;
 	if (result < 0)
 		saved_errno = shim_errno_from_linux(saved_errno);
@@ -7453,7 +7501,8 @@ ssize_t shim_recvmsg(int sockfd, void* darwin_msg_hdr, int flags)
 	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
 	linux_msg.msg_control = darwin_msg->msg_control;
 	linux_msg.msg_controllen = (size_t)darwin_msg->msg_controllen;
-	result = shim_real_recvmsg(sockfd, &linux_msg, flags);
+	result = shim_real_recvmsg(sockfd, &linux_msg,
+	                           shim_recv_flags_to_linux(flags));
 	if (result < 0) {
 		saved_errno = shim_errno_from_linux(errno);
 		errno = saved_errno;
@@ -7494,7 +7543,8 @@ ssize_t shim_recvfrom(int sockfd, void* buffer, size_t length, int flags,
 		return -1;
 
 	errno = 0;
-	result = shim_real_recvfrom(sockfd, buffer, length, flags,
+	result = shim_real_recvfrom(sockfd, buffer, length,
+	                            shim_recv_flags_to_linux(flags),
 	                            (struct sockaddr*)&linux_addr, &linux_len);
 	if (result < 0) {
 		saved_errno = shim_errno_from_linux(errno);
@@ -7519,7 +7569,8 @@ ssize_t shim_recv(int sockfd, void* buffer, size_t length, int flags)
 	int saved_errno;
 
 	errno = 0;
-	result = (ssize_t)syscall(SYS_recvfrom, sockfd, buffer, length, flags,
+	result = (ssize_t)syscall(SYS_recvfrom, sockfd, buffer, length,
+	                         shim_recv_flags_to_linux(flags),
 	                         NULL, NULL);
 	saved_errno = errno;
 	if (result < 0)
@@ -7538,8 +7589,9 @@ ssize_t shim_send(int sockfd, const void* buffer, size_t length, int flags)
 	int saved_errno;
 
 	errno = 0;
-	result = (ssize_t)syscall(SYS_sendto, sockfd, buffer, length, flags,
-	                          NULL, 0);
+	result = (ssize_t)syscall(SYS_sendto, sockfd, buffer, length,
+	                         shim_send_flags_to_linux(flags),
+	                         NULL, 0);
 	saved_errno = errno;
 	if (result < 0)
 		saved_errno = shim_errno_from_linux(saved_errno);

@@ -465,6 +465,51 @@ static int translate_socket_type(int darwin_type)
 	return linux_type;
 }
 
+#define DARWIN_MSG_OOB_FLAG       0x0001
+#define DARWIN_MSG_PEEK_FLAG      0x0002
+#define DARWIN_MSG_DONTROUTE_FLAG 0x0004
+#define DARWIN_MSG_TRUNC_FLAG     0x0010
+#define DARWIN_MSG_CTRUNC_FLAG    0x0020
+#define DARWIN_MSG_WAITALL_FLAG   0x0040
+#define DARWIN_MSG_DONTWAIT_FLAG  0x0080
+#define DARWIN_MSG_NOSIGNAL_FLAG  0x80000
+
+static int translate_send_flags(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB_FLAG)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE_FLAG)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT_FLAG)
+		linux_flags |= MSG_DONTWAIT;
+	if (darwin_flags & DARWIN_MSG_NOSIGNAL_FLAG)
+		linux_flags |= MSG_NOSIGNAL;
+	return linux_flags;
+}
+
+static int translate_recv_flags(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB_FLAG)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_PEEK_FLAG)
+		linux_flags |= MSG_PEEK;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE_FLAG)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_TRUNC_FLAG)
+		linux_flags |= MSG_TRUNC;
+	if (darwin_flags & DARWIN_MSG_CTRUNC_FLAG)
+		linux_flags |= MSG_CTRUNC;
+	if (darwin_flags & DARWIN_MSG_WAITALL_FLAG)
+		linux_flags |= MSG_WAITALL;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT_FLAG)
+		linux_flags |= MSG_DONTWAIT;
+	return linux_flags;
+}
+
 static int translate_sockaddr(const void* darwin_addr, uint64_t darwin_len,
                               struct sockaddr_storage* linux_addr,
                               socklen_t* linux_len)
@@ -646,7 +691,8 @@ static void handle_sendmsg(struct syscall_gate_state* state)
 
 	errno = 0;
 	finish_syscall_result(state, syscall(SYS_sendmsg, (int)state->x[0],
-	                                     &linux_msg, (int)state->x[2]));
+	                                     &linux_msg,
+	                                     translate_send_flags((int)state->x[2])));
 }
 
 static void handle_recvmsg(struct syscall_gate_state* state)
@@ -676,7 +722,7 @@ static void handle_recvmsg(struct syscall_gate_state* state)
 
 	errno = 0;
 	long result = syscall(SYS_recvmsg, (int)state->x[0], &linux_msg,
-	                      (int)state->x[2]);
+	                      translate_recv_flags((int)state->x[2]));
 	if (result < 0) {
 		finish_syscall_result(state, result);
 		return;
@@ -704,7 +750,8 @@ static void handle_recvfrom(struct syscall_gate_state* state)
 
 	errno = 0;
 	long result = syscall(SYS_recvfrom, (int)state->x[0], (void*)state->x[1],
-	                      (size_t)state->x[2], (int)state->x[3],
+	                      (size_t)state->x[2],
+	                      translate_recv_flags((int)state->x[3]),
 	                      state->x[4] ? (struct sockaddr*)&linux_name : NULL,
 	                      state->x[4] ? &linux_name_len : NULL);
 	if (result < 0) {

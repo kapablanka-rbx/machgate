@@ -1498,6 +1498,51 @@ static int translate_socket_domain(int darwin_domain, int* linux_domain)
 	}
 }
 
+#define DARWIN_MSG_OOB_400       0x0001
+#define DARWIN_MSG_PEEK_400      0x0002
+#define DARWIN_MSG_DONTROUTE_400 0x0004
+#define DARWIN_MSG_TRUNC_400     0x0010
+#define DARWIN_MSG_CTRUNC_400    0x0020
+#define DARWIN_MSG_WAITALL_400  0x0040
+#define DARWIN_MSG_DONTWAIT_400 0x0080
+#define DARWIN_MSG_NOSIGNAL_400 0x80000
+
+static int translate_send_flags_400(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB_400)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE_400)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT_400)
+		linux_flags |= MSG_DONTWAIT;
+	if (darwin_flags & DARWIN_MSG_NOSIGNAL_400)
+		linux_flags |= MSG_NOSIGNAL;
+	return linux_flags;
+}
+
+static int translate_recv_flags_400(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB_400)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_PEEK_400)
+		linux_flags |= MSG_PEEK;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE_400)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_TRUNC_400)
+		linux_flags |= MSG_TRUNC;
+	if (darwin_flags & DARWIN_MSG_CTRUNC_400)
+		linux_flags |= MSG_CTRUNC;
+	if (darwin_flags & DARWIN_MSG_WAITALL_400)
+		linux_flags |= MSG_WAITALL;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT_400)
+		linux_flags |= MSG_DONTWAIT;
+	return linux_flags;
+}
+
 static int translate_sockaddr(const void* darwin_addr, uint64_t darwin_len,
                               struct sockaddr_storage* linux_addr,
                               socklen_t* linux_len)
@@ -1680,7 +1725,8 @@ static void dispatch_sendmsg(struct syscall_gate_state* state)
 
 	errno = 0;
 	finish_syscall_result(state, syscall(SYS_sendmsg, (int)state->x[0],
-	                                     &linux_msg, (int)state->x[2]));
+	                                     &linux_msg,
+	                                     translate_send_flags_400((int)state->x[2])));
 }
 
 static void dispatch_recvmsg(struct syscall_gate_state* state)
@@ -1711,7 +1757,7 @@ static void dispatch_recvmsg(struct syscall_gate_state* state)
 
 	errno = 0;
 	long result = syscall(SYS_recvmsg, (int)state->x[0], &linux_msg,
-	                      (int)state->x[2]);
+	                      translate_recv_flags_400((int)state->x[2]));
 	if (result < 0) {
 		finish_syscall_result(state, result);
 		return;
@@ -1791,7 +1837,7 @@ static void dispatch_sendmsg_x(struct syscall_gate_state* state)
 
 		errno = 0;
 		long result = syscall(SYS_sendmsg, (int)state->x[0], &linux_msg,
-		                      (int)state->x[3]);
+		                      translate_send_flags_400((int)state->x[3]));
 		if (result < 0) {
 			if (sent)
 				set_success(state, sent);
@@ -1816,7 +1862,7 @@ static void dispatch_recvmsg_x(struct syscall_gate_state* state)
 		struct msghdr linux_msg;
 		struct sockaddr_storage linux_name;
 		socklen_t linux_name_len = sizeof(linux_name);
-		int flags = (int)state->x[3];
+		int flags = translate_recv_flags_400((int)state->x[3]);
 
 		if (!darwin_msg) {
 			if (received)
@@ -1885,7 +1931,8 @@ static void dispatch_recvfrom(struct syscall_gate_state* state)
 
 	errno = 0;
 	long result = syscall(SYS_recvfrom, (int)state->x[0], (void*)state->x[1],
-	                      (size_t)state->x[2], (int)state->x[3],
+	                      (size_t)state->x[2],
+	                      translate_recv_flags_400((int)state->x[3]),
 	                      state->x[4] ? (struct sockaddr*)&linux_name : NULL,
 	                      state->x[4] ? &linux_name_len : NULL);
 	if (result < 0) {
@@ -1924,7 +1971,7 @@ static void dispatch_sendto(struct syscall_gate_state* state)
 	errno = 0;
 	long result = syscall(SYS_sendto, (int)state->x[0],
 	                      (const void*)state->x[1], (size_t)state->x[2],
-	                      (int)state->x[3],
+	                      translate_send_flags_400((int)state->x[3]),
 	                      (const struct sockaddr*)linux_addr_ptr, linux_len);
 	finish_syscall_result(state, result);
 }

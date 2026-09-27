@@ -507,6 +507,26 @@ static int translate_socket_domain(int darwin_domain, int* linux_domain)
 	}
 }
 
+#define DARWIN_MSG_OOB_100       0x0001
+#define DARWIN_MSG_DONTROUTE_100 0x0004
+#define DARWIN_MSG_DONTWAIT_100  0x0080
+#define DARWIN_MSG_NOSIGNAL_100  0x80000
+
+static int translate_send_flags_100(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	if (darwin_flags & DARWIN_MSG_OOB_100)
+		linux_flags |= MSG_OOB;
+	if (darwin_flags & DARWIN_MSG_DONTROUTE_100)
+		linux_flags |= MSG_DONTROUTE;
+	if (darwin_flags & DARWIN_MSG_DONTWAIT_100)
+		linux_flags |= MSG_DONTWAIT;
+	if (darwin_flags & DARWIN_MSG_NOSIGNAL_100)
+		linux_flags |= MSG_NOSIGNAL;
+	return linux_flags;
+}
+
 static int translate_socket_option(int darwin_level, int darwin_option,
                                    int* linux_level, int* linux_option)
 {
@@ -1061,7 +1081,7 @@ static void handle_sendto(struct syscall_gate_state* state)
 	errno = 0;
 	long result = syscall(SYS_sendto, (int)state->x[0],
 	                      (const void*)state->x[1], (size_t)state->x[2],
-	                      (int)state->x[3],
+	                      translate_send_flags_100((int)state->x[3]),
 	                      (const struct sockaddr*)linux_addr_ptr, linux_len);
 	finish_syscall_result(state, result);
 }
