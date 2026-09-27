@@ -119,6 +119,9 @@
 #define DARWIN_F_WRLCK 3
 #define DARWIN_F_FULLFSYNC 51
 #define DARWIN_F_DUPFD_CLOEXEC 67
+#define DARWIN_F_PREALLOCATE 42
+#define DARWIN_F_ALLOCATEALL 0x04
+#define DARWIN_F_PEOFPOSMODE 3
 
 #define DARWIN_MS_ASYNC      0x0001
 #define DARWIN_MS_INVALIDATE 0x0002
@@ -1426,6 +1429,48 @@ static void linux_flock_to_darwin(const struct flock* in, void* darwin_flock)
 	memcpy(d + 22, &l_whence, 2);
 }
 
+static long raw_fcntl_preallocate(int fd, uint64_t arg)
+{
+	struct darwin_fstore {
+		uint32_t fst_flags;
+		int32_t fst_posmode;
+		int64_t fst_offset;
+		int64_t fst_length;
+		int32_t fst_bytesalloc;
+		int32_t fst_pad;
+	};
+	const struct darwin_fstore* store = (const struct darwin_fstore*)arg;
+
+	if (!store)
+		return -1;
+
+	errno = 0;
+	struct stat file_stat;
+	if (syscall(SYS_fstat, fd, &file_stat) != 0)
+		return -1;
+
+	if (store->fst_posmode != DARWIN_F_PEOFPOSMODE &&
+	    store->fst_posmode != 0)
+		return -1;
+
+	off_t allocate_from = store->fst_posmode == DARWIN_F_PEOFPOSMODE
+	                          ? file_stat.st_size
+	                          : store->fst_offset;
+	off_t allocate_end = allocate_from + store->fst_length;
+
+	if (store->fst_flags & DARWIN_F_ALLOCATEALL) {
+		if (allocate_end > file_stat.st_size) {
+			if (syscall(SYS_ftruncate, fd, allocate_end) != 0)
+				return -1;
+		}
+		return 0;
+	}
+
+	errno = 0;
+	return syscall(SYS_fallocate, fd, 0, allocate_from,
+	               (off_t)store->fst_length);
+}
+
 static long raw_fcntl(int fd, int darwin_cmd, uint64_t arg)
 {
 	int linux_cmd;
@@ -1456,6 +1501,8 @@ static long raw_fcntl(int fd, int darwin_cmd, uint64_t arg)
 	case DARWIN_F_DUPFD_CLOEXEC:
 		linux_cmd = F_DUPFD_CLOEXEC;
 		break;
+	case DARWIN_F_PREALLOCATE:
+		return raw_fcntl_preallocate(fd, arg);
 	case DARWIN_F_FULLFSYNC:
 		return syscall(SYS_fsync, fd);
 	default:

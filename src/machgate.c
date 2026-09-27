@@ -1862,6 +1862,8 @@ static void setup_tlv_image(struct load_results* lr)
 	uint32_t p = 0;
 
 	void* tlv_image_base = NULL;
+	uintptr_t tlv_data_addr = 0;
+	uintptr_t tlv_bss_addr = 0;
 	size_t tlv_image_size = 0;
 	size_t tlv_bss_size = 0;
 
@@ -1874,16 +1876,23 @@ static void setup_tlv_image(struct load_results* lr)
 				/* S_THREAD_LOCAL_REGULAR = 0x11 */
 				if ((sect->flags & 0xff) == 0x11) {
 					tlv_image_base = (void*)(sect->addr + lr->slide);
+					tlv_data_addr = sect->addr;
 					tlv_image_size = sect->size;
 				}
 				/* S_THREAD_LOCAL_ZEROFILL = 0x12 */
 				if ((sect->flags & 0xff) == 0x12) {
+					tlv_bss_addr = sect->addr;
 					tlv_bss_size = sect->size;
 				}
 			}
 		}
 		p += lc->cmdsize;
 	}
+
+	if (tlv_data_addr && tlv_bss_addr &&
+	    tlv_bss_addr > tlv_data_addr + tlv_image_size)
+		tlv_bss_size += tlv_bss_addr -
+		                (tlv_data_addr + tlv_image_size);
 
 	if (tlv_image_size || tlv_bss_size) {
 		machgate_log_startup("machgate: TLV image at %p, size %zu + %zu bss\n",
