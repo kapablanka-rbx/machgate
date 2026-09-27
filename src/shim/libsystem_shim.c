@@ -16010,7 +16010,7 @@ struct shim_objc_array {
 
 struct shim_cookie {
 	char name[256];
-	char value[2048];
+	char value[4096];
 	char domain[256];
 	char path[1024];
 	int secure;
@@ -16814,10 +16814,6 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 				return NULL;
 			return shim_objc_make_url(joined);
 		}
-	} else if (strcmp(selector, "path") == 0) {
-		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSURL))
-			return shim_objc_make_string(
-				((struct shim_objc_string*)receiver)->utf8);
 	} else if (strcmp(selector, "stringByExpandingTildeInPath") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
 			const char* text = ((struct shim_objc_string*)receiver)->utf8;
@@ -17196,9 +17192,13 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 		}
 		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSURL)) {
 			const char* text = shim_objc_url_string(receiver);
+			const char* host_start;
+			const char* path_start;
 			if (!text)
 				return NULL;
-			const char* path_start = strchr(text, '/');
+			host_start = strstr(text, "://");
+			host_start = host_start ? host_start + 3 : text;
+			path_start = strchr(host_start, '/');
 			if (!path_start)
 				return shim_objc_make_string("/");
 			return shim_objc_make_string(path_start);
@@ -17359,20 +17359,26 @@ void* shim_objc_msgSend_impl(void* receiver, void* sel, uintptr_t a2, uintptr_t 
 			     pair_index < properties->pair_count; pair_index++) {
 				const char* key =
 					shim_objc_string_utf8(properties->keys[pair_index * 2]);
+				void* value_object = properties->keys[pair_index * 2 + 1];
 				const char* value =
-					shim_objc_string_utf8(properties->keys[pair_index * 2 + 1]);
-				if (!key || !value)
+					shim_objc_string_utf8(value_object);
+				if (!key)
 					continue;
-				if (strcmp(key, "Name") == 0)
+				if (strcmp(key, "OriginURL") == 0) {
+					origin_url = shim_objc_url_string(value_object);
+					if (!origin_url)
+						origin_url = value;
+				} else if (!value) {
+					continue;
+				} else if (strcmp(key, "Name") == 0) {
 					shim_copy_cstring(cookie.name, sizeof(cookie.name), value);
-				else if (strcmp(key, "Value") == 0)
+				} else if (strcmp(key, "Value") == 0) {
 					shim_copy_cstring(cookie.value, sizeof(cookie.value), value);
-				else if (strcmp(key, "Path") == 0)
+				} else if (strcmp(key, "Path") == 0) {
 					shim_copy_cstring(cookie.path, sizeof(cookie.path), value);
-				else if (strcmp(key, "Domain") == 0)
+				} else if (strcmp(key, "Domain") == 0) {
 					shim_copy_cstring(cookie.domain, sizeof(cookie.domain), value);
-				else if (strcmp(key, "OriginURL") == 0)
-					origin_url = shim_objc_url_string((void*)properties->keys[pair_index * 2 + 1]);
+				}
 			}
 		}
 		if (cookie.domain[0] == '\0' && origin_url)
