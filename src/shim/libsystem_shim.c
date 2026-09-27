@@ -7503,7 +7503,7 @@ int shim_getpwnam_r(const char *name,
 #define DARWIN_IPV6_LEAVE_GROUP     13
 #define DARWIN_IPV6_CHECKSUM         26
 #define DARWIN_IPV6_RECVPKTINFO      61
-#define DARWIN_IPV6_PKTINFO          19
+#define DARWIN_IPV6_PKTINFO          46
 #define LINUX_IPV6_RECVPKTINFO       49
 #define LINUX_IPV6_PKTINFO           50
 #define LINUX_IPV6_V6ONLY            26
@@ -12591,7 +12591,12 @@ struct dispatch_queue {
 struct dispatch_work_item {
 	void* block;
 	struct dispatch_work_item* next;
+	void* context;
+	void (*function)(void* context);
 };
+
+typedef void (*dispatch_block_t)(void);
+typedef void (*dispatch_function_t)(void*);
 
 static void dispatch_run_block(void* block);
 
@@ -12653,6 +12658,16 @@ void* dispatch_get_global_queue(long priority, unsigned long flags)
 	return &_dispatch_global_default;
 }
 
+static void dispatch_run_item(struct dispatch_work_item* item)
+{
+	if (item->block) {
+		dispatch_run_block(item->block);
+		return;
+	}
+	if (item->function)
+		item->function(item->context);
+}
+
 static void* dispatch_serial_worker(void* arg)
 {
 	struct dispatch_queue* queue = arg;
@@ -12669,7 +12684,7 @@ static void* dispatch_serial_worker(void* arg)
 			queue->tail = NULL;
 		pthread_mutex_unlock(&queue->mutex);
 
-		dispatch_run_block(item->block);
+		dispatch_run_item(item);
 		free(item);
 	}
 
@@ -12710,9 +12725,6 @@ void* dispatch_queue_create(const char *label, void *attr)
 }
 
 /* ---- Async dispatch (worker thread pool) / sync (inline) ---- */
-
-typedef void (*dispatch_block_t)(void);
-typedef void (*dispatch_function_t)(void*);
 
 struct machgate_dispatch_source {
 	void* type;
@@ -12775,7 +12787,7 @@ static void* dispatch_pool_worker(void* arg)
 			dispatch_pool_tail = NULL;
 		pthread_mutex_unlock(&dispatch_pool_mutex);
 
-		dispatch_run_block(item->block);
+		dispatch_run_item(item);
 		free(item);
 	}
 
@@ -12848,6 +12860,8 @@ void dispatch_async(void *queue, void *block)
 			return;
 		}
 		item->block = owned;
+		item->context = NULL;
+		item->function = NULL;
 		item->next = NULL;
 		pthread_mutex_lock(&serial->mutex);
 		if (serial->tail)
@@ -12872,6 +12886,8 @@ void dispatch_async(void *queue, void *block)
 		return;
 	}
 	item->block = owned;
+	item->context = NULL;
+	item->function = NULL;
 	item->next = NULL;
 	dispatch_pool_post(item);
 }
@@ -12880,6 +12896,162 @@ void dispatch_sync(void *queue, void *block)
 {
 	(void)queue;
 	dispatch_invoke_block(block);
+}
+
+void dispatch_async_f(void *queue, void *context, dispatch_function_t function)
+{
+	struct dispatch_queue* serial = queue;
+
+	if (serial && serial->type == DISPATCH_OBJ_QUEUE && serial->serial &&
+	    dispatch_start_serial_worker(serial)) {
+		struct dispatch_work_item* item = malloc(sizeof(*item));
+		if (!item) {
+			if (function)
+				function(context);
+			return;
+		}
+		item->block = NULL;
+		item->context = context;
+		item->function = function;
+		item->next = NULL;
+		pthread_mutex_lock(&serial->mutex);
+		if (serial->tail)
+			serial->tail->next = item;
+		else
+			serial->head = item;
+		serial->tail = item;
+		pthread_cond_signal(&serial->cond);
+		pthread_mutex_unlock(&serial->mutex);
+		return;
+	}
+
+	if (function)
+		function(context);
+}
+
+void dispatch_after_f(uint64_t when, void *queue, void *context,
+                     dispatch_function_t function)
+{
+	(void)when;
+	(void)queue;
+	if (function)
+		function(context);
+}
+
+void dispatch_sync_f(void *queue, void *context, dispatch_function_t function)
+{
+	(void)queue;
+	if (function)
+		function(context);
+}
+
+struct machgate_dispatch_group {
+	int refcount;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	long entered;
+	long left;
+	struct dispatch_work_item* head;
+	struct dispatch_work_item* tail;
+	int notify_armed;
+	void* notify_queue;
+	void* notify_block;
+};
+
+void* dispatch_group_create(void)
+{
+	struct machgate_dispatch_group* group = calloc(1, sizeof(*group));
+	if (!group)
+		return NULL;
+	pthread_mutex_init(&group->mutex, NULL);
+	pthread_cond_init(&group->cond, NULL);
+	return group;
+}
+
+void dispatch_group_enter(void* group_ref)
+{
+	struct machgate_dispatch_group* group = group_ref;
+	if (!group)
+		return;
+	pthread_mutex_lock(&group->mutex);
+	group->entered++;
+	pthread_mutex_unlock(&group->mutex);
+}
+
+static void dispatch_group_check_notify(struct machgate_dispatch_group* group)
+{
+	void* block;
+	void* queue;
+
+	if (group->notify_armed && group->entered == group->left) {
+		block = group->notify_block;
+		queue = group->notify_queue;
+		group->notify_armed = 0;
+		group->notify_block = NULL;
+		group->notify_queue = NULL;
+		if (block)
+			dispatch_async(queue, block);
+	}
+}
+
+void dispatch_group_leave(void* group_ref)
+{
+	struct machgate_dispatch_group* group = group_ref;
+	if (!group)
+		return;
+	pthread_mutex_lock(&group->mutex);
+	group->left++;
+	pthread_cond_broadcast(&group->cond);
+	dispatch_group_check_notify(group);
+	pthread_mutex_unlock(&group->mutex);
+}
+
+void dispatch_group_notify(void* group_ref, void* queue, void* block)
+{
+	struct machgate_dispatch_group* group = group_ref;
+	if (!group || !block)
+		return;
+	pthread_mutex_lock(&group->mutex);
+	group->notify_queue = queue;
+	group->notify_block = block_copy_internal(block);
+	group->notify_armed = 1;
+	dispatch_group_check_notify(group);
+	pthread_mutex_unlock(&group->mutex);
+}
+
+const char* dispatch_queue_get_label(void* queue)
+{
+	struct dispatch_queue* serial = queue;
+	if (serial && serial->type == DISPATCH_OBJ_QUEUE)
+		return serial->label;
+	return NULL;
+}
+
+void* dispatch_queue_create_with_target(const char* label, void* attr,
+                                         void* target)
+{
+	(void)target;
+	return dispatch_queue_create(label, attr);
+}
+
+void dispatch_set_context(void* object, void* context)
+{
+	struct dispatch_queue* serial = object;
+	if (serial && serial->type == DISPATCH_OBJ_QUEUE)
+		;
+	(void)context;
+}
+
+void dispatch_set_finalizer_f(void* object, dispatch_function_t finalizer)
+{
+	(void)object;
+	(void)finalizer;
+}
+
+void* dispatch_get_context(void* queue)
+{
+	(void)queue;
+	return NULL;
 }
 
 void dispatch_once(long *predicate, void *block)
@@ -14645,6 +14817,24 @@ static void* translate_dlsym_handle(void* handle)
 	return handle;
 }
 
+void* machgate_shim_malloc(size_t size);
+void* machgate_shim_calloc(size_t count, size_t size);
+void* machgate_shim_realloc(void* ptr, size_t size);
+void machgate_shim_free(void* ptr);
+
+static void* shim_dlsym_allocator_symbol(const char* symbol)
+{
+	if (strcmp(symbol, "malloc") == 0)
+		return (void*)machgate_shim_malloc;
+	if (strcmp(symbol, "free") == 0)
+		return (void*)machgate_shim_free;
+	if (strcmp(symbol, "calloc") == 0)
+		return (void*)machgate_shim_calloc;
+	if (strcmp(symbol, "realloc") == 0)
+		return (void*)machgate_shim_realloc;
+	return NULL;
+}
+
 static void* (*resolve_real_dlsym(void))(void*, const char*)
 {
 	static const char* versions[] = {
@@ -14669,6 +14859,11 @@ void* dlsym(void* handle, const char* symbol)
 
 	if (!real_dlsym)
 		return NULL;
+	if (handle == (void*)RTLD_NEXT) {
+		void* allocator_symbol = shim_dlsym_allocator_symbol(symbol);
+		if (allocator_symbol)
+			return allocator_symbol;
+	}
 	return real_dlsym(translate_dlsym_handle(handle), symbol);
 }
 
@@ -15316,12 +15511,16 @@ static int should_forward_guest_cxx_delete(const void* ptr)
 static void resolve_real_funcs(void)
 {
 	if (real_malloc) return;
-	real_malloc  = (real_malloc_fn)dlsym(RTLD_NEXT, "malloc");
-	real_free    = (real_free_fn)dlsym(RTLD_NEXT, "free");
-	real_calloc  = (real_calloc_fn)dlsym(RTLD_NEXT, "calloc");
-	real_realloc = (real_realloc_fn)dlsym(RTLD_NEXT, "realloc");
-	real_posix_memalign = (real_posix_memalign_fn)dlsym(RTLD_NEXT,
-	                                                    "posix_memalign");
+	if (!real_dlsym)
+		real_dlsym = resolve_real_dlsym();
+	if (!real_dlsym)
+		return;
+	real_malloc  = (real_malloc_fn)real_dlsym(RTLD_NEXT, "malloc");
+	real_free    = (real_free_fn)real_dlsym(RTLD_NEXT, "free");
+	real_calloc  = (real_calloc_fn)real_dlsym(RTLD_NEXT, "calloc");
+	real_realloc = (real_realloc_fn)real_dlsym(RTLD_NEXT, "realloc");
+	real_posix_memalign = (real_posix_memalign_fn)real_dlsym(RTLD_NEXT,
+	                                                        "posix_memalign");
 }
 
 static void *shim_malloc_impl_at(size_t size, void* caller)
