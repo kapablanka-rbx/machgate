@@ -7226,6 +7226,20 @@ int shim_getpwnam_r(const char *name,
 #define DARWIN_TCP_KEEPALIVE        0x10
 #define DARWIN_TCP_KEEPINTVL        0x101
 #define DARWIN_TCP_KEEPCNT          0x102
+#define DARWIN_IPPROTO_IPV6         41
+#define DARWIN_IPV6_UNICAST_HOPS     16
+#define DARWIN_IPV6_V6ONLY           27
+#define DARWIN_IPV6_MULTICAST_IF     9
+#define DARWIN_IPV6_MULTICAST_HOPS  10
+#define DARWIN_IPV6_MULTICAST_LOOP  11
+#define DARWIN_IPV6_JOIN_GROUP      12
+#define DARWIN_IPV6_LEAVE_GROUP     13
+#define DARWIN_IPV6_CHECKSUM         26
+#define DARWIN_IPV6_RECVPKTINFO      61
+#define DARWIN_IPV6_PKTINFO          19
+#define LINUX_IPV6_RECVPKTINFO       49
+#define LINUX_IPV6_PKTINFO           50
+#define LINUX_IPV6_V6ONLY            26
 #define LINUX_IP_MTU_DISCOVER       10
 #define LINUX_IP_PMTUDISC_DONT      0
 #define LINUX_IP_PMTUDISC_DO        2
@@ -7426,6 +7440,45 @@ static int shim_translate_socket_option(int darwin_level, int darwin_option,
 			return 1;
 		case DARWIN_TCP_KEEPCNT:
 			*linux_option = TCP_KEEPCNT;
+			return 1;
+		default:
+			*linux_option = darwin_option;
+			return 1;
+		}
+	}
+
+	if (darwin_level == DARWIN_IPPROTO_IPV6) {
+		*linux_level = IPPROTO_IPV6;
+		switch (darwin_option) {
+		case DARWIN_IPV6_UNICAST_HOPS:
+			*linux_option = IPV6_UNICAST_HOPS;
+			return 1;
+		case DARWIN_IPV6_V6ONLY:
+			*linux_option = LINUX_IPV6_V6ONLY;
+			return 1;
+		case DARWIN_IPV6_MULTICAST_IF:
+			*linux_option = IPV6_MULTICAST_IF;
+			return 1;
+		case DARWIN_IPV6_MULTICAST_HOPS:
+			*linux_option = IPV6_MULTICAST_HOPS;
+			return 1;
+		case DARWIN_IPV6_MULTICAST_LOOP:
+			*linux_option = IPV6_MULTICAST_LOOP;
+			return 1;
+		case DARWIN_IPV6_JOIN_GROUP:
+			*linux_option = IPV6_JOIN_GROUP;
+			return 1;
+		case DARWIN_IPV6_LEAVE_GROUP:
+			*linux_option = IPV6_LEAVE_GROUP;
+			return 1;
+		case DARWIN_IPV6_CHECKSUM:
+			*linux_option = IPV6_CHECKSUM;
+			return 1;
+		case DARWIN_IPV6_RECVPKTINFO:
+			*linux_option = LINUX_IPV6_RECVPKTINFO;
+			return 1;
+		case DARWIN_IPV6_PKTINFO:
+			*linux_option = LINUX_IPV6_PKTINFO;
 			return 1;
 		default:
 			*linux_option = darwin_option;
