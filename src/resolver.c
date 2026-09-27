@@ -1143,6 +1143,7 @@ static const struct variadic_info variadic_functions[] = {
 	{"sprintf",         "vsprintf",         2, 0, 0},
 	{"snprintf",        "vsnprintf",        3, 0, 0},
 	{"sscanf",          "vsscanf",          2, 0, 0},
+	{"fscanf",          "vfscanf",          2, 0, 0},
 	{"__sprintf_chk",   "__vsprintf_chk",   4, 0, 0},
 	/* va_list passthrough — same glibc function, converted va_list.
 	 * source_reg = register holding macOS va_list (char*) */
@@ -1151,6 +1152,7 @@ static const struct variadic_info variadic_functions[] = {
 	{"vfprintf",        "vfprintf",         2, 1, 2},
 	{"vprintf",         "vprintf",         1, 1, 1},
 	{"vsscanf",         "vsscanf",          2, 1, 2},
+	{"vfscanf",         "vfscanf",          2, 1, 2},
 	{"vsnprintf",       "vsnprintf",        3, 1, 3},
 	{"vasprintf",       "vasprintf",        2, 1, 2},
 	{"__vsnprintf_chk", "__vsnprintf_chk",  5, 1, 5},
