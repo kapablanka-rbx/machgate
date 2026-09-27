@@ -732,5 +732,90 @@ global_block = BlockLayout(
 global_copy = lib._Block_copy(ctypes.byref(global_block))
 assert global_copy == ctypes.addressof(global_block), '_Block_copy must not copy global blocks'
 
+# host_statistics64(HOST_VM_INFO64) must report real host memory: the
+# engine's MemoryStats::freeMemoryBytes() reads free/speculative/purgeable/
+# external page counts, and MemoryStatsTests/FreeMemory asserts nonzero.
+class VmStatistics64(ctypes.Structure):
+    _fields_ = [
+        ('free_count', ctypes.c_uint32),
+        ('active_count', ctypes.c_uint32),
+        ('inactive_count', ctypes.c_uint32),
+        ('wire_count', ctypes.c_uint32),
+        ('zero_fill_count', ctypes.c_uint64),
+        ('reactivations', ctypes.c_uint64),
+        ('pageins', ctypes.c_uint64),
+        ('pageouts', ctypes.c_uint64),
+        ('faults', ctypes.c_uint64),
+        ('cow_faults', ctypes.c_uint64),
+        ('lookups', ctypes.c_uint64),
+        ('hits', ctypes.c_uint64),
+        ('purges', ctypes.c_uint64),
+        ('purgeable_count', ctypes.c_uint32),
+        ('speculative_count', ctypes.c_uint32),
+        ('decompressions', ctypes.c_uint64),
+        ('compressions', ctypes.c_uint64),
+        ('swapins', ctypes.c_uint64),
+        ('swapouts', ctypes.c_uint64),
+        ('compressor_page_count', ctypes.c_uint32),
+        ('throttled_count', ctypes.c_uint32),
+        ('external_page_count', ctypes.c_uint32),
+        ('internal_page_count', ctypes.c_uint32),
+        ('total_uncompressed_pages_in_compressor', ctypes.c_uint64),
+        ('swapped_count', ctypes.c_uint64),
+    ]
+
+lib.host_statistics64.restype = ctypes.c_int
+lib.host_statistics64.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+vm_stats = VmStatistics64()
+vm_count = ctypes.c_uint32(ctypes.sizeof(VmStatistics64) // 4)
+vm_result = lib.host_statistics64(0x104, 4, ctypes.byref(vm_stats), ctypes.byref(vm_count))
+assert vm_result == 0, f'host_statistics64 returned {vm_result}'
+assert vm_stats.free_count > 0, 'host_statistics64 reported zero free pages'
+assert vm_stats.external_page_count > 0, 'host_statistics64 reported zero external pages'
+
+# host_page_size must return the host page size.
+lib.host_page_size.restype = ctypes.c_int
+lib.host_page_size.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+page_size = ctypes.c_uint64(0)
+page_result = lib.host_page_size(0x104, ctypes.byref(page_size))
+assert page_result == 0, f'host_page_size returned {page_result}'
+assert page_size.value >= 4096, f'host_page_size returned {page_size.value}'
+
+# task_info(TASK_VM_INFO) must report a nonzero resident size and
+# phys_footprint; the engine's usedMemoryBytes() reads phys_footprint.
+class TaskVmInfoPrefix(ctypes.Structure):
+    _fields_ = [
+        ('virtual_size', ctypes.c_uint64),
+        ('region_count', ctypes.c_uint32),
+        ('page_size_field', ctypes.c_uint32),
+        ('resident_size', ctypes.c_uint64),
+        ('resident_size_peak', ctypes.c_uint64),
+        ('device', ctypes.c_uint64),
+        ('device_peak', ctypes.c_uint64),
+        ('internal', ctypes.c_uint64),
+        ('internal_peak', ctypes.c_uint64),
+        ('external_bytes', ctypes.c_uint64),
+        ('external_peak', ctypes.c_uint64),
+        ('reusable', ctypes.c_uint64),
+        ('reusable_peak', ctypes.c_uint64),
+        ('purgeable_volatile_pmap', ctypes.c_uint64),
+        ('purgeable_volatile_resident', ctypes.c_uint64),
+        ('purgeable_volatile_virtual', ctypes.c_uint64),
+        ('compressed', ctypes.c_uint64),
+        ('compressed_peak', ctypes.c_uint64),
+        ('compressed_lifetime', ctypes.c_uint64),
+        ('phys_footprint', ctypes.c_uint64),
+    ]
+
+lib.task_info.restype = ctypes.c_int
+lib.task_info.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+task_stats = TaskVmInfoPrefix()
+task_count = ctypes.c_uint32(1024)
+task_result = lib.task_info(0x103, 22, ctypes.byref(task_stats), ctypes.byref(task_count))
+assert task_result == 0, f'task_info returned {task_result}'
+assert task_stats.phys_footprint > 0, 'task_info reported zero phys_footprint'
+assert task_stats.resident_size > 0, 'task_info reported zero resident_size'
+assert task_stats.page_size_field >= 4096, f'task_info page_size={task_stats.page_size_field}'
+
 print('All libsystem_shim symbol tests passed')
 "

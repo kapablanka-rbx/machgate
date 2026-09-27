@@ -282,13 +282,93 @@ uint64_t mach_continuous_approximate_time(void)
 	return mach_continuous_time();
 }
 
-/* task_info — stub, returns KERN_FAILURE */
+#define DARWIN_TASK_VM_INFO 22
+
+struct darwin_task_vm_info_prefix {
+	uint64_t virtual_size;
+	uint32_t region_count;
+	uint32_t page_size;
+	uint64_t resident_size;
+	uint64_t resident_size_peak;
+	uint64_t device;
+	uint64_t device_peak;
+	uint64_t internal;
+	uint64_t internal_peak;
+	uint64_t external;
+	uint64_t external_peak;
+	uint64_t reusable;
+	uint64_t reusable_peak;
+	uint64_t purgeable_volatile_pmap;
+	uint64_t purgeable_volatile_resident;
+	uint64_t purgeable_volatile_virtual;
+	uint64_t compressed;
+	uint64_t compressed_peak;
+	uint64_t compressed_lifetime;
+	uint64_t phys_footprint;
+};
+
+static uint64_t guest_resident_bytes(void)
+{
+	char line_buffer[256];
+	FILE* status_file;
+	uint64_t rss_kilobytes = 0;
+
+	status_file = fopen("/proc/self/status", "r");
+	if (!status_file)
+		return 0;
+	while (fgets(line_buffer, sizeof(line_buffer), status_file)) {
+		if (sscanf(line_buffer, "VmRSS: %llu kB",
+		           (unsigned long long*)&rss_kilobytes) == 1)
+			break;
+	}
+	fclose(status_file);
+	return rss_kilobytes * 1024ull;
+}
+
+static uint64_t guest_virtual_bytes(void)
+{
+	unsigned long long virtual_pages = 0;
+	FILE* statm_file;
+	uint64_t virtual_bytes = 0;
+	int parsed;
+
+	statm_file = fopen("/proc/self/statm", "r");
+	if (!statm_file)
+		return 0;
+	parsed = fscanf(statm_file, "%llu", &virtual_pages);
+	fclose(statm_file);
+	if (parsed == 1)
+		virtual_bytes = (uint64_t)virtual_pages *
+		                (uint64_t)sysconf(_SC_PAGESIZE);
+	return virtual_bytes;
+}
+
 int task_info(uint32_t target_task, uint32_t flavor,
               void *task_info_out, uint32_t *task_info_count)
 {
-	(void)target_task; (void)flavor;
-	(void)task_info_out; (void)task_info_count;
-	return 5; /* KERN_FAILURE */
+	(void)target_task;
+
+	if (flavor != DARWIN_TASK_VM_INFO || !task_info_out ||
+	    !task_info_count)
+		return 5;
+
+	if ((*task_info_count * sizeof(uint32_t)) <
+	    sizeof(struct darwin_task_vm_info_prefix))
+		return 4;
+
+	{
+		struct darwin_task_vm_info_prefix info;
+		memset(&info, 0, sizeof(info));
+		info.virtual_size = guest_virtual_bytes();
+		info.page_size = (uint32_t)sysconf(_SC_PAGESIZE);
+		info.resident_size = guest_resident_bytes();
+		info.resident_size_peak = info.resident_size;
+		info.internal = info.resident_size;
+		info.internal_peak = info.resident_size;
+		info.phys_footprint = info.resident_size;
+		memcpy(task_info_out, &info, sizeof(info));
+	}
+	return 0;
 }
 
 int task_policy_set(uint32_t task, int flavor, void* policy_info,
@@ -589,14 +669,99 @@ int host_processor_info(uint32_t host, int flavor, uint32_t* out_processor_count
 #undef DARWIN_PROCESSOR_CPU_LOAD_INFO
 }
 
+int host_page_size(uint32_t host, uint64_t* out_page_size)
+{
+	(void)host;
+
+	if (!out_page_size)
+		return 4;
+	*out_page_size = (uint64_t)sysconf(_SC_PAGESIZE);
+	return 0;
+}
+
+struct darwin_vm_statistics64 {
+	uint32_t free_count;
+	uint32_t active_count;
+	uint32_t inactive_count;
+	uint32_t wire_count;
+	uint64_t zero_fill_count;
+	uint64_t reactivations;
+	uint64_t pageins;
+	uint64_t pageouts;
+	uint64_t faults;
+	uint64_t cow_faults;
+	uint64_t lookups;
+	uint64_t hits;
+	uint64_t purges;
+	uint32_t purgeable_count;
+	uint32_t speculative_count;
+	uint64_t decompressions;
+	uint64_t compressions;
+	uint64_t swapins;
+	uint64_t swapouts;
+	uint32_t compressor_page_count;
+	uint32_t throttled_count;
+	uint32_t external_page_count;
+	uint32_t internal_page_count;
+	uint64_t total_uncompressed_pages_in_compressor;
+	uint64_t swapped_count;
+};
+
+#define DARWIN_HOST_VM_INFO64 4
+
+static void fill_vm_statistics64_from_sysinfo(
+	struct darwin_vm_statistics64* stats)
+{
+	struct sysinfo linux_info;
+	uint64_t page_size = (uint64_t)sysconf(_SC_PAGESIZE);
+	uint64_t total_pages;
+	uint64_t free_pages;
+	uint64_t cached_pages;
+	uint64_t used_pages;
+
+	memset(stats, 0, sizeof(*stats));
+	if (sysinfo(&linux_info) != 0)
+		return;
+	if (page_size == 0)
+		page_size = 4096;
+
+	total_pages = (uint64_t)linux_info.totalram / page_size;
+	free_pages = (uint64_t)linux_info.freeram / page_size;
+	cached_pages = (uint64_t)linux_info.bufferram / page_size;
+	if (free_pages > total_pages)
+		free_pages = total_pages;
+	used_pages = total_pages > free_pages ? total_pages - free_pages : 0;
+
+	stats->free_count = (uint32_t)free_pages;
+	stats->active_count = (uint32_t)used_pages;
+	stats->inactive_count = (uint32_t)cached_pages;
+	stats->wire_count = (uint32_t)(linux_info.sharedram / page_size);
+	stats->purgeable_count = (uint32_t)cached_pages;
+	stats->speculative_count = 0;
+	stats->external_page_count = (uint32_t)cached_pages;
+	stats->internal_page_count =
+		(uint32_t)(used_pages > cached_pages ? used_pages - cached_pages
+		                                     : 0);
+}
+
 int host_statistics64(uint32_t host, int flavor, void* info,
                       uint32_t* info_count)
 {
 	(void)host;
-	(void)flavor;
 
-	if (info && info_count)
-		memset(info, 0, (size_t)*info_count * sizeof(uint64_t));
+	if (flavor != DARWIN_HOST_VM_INFO64 || !info || !info_count ||
+	    *info_count == 0)
+		return 5;
+
+	if ((*info_count * sizeof(uint32_t)) <
+	    sizeof(struct darwin_vm_statistics64))
+		return 4;
+
+	{
+		struct darwin_vm_statistics64 stats;
+		fill_vm_statistics64_from_sysinfo(&stats);
+		memcpy(info, &stats, sizeof(stats));
+	}
 	return 0;
 }
 
@@ -14406,7 +14571,6 @@ static real_free_fn real_free = NULL;
 
 #define MACHGATE_FREE_QUARANTINE_SLOTS 32768
 #define MACHGATE_FREE_QUARANTINE_MAX_CHUNK (16u << 20)
-#define MACHGATE_FREE_QUARANTINE_MIN_BUDGET (64u << 20)
 
 struct machgate_free_quarantine_slot {
 	void* ptr;
@@ -14434,8 +14598,6 @@ static size_t machgate_free_quarantine_budget(void)
 		else
 			configured = 0;
 	}
-	if (configured == 0)
-		return MACHGATE_FREE_QUARANTINE_MIN_BUDGET;
 	return (size_t)configured;
 }
 
@@ -15044,6 +15206,10 @@ static void shim_free_quarantine_push(void* ptr, size_t bytes)
 		return;
 	if (!real_free)
 		return;
+	if (machgate_free_quarantine_budget() == 0) {
+		real_free(ptr);
+		return;
+	}
 
 	size_t slot_size = bytes > PTRDIFF_MAX ? PTRDIFF_MAX : bytes;
 	if (pthread_mutex_lock(&quarantine_mutex) != 0) {
