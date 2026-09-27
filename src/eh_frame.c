@@ -16,6 +16,7 @@
 #include "eh_frame.h"
 #include "macho_defs.h"
 #include "log.h"
+#include "startup_cache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,7 @@
 #include <stdint.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 /* ========== Compact Unwind Encoding Constants (ARM64) ========== */
 
@@ -437,6 +439,31 @@ static void* macho_eh_frame_hdr = NULL;
 static size_t macho_eh_frame_hdr_size = 0;
 static int (*real_dl_find_object)(void*, struct dl_find_object*) = NULL;
 
+int eh_frame_generate_and_register(void* mh, uintptr_t slide);
+void eh_frame_hooks_install(void);
+
+static const char* eh_frame_cache_binary_path = NULL;
+static struct stat eh_frame_cache_binary_st;
+static int eh_frame_cache_binary_valid = 0;
+
+void eh_frame_note_binary(const char* binary_path, const struct stat* binary_st)
+{
+	if (!binary_path || !binary_st)
+		return;
+	eh_frame_cache_binary_path = binary_path;
+	eh_frame_cache_binary_st = *binary_st;
+	eh_frame_cache_binary_valid = 1;
+}
+
+int eh_frame_cache_context(const char** out_path, struct stat* out_st)
+{
+	if (!eh_frame_cache_binary_valid)
+		return -1;
+	*out_path = eh_frame_cache_binary_path;
+	*out_st = eh_frame_cache_binary_st;
+	return 0;
+}
+
 static void* mmap_near_address(uintptr_t base, size_t size, int prot)
 {
 	const uintptr_t step = 0x02000000ULL;
@@ -581,6 +608,8 @@ static void ehf_align(size_t align)
  *
  * Returns the offset of the CIE in the buffer (for FDE back-references).
  */
+static uint64_t cie_personality_value_offset = 0;
+
 static size_t emit_cie(uintptr_t personality_addr)
 {
 	size_t cie_start = ehf_pos;
@@ -623,6 +652,7 @@ static size_t emit_cie(uintptr_t personality_addr)
 
 		/* P: personality encoding + pointer */
 		ehf_u8(DW_EH_PE_absptr);
+		cie_personality_value_offset = ehf_pos;
 		ehf_u64(personality_addr);
 
 		/* L: LSDA encoding */
@@ -1106,8 +1136,219 @@ static int collect_entries(const uint8_t* unwind_info, size_t unwind_size,
 
 /* ========== Main Entry Point ========== */
 
+static void* pending_cache_eh_frame = NULL;
+static size_t pending_cache_eh_frame_size = 0;
+static uint64_t* pending_cache_hdr_pairs = NULL;
+static size_t pending_cache_hdr_pairs_size = 0;
+static uint64_t pending_cache_personality_offset = 0;
+static uint32_t pending_cache_fde_count = 0;
+
+void eh_frame_cache_capture(const char* binary_path,
+                            const struct stat* binary_st,
+                            const struct startup_cache_patch* patches,
+                            size_t patch_count)
+{
+	if (!pending_cache_eh_frame || !binary_path || !binary_st)
+		return;
+
+	int result = startup_cache_publish(
+		pending_cache_eh_frame, pending_cache_eh_frame_size,
+		pending_cache_hdr_pairs, pending_cache_hdr_pairs_size,
+		pending_cache_personality_offset,
+		patches, patch_count, pending_cache_fde_count,
+		binary_path, binary_st);
+	if (result == 0)
+		machgate_log_startup("eh_frame: wrote startup cache\n");
+}
+
+static int eh_frame_register_cached(void* mh, uintptr_t slide,
+                                    const char* binary_path,
+                                    const struct stat* binary_st)
+{
+	struct mach_header_64* header = (struct mach_header_64*)mh;
+
+	uint64_t phase_start_ms = machgate_phase_now_ms();
+
+	struct startup_cache_header cache_header;
+	const void* cached_eh_frame = NULL;
+	const uint64_t* cached_pairs = NULL;
+	const struct startup_cache_patch* cached_patches = NULL;
+
+	if (startup_cache_open(&cache_header, &cached_eh_frame,
+	                       &cached_pairs, &cached_patches,
+	                       binary_path, binary_st) < 0)
+		return -1;
+
+	if (cache_header.eh_frame_size == 0) {
+		startup_cache_close();
+		return -1;
+	}
+
+	uintptr_t text_base = 0;
+	const uint8_t* unwind_info = NULL;
+	size_t unwind_size = 0;
+	uint8_t* cmd_ptr = (uint8_t*)(header + 1);
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		struct load_command* lc = (struct load_command*)cmd_ptr;
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64* seg = (struct segment_command_64*)lc;
+			if (strcmp(seg->segname, "__TEXT") == 0) {
+				text_base = seg->vmaddr;
+				text_size = seg->vmsize;
+				struct section_64* sect = (struct section_64*)(seg + 1);
+				for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
+					if (strcmp(sect->sectname, "__unwind_info") == 0) {
+						unwind_info = (const uint8_t*)(sect->addr + slide);
+						unwind_size = sect->size;
+					}
+				}
+			}
+		}
+		cmd_ptr += lc->cmdsize;
+	}
+
+	if (!unwind_info) {
+		startup_cache_close();
+		return -1;
+	}
+
+	const struct unwind_info_section_header* unwind_hdr =
+		(const struct unwind_info_section_header*)unwind_info;
+
+	uintptr_t personalities[4] = {0};
+	const int32_t* personality_arr =
+		(const int32_t*)(unwind_info + unwind_hdr->personalityArraySectionOffset);
+	for (uint32_t i = 0; i < unwind_hdr->personalityArrayCount && i < 4; i++) {
+		uintptr_t got_addr = text_base + slide + personality_arr[i];
+		uintptr_t* got_entry = (uintptr_t*)got_addr;
+		personalities[i] = *got_entry;
+	}
+
+	uint8_t* eh_frame_copy = (uint8_t*)startup_cache_map_eh_frame_near(text_base + slide);
+	if (!eh_frame_copy) {
+		startup_cache_close();
+		machgate_log_startup("eh_frame: cache load failed (no near mapping)\n");
+		return -1;
+	}
+
+	memcpy(eh_frame_copy, cached_eh_frame, cache_header.eh_frame_size);
+
+	if (cache_header.cie_personality_offset + 8 <= cache_header.eh_frame_size) {
+		uint64_t* personality_slot =
+			(uint64_t*)(eh_frame_copy + cache_header.cie_personality_offset);
+		*personality_slot = personalities[0];
+	}
+
+	macho_eh_frame = eh_frame_copy;
+	macho_eh_frame_size = (size_t)cache_header.eh_frame_size;
+
+	size_t pair_count = cache_header.hdr_pairs_size / (2 * sizeof(uint64_t));
+	size_t hdr_size = 12 + pair_count * 8;
+	uint8_t* hdr_copy = (uint8_t*)mmap_near_address(text_base + slide,
+	                                                hdr_size,
+	                                                PROT_READ | PROT_WRITE);
+	if (hdr_copy == MAP_FAILED) {
+		startup_cache_close();
+		machgate_log_startup("eh_frame: cache load failed (hdr mapping)\n");
+		return -1;
+	}
+
+	hdr_copy[0] = 1;
+	hdr_copy[1] = DW_EH_PE_pcrel | DW_EH_PE_sdata4;
+	hdr_copy[2] = DW_EH_PE_udata4;
+	hdr_copy[3] = DW_EH_PE_datarel | DW_EH_PE_sdata4;
+
+	int32_t eh_frame_rel = (int32_t)((int64_t)(uintptr_t)eh_frame_copy -
+	                                 (int64_t)(uintptr_t)(hdr_copy + 4));
+	memcpy(hdr_copy + 4, &eh_frame_rel, 4);
+	uint32_t fde_count_value = (uint32_t)pair_count;
+	memcpy(hdr_copy + 8, &fde_count_value, 4);
+
+	uintptr_t datarel_base = (uintptr_t)hdr_copy;
+	int table_ok = 1;
+	size_t hp = 12;
+	for (size_t i = 0; i < pair_count; i++) {
+		uint64_t initial_location = cached_pairs[2 * i];
+		uint64_t fde_offset = cached_pairs[2 * i + 1];
+		uint64_t fde_address = (uint64_t)(uintptr_t)eh_frame_copy + fde_offset;
+
+		int64_t initial_rel = (int64_t)initial_location - (int64_t)datarel_base;
+		int64_t fde_rel = (int64_t)fde_address - (int64_t)datarel_base;
+		if (initial_rel < INT32_MIN || initial_rel > INT32_MAX ||
+		    fde_rel < INT32_MIN || fde_rel > INT32_MAX) {
+			table_ok = 0;
+			break;
+		}
+		int32_t initial_rel32 = (int32_t)initial_rel;
+		int32_t fde_rel32 = (int32_t)fde_rel;
+		memcpy(hdr_copy + hp, &initial_rel32, 4); hp += 4;
+		memcpy(hdr_copy + hp, &fde_rel32, 4); hp += 4;
+	}
+
+	if (!table_ok) {
+		startup_cache_close();
+		machgate_log_startup("eh_frame: cache load failed (table encoding)\n");
+		return -1;
+	}
+
+	macho_eh_frame_hdr = hdr_copy;
+	macho_eh_frame_hdr_size = hp;
+	macho_text_start = text_base + slide;
+	macho_text_end = macho_text_start + text_size;
+
+	machgate_phase_log("eh_frame: loaded from cache", phase_start_ms);
+	machgate_log_startup("eh_frame: cache: %llu FDEs, %llu-byte eh_frame, %zu-byte hdr\n",
+	                     (unsigned long long)cache_header.fde_count,
+	                     (unsigned long long)cache_header.eh_frame_size,
+	                     hp);
+
+	startup_cache_close();
+	return 0;
+}
+
+static int eh_frame_has_unwind_info(void* mh)
+{
+	struct mach_header_64* header = (struct mach_header_64*)mh;
+	uint8_t* cmd_ptr = (uint8_t*)(header + 1);
+
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		struct load_command* lc = (struct load_command*)cmd_ptr;
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64* seg = (struct segment_command_64*)lc;
+			if (strcmp(seg->segname, "__TEXT") == 0) {
+				struct section_64* sect = (struct section_64*)(seg + 1);
+				for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
+					if (strcmp(sect->sectname, "__unwind_info") == 0)
+						return 1;
+				}
+			}
+		}
+		cmd_ptr += lc->cmdsize;
+	}
+	return 0;
+}
+
 int eh_frame_register_macho(void* mh, uintptr_t slide)
 {
+	int has_unwind = eh_frame_has_unwind_info(mh);
+
+	if (has_unwind) {
+		const char* binary_path = NULL;
+		struct stat binary_st;
+		if (eh_frame_cache_context(&binary_path, &binary_st) == 0 &&
+		    eh_frame_register_cached(mh, slide, binary_path, &binary_st) == 0) {
+			eh_frame_hooks_install();
+			return 0;
+		}
+	}
+
+	int result = eh_frame_generate_and_register(mh, slide);
+	return result;
+}
+
+int eh_frame_generate_and_register(void* mh, uintptr_t slide)
+{
+	uint64_t phase_start_ms = machgate_phase_now_ms();
 	struct mach_header_64* header = (struct mach_header_64*)mh;
 	uint8_t* cmd_ptr = (uint8_t*)(header + 1);
 
@@ -1413,38 +1654,58 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 			                      nat_shadowed_count);
 		}
 
+		if (slide == 0 && startup_cache_enabled() &&
+		    cie_personality_value_offset > 0 &&
+		    cie_personality_value_offset + 8 <= macho_eh_frame_size) {
+			pending_cache_eh_frame = (uint8_t*)malloc(macho_eh_frame_size);
+			if (pending_cache_eh_frame) {
+				memcpy(pending_cache_eh_frame, ehf_buf, macho_eh_frame_size);
+				pending_cache_eh_frame_size = macho_eh_frame_size;
+
+				uint64_t* pairs = (uint64_t*)malloc(
+					(size_t)total_count * 2 * sizeof(uint64_t));
+				if (pairs) {
+					for (int i = 0; i < total_count; i++) {
+						pairs[2 * i] = all_entries[i].initial_location;
+						pairs[2 * i + 1] =
+							(uint64_t)(uintptr_t)
+							((const uint8_t*)(uintptr_t)all_entries[i].fde_ptr - ehf_buf);
+					}
+					pending_cache_hdr_pairs = pairs;
+					pending_cache_hdr_pairs_size =
+						(size_t)total_count * 2 * sizeof(uint64_t);
+				}
+				pending_cache_personality_offset = cie_personality_value_offset;
+				pending_cache_fde_count = (uint32_t)fdes_emitted;
+			}
+		}
+
 		free(syn_entries);
 		free(all_entries);
 	}
 
-	/* Register with __register_frame for older unwinder path (GCC <15 / glibc <2.35) */
-	{
-		void (*reg_frame)(const void *) = dlsym(RTLD_DEFAULT, "__register_frame");
-		if (reg_frame) {
-			reg_frame(ehf_buf);
-			machgate_log_startup("eh_frame: registered %d synthetic FDEs via __register_frame\n",
-			                      fdes_emitted);
-			if (native_eh_frame && native_eh_frame_size > 0) {
-				machgate_log_startup("eh_frame: native __eh_frame served by _dl_find_object hook (%zu bytes, %d FDEs)\n",
-				                      native_eh_frame_size, native_fde_count);
-			}
-		} else {
-			fprintf(stderr, "eh_frame: WARNING: __register_frame not found\n");
-		}
-	}
-
-	/* Resolve real _dl_find_object from glibc for forwarding non-Mach-O queries */
-	{
-		real_dl_find_object = dlsym(RTLD_NEXT, "_dl_find_object");
-		if (real_dl_find_object) {
-			machgate_log_startup("eh_frame: _dl_find_object hook active for %p..%p\n",
-			                      (void*)macho_text_start, (void*)macho_text_end);
-		} else {
-			fprintf(stderr, "eh_frame: using __register_frame only "
-			        "(no _dl_find_object in this glibc)\n");
-		}
-	}
-
 	free(native_entries);
+	eh_frame_hooks_install();
+	machgate_phase_log("eh_frame: generated", phase_start_ms);
 	return 0;
+}
+
+void eh_frame_hooks_install(void)
+{
+	void (*reg_frame)(const void *) = dlsym(RTLD_DEFAULT, "__register_frame");
+	if (reg_frame && macho_eh_frame) {
+		reg_frame(macho_eh_frame);
+		machgate_log_startup("eh_frame: registered synthetic FDEs via __register_frame\n");
+	} else if (!reg_frame) {
+		fprintf(stderr, "eh_frame: WARNING: __register_frame not found\n");
+	}
+
+	real_dl_find_object = dlsym(RTLD_NEXT, "_dl_find_object");
+	if (real_dl_find_object) {
+		machgate_log_startup("eh_frame: _dl_find_object hook active for %p..%p\n",
+		                      (void*)macho_text_start, (void*)macho_text_end);
+	} else {
+		fprintf(stderr, "eh_frame: using __register_frame only "
+		        "(no _dl_find_object in this glibc)\n");
+	}
 }
