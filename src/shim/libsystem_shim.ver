@@ -245,6 +245,10 @@ GLIBC_2.17 {
         __ulock_wait;
         __ulock_wait2;
         __ulock_wake;
+        OSAtomicAdd64;
+        OSAtomicCompareAndSwap64;
+        OSAtomicDecrement64;
+        OSAtomicIncrement64;
         _dispatch_source_type_mach_recv;
         _os_signpost_emit_with_name_impl;
         dispatch_once_f;

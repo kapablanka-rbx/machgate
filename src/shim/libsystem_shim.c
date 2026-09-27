@@ -11140,6 +11140,31 @@ void os_unfair_lock_assert_owner(uint32_t* lock)
 	(void)lock;
 }
 
+int OSAtomicCompareAndSwap64(int64_t old_value, int64_t new_value,
+                             volatile int64_t* address)
+{
+	if (!address)
+		return 0;
+	return __sync_bool_compare_and_swap(address, old_value, new_value) ? 1 : 0;
+}
+
+int64_t OSAtomicAdd64(int64_t amount, volatile int64_t* address)
+{
+	if (!address)
+		return 0;
+	return __sync_fetch_and_add(address, amount) + amount;
+}
+
+int64_t OSAtomicIncrement64(volatile int64_t* address)
+{
+	return OSAtomicAdd64(1, address);
+}
+
+int64_t OSAtomicDecrement64(volatile int64_t* address)
+{
+	return OSAtomicAdd64(-1, address);
+}
+
 #define DARWIN_UL_OPCODE_MASK 0x000000ffU
 #define DARWIN_ULF_NO_ERRNO 0x01000000U
 #define DARWIN_ULF_WAKE_ALL 0x00000100U
