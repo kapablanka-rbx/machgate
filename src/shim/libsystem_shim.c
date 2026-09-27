@@ -19952,6 +19952,10 @@ void objc_setProperty_atomic(void* receiver, void* sel, void* value,
                              uintptr_t offset)
 {
 	(void)sel;
+	if (shim_objc_msgsend_trace_enabled())
+		fprintf(stderr,
+		        "libsystem_shim: setProperty self=%p value=%p offset=%#lx\n",
+		        receiver, value, (unsigned long)offset);
 	if (!receiver)
 		return;
 	*(void**)((char*)receiver + offset) = value;
