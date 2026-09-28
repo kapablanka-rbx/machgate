@@ -1937,6 +1937,11 @@ static void setup_tlv_image(struct load_results* lr)
 		if (shim)
 			machgate_log_startup("machgate: TLV shim located via resolver handle\n");
 	}
+	if (!shim) {
+		shim = dlopen("libsystem_shim.so", RTLD_LAZY | RTLD_GLOBAL);
+		if (shim)
+			machgate_log_startup("machgate: TLV shim loaded on demand\n");
+	}
 	if (shim) {
 		void** p_base = (void**)dlsym(shim, "__tlv_image_base");
 		size_t* p_size = (size_t*)dlsym(shim, "__tlv_image_size");
