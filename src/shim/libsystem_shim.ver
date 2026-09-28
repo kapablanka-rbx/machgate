@@ -44,6 +44,17 @@ GLIBC_2.17 {
         OBJC_CLASS_$_NSArray;
         OBJC_CLASS_$_NSDictionary;
         OBJC_CLASS_$_NSJSONSerialization;
+        OBJC_CLASS_$_NSCondition;
+        OBJC_CLASS_$_NSError;
+        OBJC_CLASS_$_MachGateGenericObject;
+        OBJC_CLASS_$_NSNotificationCenter;
+        NSHTTPCookieManagerCookiesChangedNotification;
+        objc_initWeak;
+        objc_storeWeak;
+        objc_loadWeak;
+        objc_loadWeakRetained;
+        objc_destroyWeak;
+        objc_copyWeak;
         __NSDictionary0__;
         __NSArray0__;
         __CFConstantStringClassReference;
@@ -53,6 +64,7 @@ GLIBC_2.17 {
         NSHTTPCookieOriginURL;
         NSHTTPCookiePath;
         NSHTTPCookieValue;
+        NSLocalizedDescriptionKey;
         OBJC_CLASS_$_NSMutableDictionary;
         OBJC_CLASS_$_NSFileManager;
         OBJC_CLASS_$_NSFileHandle;

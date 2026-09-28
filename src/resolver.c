@@ -729,15 +729,22 @@ static int is_shim_objc_class_symbol(const char* sym_name)
 static uintptr_t resolve_shim_objc_class_symbol(const char* sym_name)
 {
 	const char* lookup = sym_name;
+	void* class_object;
 
 	if (lookup[0] == '_')
 		lookup++;
 
-	void* class_object = dlsym(RTLD_DEFAULT, lookup);
+	class_object = dlsym(RTLD_DEFAULT, lookup);
+	if (class_object)
+		return (uintptr_t)class_object;
 
-	if (!class_object)
-		return 0;
-	return (uintptr_t)class_object;
+	if (strncmp(lookup, "OBJC_CLASS_$_", 13) == 0) {
+		class_object = dlsym(RTLD_DEFAULT,
+		                     "OBJC_CLASS_$_MachGateGenericObject");
+		if (class_object)
+			return (uintptr_t)class_object;
+	}
+	return 0;
 }
 
 static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
