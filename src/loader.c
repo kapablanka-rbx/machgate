@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "loader.h"
+#include "guest_cpus.h"
 #include "log.h"
 
 static int native_prot(int prot);
@@ -291,6 +292,16 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				{
 					struct uuid_command* ue = (struct uuid_command*) lc;
 					memcpy(lr->uuid, ue->uuid, sizeof(ue->uuid));
+				}
+				break;
+			}
+			case LC_BUILD_VERSION:
+			{
+				if (header.filetype == MH_EXECUTE)
+				{
+					struct macho_build_version_command* bv =
+						(struct macho_build_version_command*) lc;
+					machgate_set_guest_platform((int)bv->platform);
 				}
 				break;
 			}

@@ -1,30 +1,44 @@
 #include "guest_cpus.h"
 
+#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-
-/*
- * Guests size thread pools and parallel work from the reported CPU count.
- * On the 64-core devspace that made every resident guest daemon spawn
- * 64-thread pools, oversubscribing the host. MACHGATE_GUEST_NCPU caps the
- * count; when unset, iOS binaries default to iPhone-class hardware (6 cores)
- * because the guest was built for that device class, and everything else
- * falls back to the host count.
- */
 
 #define IOS_DEFAULT_CPU_COUNT 6
 
-static int guest_binary_is_ios(void)
+/*
+ * The guest platform is a load-time fact: the binary's LC_BUILD_VERSION
+ * declares it and the loader records it once before guest execution. It never
+ * changes after being set — one machgate process runs one guest, and the
+ * guest's mode is that guest's identity. This is what lets a single host run
+ * iOS and macOS guests side by side: each process reads its own guest's mode.
+ */
+
+static int detected_platform = 0;
+
+void machgate_set_guest_platform(int macho_platform)
 {
-	const char* ios_hint = getenv("MACHGATE_GUEST_IOS");
-	if (ios_hint && *ios_hint) {
-		return ios_hint[0] == '1' ||
-		       strcmp(ios_hint, "on") == 0 ||
-		       strcmp(ios_hint, "true") == 0;
+	if (detected_platform == 0)
+		detected_platform = macho_platform;
+}
+
+int machgate_guest_platform(void)
+{
+	return detected_platform;
+}
+
+const char* machgate_guest_platform_name(void)
+{
+	switch (detected_platform) {
+	case 2:
+		return "ios";
+	case 1:
+		return "macos";
+	case 7:
+		return "ios-simulator";
+	default:
+		return "host";
 	}
-	const char* platform = getenv("MACHGATE_GUEST_PLATFORM");
-	return platform && strcmp(platform, "ios") == 0;
 }
 
 int guest_cpu_count(void)
@@ -41,7 +55,7 @@ int guest_cpu_count(void)
 			result = parsed;
 	}
 
-	if (!result && guest_binary_is_ios())
+	if (!result && (detected_platform == 2 || detected_platform == 7))
 		result = IOS_DEFAULT_CPU_COUNT;
 
 	if (!result) {

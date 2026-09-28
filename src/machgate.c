@@ -37,6 +37,7 @@
 #include "gdb_jit.h"
 #include "patcher.h"
 #include "config.h"
+#include "guest_cpus.h"
 #include "bgfx_shim.h"
 #include "sdl_window_shim.h"
 #include "eh_frame.h"
@@ -1107,7 +1108,9 @@ int main(int argc, char** argv, char** envp)
 	 * The resolver handles MACHO: entries in dylib_map.conf by loading
 	 * Mach-O dylibs and looking up symbols in their LC_SYMTAB.
 	 * Order: resolve main exe first (which triggers dylib loading),
-	 * then resolve each loaded dylib's own fixups. */
+	 * then resolve each loaded Mach-O dylib's own fixups. */
+	machgate_log_startup("machgate: guest platform %s (%d cpus)\n",
+	                     machgate_guest_platform_name(), guest_cpu_count());
 	if (machgate_load_results.mh && cfg.dylib_map) {
 		uint64_t resolver_phase_ms = machgate_phase_now_ms();
 		resolver_resolve_fixups((void*)machgate_load_results.mh,
@@ -1943,6 +1946,9 @@ static void setup_tlv_image(struct load_results* lr)
 			machgate_log_startup("machgate: TLV shim loaded on demand\n");
 	}
 	if (shim) {
+		int* p_ncpu = (int*)dlsym(shim, "machgate_shim_guest_ncpu");
+		if (p_ncpu)
+			*p_ncpu = guest_cpu_count();
 		void** p_base = (void**)dlsym(shim, "__tlv_image_base");
 		size_t* p_size = (size_t*)dlsym(shim, "__tlv_image_size");
 	size_t* p_bss = (size_t*)dlsym(shim, "__tlv_bss_size");

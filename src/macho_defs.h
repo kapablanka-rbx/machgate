@@ -107,6 +107,20 @@ struct mach_header_64 {
 #define LC_MAIN              (0x28 | LC_REQ_DYLD)
 #define LC_SOURCE_VERSION    0x2A
 #define LC_REEXPORT_DYLIB    (0x1f | LC_REQ_DYLD)
+#define LC_BUILD_VERSION     0x32
+
+#define MACHO_PLATFORM_MACOS 1
+#define MACHO_PLATFORM_IOS   2
+#define MACHO_PLATFORM_IOSSIMULATOR 7
+
+struct macho_build_version_command {
+	uint32_t cmd;
+	uint32_t cmdsize;
+	uint32_t platform;
+	uint32_t minos;
+	uint32_t sdk;
+	uint32_t ntools;
+};
 
 /* --- LC_DYLD_INFO / LC_DYLD_INFO_ONLY --- */
 

@@ -12137,6 +12137,8 @@ static const char darwin_osproductversion[] = "15.6";
 static const char darwin_machine[] = "arm64";
 static const char darwin_model[] = "VirtualMac2,1";
 
+int machgate_shim_guest_ncpu = 0;
+
 static int shim_hw_ncpu(void)
 {
 	const char* override = getenv("MACHGATE_GUEST_NCPU");
@@ -12145,6 +12147,8 @@ static int shim_hw_ncpu(void)
 		if (parsed >= 1 && parsed <= 255)
 			return parsed;
 	}
+	if (machgate_shim_guest_ncpu >= 1)
+		return machgate_shim_guest_ncpu;
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
 	return (n < 1) ? 1 : (int)n;
 }
