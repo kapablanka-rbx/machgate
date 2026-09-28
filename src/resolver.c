@@ -681,11 +681,17 @@ static void trace_target_binding(const char* context,
 
 enum { SHIM_OBJC_MAGIC = 0x4F424A43 };
 enum shim_objc_kind { SHIM_OBJC_STRING = 3 };
+enum resolver_shim_instance_kind { RESOLVER_SHIM_INSTANCE_NSAPPLICATION = 34 };
 
 struct shim_objc_string_stub {
 	uint32_t magic;
 	uint32_t kind;
 	char utf8[sizeof("public.utf8-plain-text")];
+};
+
+struct resolver_shim_instance_stub {
+	uint32_t magic;
+	uint32_t kind;
 };
 
 static uintptr_t resolve_asan_data_symbol(const char* sym_name)
@@ -743,6 +749,10 @@ static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
 		"public.utf8-plain-text",
 	};
 	static const void* ns_pasteboard_type_string = &ns_pasteboard_type_string_obj;
+	static const struct resolver_shim_instance_stub nsapplication_singleton = {
+		SHIM_OBJC_MAGIC,
+		RESOLVER_SHIM_INSTANCE_NSAPPLICATION,
+	};
 
 	if (!de)
 		return 0;
@@ -750,6 +760,9 @@ static uintptr_t resolve_non_gui_framework_data(const struct dylib_entry* de,
 	if (strcmp(de->name, "AppKit") == 0 &&
 	    strcmp(sym_name, "_NSPasteboardTypeString") == 0)
 		return (uintptr_t)&ns_pasteboard_type_string;
+	if (strcmp(de->name, "AppKit") == 0 &&
+	    strcmp(sym_name, "_NSApp") == 0)
+		return (uintptr_t)&nsapplication_singleton;
 
 	if (is_shim_objc_class_symbol(sym_name))
 		return resolve_shim_objc_class_symbol(sym_name);
@@ -2371,6 +2384,20 @@ static int process_chained_fixups(struct resolver_state* rs)
 
 /* ---- Shared stub allocator ---- */
 
+static int is_likely_data_symbol(const char* sym_name)
+{
+	if (!sym_name || sym_name[0] != '_')
+		return 0;
+	const char* body = sym_name + 1;
+	if (strncmp(body, "OBJC_CLASS_$_", 13) == 0)
+		return 0;
+	if (strncmp(body, "OBJC_METACLASS_$_", 18) == 0)
+		return 0;
+	if (body[0] == '_' || (body[0] >= 'A' && body[0] <= 'Z'))
+		return 1;
+	return 0;
+}
+
 static uintptr_t alloc_return0_stub(void)
 {
 	static uint8_t* pool = NULL;
@@ -2389,6 +2416,24 @@ static uintptr_t alloc_return0_stub(void)
 	__builtin___clear_cache((char*)code, (char*)(code + 2));
 	used += 128;
 	return slot;
+}
+
+/* ---- Data-symbol stub ----
+ * Skipped libraries also export data symbols (e.g. AppKit's _NSApp).
+ * Binding those to executable return-0 code lets a guest ldr+msgSend treat
+ * the code bytes as an object pointer and SIGSEGV. Data symbols get a
+ * zero-filled read-only page instead: dereferences yield a null-ish object
+ * and the shim's nil-receiver paths handle it. */
+
+static uintptr_t alloc_zero_data_stub(void)
+{
+	static void* page = NULL;
+	if (!page) {
+		page = mmap(NULL, 4096, PROT_READ,
+		            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+		if (page == MAP_FAILED) { page = NULL; return 0; }
+	}
+	return (uintptr_t)page;
 }
 
 /* ---- Deferred library completion ----
@@ -2895,6 +2940,8 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 alloc_stub_slot:
 	{
 		uintptr_t result = alloc_return0_stub();
+		if (is_likely_data_symbol(sym_name))
+			result = alloc_zero_data_stub();
 		trace_target_binding("chained-stub", sym_name, lookup_name,
 		                     lib_ordinal, trace_de, slot_addr, result,
 		                     "stub/fail", trace_de ? trace_de->so_path : "stub/fail");

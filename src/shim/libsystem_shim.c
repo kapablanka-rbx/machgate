@@ -17417,6 +17417,7 @@ enum shim_objc_kind {
 	SHIM_OBJC_INSTANCE_NSMUTABLEARRAY,
 	SHIM_OBJC_CLASS_NSDICTIONARY,
 	SHIM_OBJC_CLASS_NSJSONSERIALIZATION,
+	SHIM_OBJC_INSTANCE_NSAPPLICATION,
 	SHIM_OBJC_CLASS_NSMUTABLESTRING,
 };
 
@@ -17519,6 +17520,10 @@ static struct shim_objc_header shim_processinfo_singleton = {
 
 static struct shim_objc_header shim_cookie_storage_singleton = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE,
+};
+
+static struct shim_objc_header shim_nsapplication_singleton = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSAPPLICATION,
 };
 
 static struct shim_objc_header shim_filemanager_singleton = {
@@ -19943,11 +19948,10 @@ void* objc_msgSendSuper2(struct guest_objc_super* super_data, void* sel, ...)
 	return NULL;
 }
 
-void* objc_getProperty(void* receiver, void* sel, void* value,
-                       uintptr_t offset, int atomic_flag)
+void* objc_getProperty(void* receiver, void* sel, uintptr_t offset,
+                       int atomic_flag)
 {
 	(void)sel;
-	(void)value;
 	(void)atomic_flag;
 	if (!receiver)
 		return NULL;
