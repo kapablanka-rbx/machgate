@@ -12952,13 +12952,185 @@ void dispatch_async_f(void *queue, void *context, dispatch_function_t function)
 		function(context);
 }
 
-void dispatch_after_f(uint64_t when, void *queue, void *context,
-                     dispatch_function_t function)
+/* ---- Delayed dispatch (dispatch_after) ----
+ * Darwin dispatch_time_t values are CLOCK_MONOTONIC nanoseconds with
+ * DISPATCH_TIME_NOW=0 and DISPATCH_TIME_FOREVER=~0 sentinels. A single
+ * manager thread sleeps on a condvar until the earliest deadline and
+ * then posts the block onto the target queue via dispatch_async. */
+
+struct dispatch_delayed_item {
+	struct dispatch_delayed_item* next;
+	uint64_t deadline_ns;
+	void* queue;
+	void* block;
+	void* context;
+	void (*function)(void* context);
+};
+
+static pthread_mutex_t dispatch_delayed_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dispatch_delayed_cond = PTHREAD_COND_INITIALIZER;
+static struct dispatch_delayed_item* dispatch_delayed_head;
+static int dispatch_delayed_started;
+
+static uint64_t dispatch_monotonic_now_ns(void)
 {
-	(void)when;
-	(void)queue;
-	if (function)
-		function(context);
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void dispatch_post_item(void* queue, void* block, void* context,
+                               void (*function)(void* context))
+{
+	if (block) {
+		dispatch_async(queue, block);
+		return;
+	}
+	if (function) {
+		struct dispatch_queue* serial = queue;
+		if (serial && serial->type == DISPATCH_OBJ_QUEUE &&
+		    serial->serial && dispatch_start_serial_worker(serial)) {
+			struct dispatch_work_item* item = malloc(sizeof(*item));
+			if (!item) {
+				function(context);
+				return;
+			}
+			item->block = NULL;
+			item->context = context;
+			item->function = function;
+			item->next = NULL;
+			pthread_mutex_lock(&serial->mutex);
+			if (serial->tail)
+				serial->tail->next = item;
+			else
+				serial->head = item;
+			serial->tail = item;
+			pthread_cond_signal(&serial->cond);
+			pthread_mutex_unlock(&serial->mutex);
+			return;
+		}
+		dispatch_pool_start_workers();
+		if (!dispatch_pool_started) {
+			function(context);
+			return;
+		}
+		struct dispatch_work_item* item = malloc(sizeof(*item));
+		if (!item) {
+			function(context);
+			return;
+		}
+		item->block = NULL;
+		item->context = context;
+		item->function = function;
+		item->next = NULL;
+		dispatch_pool_post(item);
+	}
+}
+
+static void* dispatch_delayed_worker(void* arg)
+{
+	(void)arg;
+	for (;;) {
+		struct dispatch_delayed_item* ready_head = NULL;
+		struct dispatch_delayed_item* ready_tail = NULL;
+
+		pthread_mutex_lock(&dispatch_delayed_mutex);
+		while (!dispatch_delayed_head)
+			pthread_cond_wait(&dispatch_delayed_cond,
+			                  &dispatch_delayed_mutex);
+		uint64_t now = dispatch_monotonic_now_ns();
+		while (dispatch_delayed_head &&
+		       dispatch_delayed_head->deadline_ns <= now) {
+			struct dispatch_delayed_item* item =
+				dispatch_delayed_head;
+			dispatch_delayed_head = item->next;
+			item->next = NULL;
+			if (ready_tail) {
+				ready_tail->next = item;
+			} else {
+				ready_head = item;
+			}
+			ready_tail = item;
+		}
+		if (dispatch_delayed_head) {
+			struct timespec deadline;
+			uint64_t remaining =
+				dispatch_delayed_head->deadline_ns - now;
+			deadline.tv_sec = (time_t)(remaining / 1000000000ULL);
+			deadline.tv_nsec = (long)(remaining % 1000000000ULL);
+			pthread_cond_timedwait(&dispatch_delayed_cond,
+			                       &dispatch_delayed_mutex, &deadline);
+		}
+		pthread_mutex_unlock(&dispatch_delayed_mutex);
+
+		while (ready_head) {
+			struct dispatch_delayed_item* item = ready_head;
+			ready_head = item->next;
+			dispatch_post_item(item->queue, item->block,
+			                  item->context, item->function);
+			free(item);
+		}
+	}
+	return NULL;
+}
+
+static void dispatch_delayed_schedule(uint64_t when, void* queue, void* block,
+                                      void* context,
+                                      void (*function)(void* context))
+{
+	static int (*real_pthread_create_fn)(pthread_t*, const pthread_attr_t*,
+	                                     void* (*)(void*), void*) = NULL;
+	struct dispatch_delayed_item* item;
+	struct dispatch_delayed_item** link;
+
+	if (when == ~(uint64_t)0)
+		return;
+	if (when <= dispatch_monotonic_now_ns()) {
+		dispatch_post_item(queue, block, context, function);
+		return;
+	}
+
+	item = malloc(sizeof(*item));
+	if (!item) {
+		dispatch_post_item(queue, block, context, function);
+		return;
+	}
+	item->deadline_ns = when;
+	item->queue = queue;
+	item->block = block;
+	item->context = context;
+	item->function = function;
+	item->next = NULL;
+
+	pthread_mutex_lock(&dispatch_delayed_mutex);
+	link = &dispatch_delayed_head;
+	while (*link && (*link)->deadline_ns <= when)
+		link = &(*link)->next;
+	item->next = *link;
+	*link = item;
+	pthread_cond_signal(&dispatch_delayed_cond);
+	pthread_mutex_unlock(&dispatch_delayed_mutex);
+
+	if (!real_pthread_create_fn)
+		real_pthread_create_fn = dlsym(RTLD_NEXT, "pthread_create");
+	if (real_pthread_create_fn && !dispatch_delayed_started) {
+		pthread_t worker;
+		if (real_pthread_create_fn(&worker, NULL,
+		                          dispatch_delayed_worker,
+		                          NULL) == 0) {
+			pthread_detach(worker);
+			dispatch_delayed_started = 1;
+		}
+	}
+}
+
+void dispatch_after_f(uint64_t when, void *queue, void *context,
+                      dispatch_function_t function)
+{
+	if (!function)
+		return;
+	dispatch_delayed_schedule(when, queue, NULL, context, function);
 }
 
 void dispatch_sync_f(void *queue, void *context, dispatch_function_t function)
@@ -13157,8 +13329,14 @@ void dispatch_source_cancel(void* source_ref)
 
 void dispatch_after(uint64_t when, void* queue, void* block)
 {
-	(void)when;
-	dispatch_async(queue, block);
+	if (!block)
+		return;
+	void* owned = block_copy_internal(block);
+	if (!owned) {
+		dispatch_delayed_schedule(when, queue, block, NULL, NULL);
+		return;
+	}
+	dispatch_delayed_schedule(when, queue, owned, NULL, NULL);
 }
 
 void dispatch_resume(void* object)
@@ -18846,6 +19024,8 @@ static void* shim_objc_generic_msgsend(void* receiver, const char* selector,
 
 	if (strcmp(selector, "objectAtIndexedSubscript:") == 0 ||
 	    strcmp(selector, "objectForKeyedSubscript:") == 0)
+		return NULL;
+	if (strcmp(selector, "countByEnumeratingWithState:objects:count:") == 0)
 		return NULL;
 	if (strcmp(selector, "addObject:") == 0) {
 		shim_objc_generic_set_property(object, "object", (void*)a2);
