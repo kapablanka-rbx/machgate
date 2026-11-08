@@ -28,10 +28,9 @@ struct machgate_rune_locale _DefaultRuneLocale;
 
 static uint32_t ascii_rune_flags(unsigned int character)
 {
-	if (character <= 0x1f || character == 0x7f)
-		return MACHGATE_CTYPE_CONTROL;
-
 	uint32_t flags = 0;
+	if (character <= 0x1f || character == 0x7f)
+		flags |= MACHGATE_CTYPE_CONTROL;
 	if (character == ' ' || character == '\t')
 		flags |= MACHGATE_CTYPE_BLANK;
 	if (character == ' ' || (character >= '\t' && character <= '\r'))

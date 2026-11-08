@@ -6,13 +6,12 @@ An exported name alone does not establish its calling convention, error
 contract, ownership, initialization order, or lifetime. The supported target
 remains ARM64 command-line guests on ARM64 Linux.
 
-Latest validation (2026-11-08): the normal build passes 94/94 MachGate
-scripts after fixing thread-pointer rewriting in large mapped images. A
-focused TDS daemon/MachGate run of the previously blocked noopt App.Audio
-driver passes two registrations, flags off/on. Interface enumeration and
-explicit socket-option mappings are also in this build. This is not completion
-of this worklist. See `../kapa-prompts/machgate/tds-large-image-fix.md` and
-`../kapa-prompts/machgate/network-contract-audit.md` for evidence and open gaps.
+Latest core validation (2026-11-08): the isolated `build/ios-contract` build
+passes 114/114 MachGate scripts, including regressions for ASCII whitespace
+flags and TASK_VM_INFO revision/count handling. Those regressions fail on
+the published v0.3.58 shim. TASK_VM_INFO now implements revisions 0/1 using
+the archive's RSS-based estimates; complete XNU ledger accounting remains
+unsupported. This is not completion of this worklist.
 
 Historical baselines supplied by the user (not yet reproduced with this
 checkout): macOS ARM64, about 5 minutes, 52K tests, 99.6% passing, 150–230
@@ -25,6 +24,7 @@ measurements so changes in the corpus are visible.
 | Allocation ownership | Apple libmalloc/Libc allocation interfaces; LLVM allocator callers | Size/zone/guest-C++ ownership tests; archive's sharded tracker passes concurrent growth and churn | Review allocation policy separately from the tracker, especially guest/host ownership crossings |
 | Guest VM | XNU VM and BSD mapping interfaces | Existing direct/imported mapping and protection regressions | Inventory archive VM differences and verify alignment, fixed mappings, protection, errno, and teardown |
 | Libc / stdio | Apple Libc and Darwin ARM64 ABI | String/variadic/file-ABI regressions and all inventoried exports | Audit actual implementations; guest code inspecting Darwin FILE layout is not covered by mapping calls to glibc |
+| Character classification / task memory | Apple Libc rune tables; XNU task_info.h and task.c | All ASCII control/space/blank flags; TASK_VM_INFO revisions 0/1, invalid/count boundaries and live footprint growth | Full locale tables and XNU memory ledgers/later task-info revisions remain incomplete |
 | libc++ / libc++abi | Pinned local LLVM libcxx/libcxxabi sources | Apple-ABI libc++ overlay; exception and register-preservation regressions; GNU ICU runtime isolated | Audit allocation, RTTI/unwind, exception ownership, locale, and pthread ABI boundaries |
 | TLS / pthread | dyld TLV descriptors; Apple libpthread and Libc termination | Per-image templates and shared descriptor keys; native thread isolation, alignment, termination, and teardown regressions | Runtime unload with live threads, legacy TLV initializer sections, and shared-cache formats remain unvalidated |
 | Blocks / Objective-C dispatch | LLVM BlocksRuntime; Apple objc4 super lookup and root initialization | Escaped/nested/byref Blocks and captured string lifetime tests; native superclass fallback regression; seven focused engine cases pass with flags off/on | Full weak/GC behavior, newer layout variants and remaining framework behaviors are unvalidated; exported names previously hid no-op Blocks implementations |

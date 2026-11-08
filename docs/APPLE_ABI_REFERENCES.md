@@ -288,3 +288,25 @@ The iOS crash/timeout repair batch also checked these contracts:
   Shared waits still lack a count spanning multiple host processes; their
   existing futex wake behavior is unchanged. This is not a claim of complete
   ulock priority inheritance or shared-wait parity.
+
+The whitespace and task-memory repair checked:
+
+- Apple Libc `locale/FreeBSD/table.c:63-67`: tab has CONTROL, SPACE and BLANK;
+  newline, vertical tab, form feed and carriage return have CONTROL and SPACE.
+  Classification accumulates these flags instead of returning at CONTROL.
+  The local LLVM `libcxx/src/locale.cpp::ctype<char>::classic_table` uses
+  `_DefaultRuneLocale.__runetype` under the Darwin ABI compatibility build.
+  Regression coverage checks all 128 ASCII entries through both the exported
+  table and `__maskrune`.
+- XNU `osfmk/mach/task_info.h::task_vm_info` and
+  `osfmk/kern/task.c::task_info`: TASK_VM_INFO is flavor 22. Revision 0 is
+  144 bytes; revision 1 adds the eight-byte `phys_footprint`. Counts are in
+  32-bit words, a short revision-0 buffer returns KERN_INVALID_ARGUMENT, and
+  output counts advance only at supported revision boundaries. MachGate
+  implements revisions 0/1 and returns 36/38 words, leaving later fields
+  untouched. Its Linux RSS-based footprint and internal-memory estimates
+  follow archive behavior; they are not XNU ledger accounting. Device,
+  purgeable, compressed, external-memory and region counters remain zero.
+  Later revisions and detailed ledger statistics remain unsupported. Tests
+  check sizes, boundaries, sentinel preservation, invalid requests and a
+  footprint increase after faulting in an allocation.

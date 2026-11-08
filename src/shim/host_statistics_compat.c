@@ -29,6 +29,7 @@ enum {
 	DARWIN_TASK_BASIC2_INFO_32 = 6,
 	DARWIN_TASK_BASIC_INFO_64_2 = 18,
 	DARWIN_MACH_TASK_BASIC_INFO = 20,
+	DARWIN_TASK_VM_INFO = 22,
 	DARWIN_LOAD_SCALE = 1000,
 	DARWIN_CPU_STATE_MAX = 4,
 	DARWIN_CPU_STATE_COUNT = 3,
@@ -67,6 +68,29 @@ struct darwin_mach_task_basic_info {
 	struct darwin_time_value system_time;
 	int32_t policy;
 	int32_t suspend_count;
+};
+
+struct darwin_task_vm_info_rev1 {
+	uint64_t virtual_size;
+	int32_t region_count;
+	int32_t page_size;
+	uint64_t resident_size;
+	uint64_t resident_size_peak;
+	uint64_t device;
+	uint64_t device_peak;
+	uint64_t internal;
+	uint64_t internal_peak;
+	uint64_t external;
+	uint64_t external_peak;
+	uint64_t reusable;
+	uint64_t reusable_peak;
+	uint64_t purgeable_volatile_pmap;
+	uint64_t purgeable_volatile_resident;
+	uint64_t purgeable_volatile_virtual;
+	uint64_t compressed;
+	uint64_t compressed_peak;
+	uint64_t compressed_lifetime;
+	uint64_t phys_footprint;
 };
 
 struct darwin_host_load_info {
@@ -128,6 +152,10 @@ _Static_assert(sizeof(struct darwin_task_basic_info_64) == 40,
 	       "Darwin task_basic_info_64 layout changed");
 _Static_assert(sizeof(struct darwin_mach_task_basic_info) == 48,
 	       "Darwin mach_task_basic_info layout changed");
+_Static_assert(sizeof(struct darwin_task_vm_info_rev1) == 152,
+	       "Darwin task_vm_info revision 1 layout changed");
+_Static_assert(offsetof(struct darwin_task_vm_info_rev1, phys_footprint) == 144,
+	       "Darwin task_vm_info revision 0 layout changed");
 _Static_assert(sizeof(struct darwin_vm_statistics) == 60,
 	       "Darwin vm_statistics layout changed");
 _Static_assert(sizeof(struct darwin_vm_statistics64) == 160,
@@ -269,6 +297,27 @@ static int fill_mach_task_basic_info(void* output, uint32_t* count)
 	return copy_counted_output(&info, sizeof(info), output, count);
 }
 
+static int fill_task_vm_info(void* output, uint32_t* count)
+{
+	struct darwin_task_vm_info_rev1 info = { 0 };
+	size_t revision_zero_size = offsetof(
+		struct darwin_task_vm_info_rev1, phys_footprint);
+
+	if (!output || !count || *count < revision_zero_size / sizeof(uint32_t))
+		return DARWIN_KERN_INVALID_ARGUMENT;
+	if (!read_current_process_memory(&info.virtual_size, &info.resident_size,
+	                                 &info.resident_size_peak))
+		return DARWIN_KERN_FAILURE;
+
+	info.page_size = (int32_t)machgate_host_page_size();
+	info.internal = info.resident_size;
+	info.internal_peak = info.resident_size_peak;
+	info.phys_footprint = info.resident_size;
+	size_t output_size = *count >= sizeof(info) / sizeof(uint32_t) ?
+		sizeof(info) : revision_zero_size;
+	return copy_counted_output(&info, output_size, output, count);
+}
+
 int task_info(uint32_t target_task, uint32_t flavor, void* output,
               uint32_t* count)
 {
@@ -284,6 +333,8 @@ int task_info(uint32_t target_task, uint32_t flavor, void* output,
 		return fill_task_basic_info_64(output, count);
 	case DARWIN_MACH_TASK_BASIC_INFO:
 		return fill_mach_task_basic_info(output, count);
+	case DARWIN_TASK_VM_INFO:
+		return fill_task_vm_info(output, count);
 	default:
 		return DARWIN_KERN_NOT_SUPPORTED;
 	}

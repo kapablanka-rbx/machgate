@@ -47,6 +47,61 @@ assert short_count.value == 9
 assert lib.task_info(task + 1, 18, ctypes.byref(info), ctypes.byref(count)) == 4
 assert lib.task_info(task, 0, None, None) == 46
 
+class TaskVMInfoRev1(ctypes.Structure):
+    _pack_ = 4
+    _fields_ = [
+        ('virtual_size', ctypes.c_uint64),
+        ('region_count', ctypes.c_int32),
+        ('page_size', ctypes.c_int32),
+    ] + [(name, ctypes.c_uint64) for name in (
+        'resident_size', 'resident_size_peak', 'device', 'device_peak',
+        'internal', 'internal_peak', 'external', 'external_peak',
+        'reusable', 'reusable_peak', 'purgeable_volatile_pmap',
+        'purgeable_volatile_resident', 'purgeable_volatile_virtual',
+        'compressed', 'compressed_peak', 'compressed_lifetime',
+        'phys_footprint',
+    )]
+
+assert ctypes.sizeof(TaskVMInfoRev1) == 152
+assert TaskVMInfoRev1.phys_footprint.offset == 144
+for supplied_count, expected_count in ((36, 36), (37, 36), (38, 38), (128, 38)):
+    storage = (ctypes.c_uint32 * 128)(*([0x5a5a5a5a] * 128))
+    count = ctypes.c_uint32(supplied_count)
+    assert lib.task_info(task, 22, storage, ctypes.byref(count)) == 0
+    assert count.value == expected_count
+    vm_info = TaskVMInfoRev1.from_buffer(storage)
+    assert vm_info.virtual_size >= vm_info.resident_size > 0
+    assert vm_info.resident_size_peak >= vm_info.resident_size
+    assert vm_info.page_size == os.sysconf('SC_PAGESIZE')
+    if expected_count >= 38:
+        assert vm_info.phys_footprint > 0
+    assert list(storage)[expected_count:] == [0x5a5a5a5a] * (128 - expected_count)
+
+for supplied_count in (0, 35):
+    storage = (ctypes.c_uint32 * 128)(*([0x5a5a5a5a] * 128))
+    count = ctypes.c_uint32(supplied_count)
+    assert lib.task_info(task, 22, storage, ctypes.byref(count)) == 4
+    assert count.value == supplied_count
+    assert list(storage) == [0x5a5a5a5a] * 128
+
+count = ctypes.c_uint32(38)
+assert lib.task_info(task + 1, 22, storage, ctypes.byref(count)) == 4
+assert lib.task_info(task, 22, None, ctypes.byref(count)) == 4
+assert lib.task_info(task, 22, storage, None) == 4
+
+def physical_footprint():
+    vm_info = TaskVMInfoRev1()
+    count = ctypes.c_uint32(38)
+    assert lib.task_info(task, 22, ctypes.byref(vm_info), ctypes.byref(count)) == 0
+    return vm_info.phys_footprint
+
+import mmap
+before = physical_footprint()
+with mmap.mmap(-1, 8 * 1024 * 1024) as allocation:
+    for offset in range(0, len(allocation), os.sysconf('SC_PAGESIZE')):
+        allocation[offset] = 1
+    assert physical_footprint() >= before + 4 * 1024 * 1024
+
 class VMStatistics64(ctypes.Structure):
     _pack_ = 4
     _fields_ = [
