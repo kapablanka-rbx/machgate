@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     pkg-config \
     python3 \
+    ripgrep \
     strace \
     unzip \
     zlib1g-dev \
