@@ -1,5 +1,27 @@
 # Apple ABI references used for the archive port
 
+The November 8 iOS follow-up corrected mutex attribute type translation:
+
+- libpthread `include/pthread/pthread.h:166-169` defines NORMAL0,
+  ERRORCHECK1 and RECURSIVE2. Linux reverses ERRORCHECK and RECURSIVE.
+  `src/pthread_mutex.c:341-349,427-441` defines get/set behavior and rejects
+  values outside those three types. Guest imports use explicit adapters;
+  native ELF providers retain Linux enum semantics.
+- libpthread `include/sys/_pthread/_pthread_types.h:37-47,75-83` defines
+  the LP64 opaque storage used by the Mach-O regression: 16-byte attributes
+  and a 64-byte mutex. The implementation uses the host attribute API for
+  its opaque backing; it does not interpret Apple private bitfields.
+- LLVM `libcxx/include/__threading_support:289-307` in the archive checkout
+  initializes recursive mutexes using the native pthread headers when built
+  as an ELF provider. The native-provider regression checks that this path
+  remains recursive. Archive `src/shim/libsystem_shim.c` has no guest
+  mutexattr type adapters; its static-mutex recursion workaround does not
+  repair explicitly initialized guest attributes.
+
+`tests/test_pthread_mutex_attributes.sh` verifies normal and recursive
+relocking, error-checking EDEADLK, invalid type rejection, native-provider
+isolation, and disabled/cold/warm startup caches.
+
 The third filtered repair batch checked these contracts against the same
 pinned sources below:
 

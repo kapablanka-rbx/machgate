@@ -18,6 +18,14 @@ int machgate_resolve_guest_import_v1(const char* name, void** address)
 	if (!name || !address)
 		return 0;
 
+	if (strcmp(name, "pthread_mutexattr_settype") == 0) {
+		*address = machgate_darwin_pthread_mutexattr_settype;
+		return 1;
+	}
+	if (strcmp(name, "pthread_mutexattr_gettype") == 0) {
+		*address = machgate_darwin_pthread_mutexattr_gettype;
+		return 1;
+	}
 	if (strcmp(name, "pthread_attr_getschedpolicy") == 0) {
 		*address = machgate_darwin_pthread_attr_getschedpolicy;
 		return 1;

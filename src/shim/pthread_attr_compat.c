@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "pthread_attr_compat.h"
+#include "darwin_errno.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -10,6 +11,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+
+enum darwin_mutex_type {
+	DARWIN_MUTEX_NORMAL = 0,
+	DARWIN_MUTEX_ERROR_CHECK = 1,
+	DARWIN_MUTEX_RECURSIVE = 2,
+};
+
+int machgate_darwin_pthread_mutexattr_settype(pthread_mutexattr_t* attributes, int type)
+{
+	int native_type;
+	switch (type) {
+	case DARWIN_MUTEX_NORMAL: native_type = PTHREAD_MUTEX_NORMAL; break;
+	case DARWIN_MUTEX_ERROR_CHECK: native_type = PTHREAD_MUTEX_ERRORCHECK; break;
+	case DARWIN_MUTEX_RECURSIVE: native_type = PTHREAD_MUTEX_RECURSIVE; break;
+	default: return machgate_darwin_errno_from_linux(EINVAL);
+	}
+	return machgate_darwin_errno_from_linux(pthread_mutexattr_settype(attributes, native_type));
+}
+
+int machgate_darwin_pthread_mutexattr_gettype(const pthread_mutexattr_t* attributes, int* type)
+{
+	int native_type;
+	int result = pthread_mutexattr_gettype(attributes, &native_type);
+	if (result != 0)
+		return machgate_darwin_errno_from_linux(result);
+	switch (native_type) {
+	case PTHREAD_MUTEX_NORMAL: *type = DARWIN_MUTEX_NORMAL; return 0;
+	case PTHREAD_MUTEX_ERRORCHECK: *type = DARWIN_MUTEX_ERROR_CHECK; return 0;
+	case PTHREAD_MUTEX_RECURSIVE: *type = DARWIN_MUTEX_RECURSIVE; return 0;
+	default: return machgate_darwin_errno_from_linux(EINVAL);
+	}
+}
 
 struct native_pthread_attr_api {
 	int (*init)(pthread_attr_t*);

@@ -11,5 +11,9 @@ __attribute__((visibility("hidden")))
 int machgate_darwin_pthread_attr_getstacksize(const pthread_attr_t* attr, size_t* stack_size);
 __attribute__((visibility("hidden")))
 int machgate_darwin_pthread_attr_getschedpolicy(const pthread_attr_t* attr, int* policy);
+__attribute__((visibility("hidden")))
+int machgate_darwin_pthread_mutexattr_settype(pthread_mutexattr_t* attributes, int type);
+__attribute__((visibility("hidden")))
+int machgate_darwin_pthread_mutexattr_gettype(const pthread_mutexattr_t* attributes, int* type);
 
 #endif
