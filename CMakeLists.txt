@@ -33,6 +33,7 @@ add_executable(machgate
     src/adapters/guest_execution.c
     src/adapters/guest_platform.c
     src/adapters/guest_libraries.c
+    src/adapters/guest_symbol_lookup.c
     src/adapters/guest_rebase.c
     src/adapters/guest_thread_local.c
     src/adapters/guest_unwind.c
@@ -59,6 +60,8 @@ add_executable(machgate
     src/syscall/guest_vm_dispatch.c
     src/syscall/guest_vm_track.c
     src/syscall/darwin_socket.c
+    src/syscall/darwin_xattr.c
+    src/shim/darwin_errno.c
     src/syscall/syscall_range_000_099.c
     src/syscall/syscall_range_100_199.c
     src/syscall/syscall_range_200_399.c
@@ -98,7 +101,11 @@ add_library(system_shim SHARED
     src/shim/file_operations_abi_entry.S
     src/shim/filesystem_metadata_compat.c
     src/shim/guest_import_resolver.c
+    src/shim/extended_attributes_compat.c
+    src/syscall/darwin_xattr.c
     src/shim/guest_process_compat.c
+    src/shim/guest_environment_compat.c
+    src/shim/image_symbols_compat.c
     src/shim/guest_hardware_compat.c
     src/shim/initializer_context.c
     src/shim/interface_addresses_compat.c

@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "native_provider_guest_import.h"
 #include "interface_addresses_compat.h"
 #include "resource_limit_compat.h"
@@ -5,6 +7,9 @@
 #include "variadic_abi_compat.h"
 #include "darwin_error_messages_compat.h"
 #include "pthread_attr_compat.h"
+#include "extended_attributes_compat.h"
+#include "guest_environment_compat.h"
+#include "image_symbols_compat.h"
 
 #include <string.h>
 
@@ -17,6 +22,50 @@ int machgate_resolve_guest_import_v1(const char* name, void** address)
 {
 	if (!name || !address)
 		return 0;
+	if (strcmp(name, "dladdr") == 0) {
+		*address = machgate_darwin_dladdr;
+		return 1;
+	}
+	if (strcmp(name, "backtrace_symbols") == 0) {
+		*address = machgate_darwin_backtrace_symbols;
+		return 1;
+	}
+	if (strcmp(name, "backtrace_symbols_fd") == 0) {
+		*address = machgate_darwin_backtrace_symbols_fd;
+		return 1;
+	}
+	if (strcmp(name, "setenv") == 0) {
+		*address = machgate_darwin_setenv;
+		return 1;
+	}
+	if (strcmp(name, "unsetenv") == 0) {
+		*address = machgate_darwin_unsetenv;
+		return 1;
+	}
+	if (strcmp(name, "putenv") == 0) {
+		*address = machgate_darwin_putenv;
+		return 1;
+	}
+
+	static const struct {
+		const char* name;
+		void* address;
+	} extended_attributes[] = {
+		{"getxattr", machgate_darwin_getxattr},
+		{"fgetxattr", machgate_darwin_fgetxattr},
+		{"setxattr", machgate_darwin_setxattr},
+		{"fsetxattr", machgate_darwin_fsetxattr},
+		{"removexattr", machgate_darwin_removexattr},
+		{"fremovexattr", machgate_darwin_fremovexattr},
+		{"listxattr", machgate_darwin_listxattr},
+		{"flistxattr", machgate_darwin_flistxattr},
+	};
+	for (size_t index = 0; index < sizeof(extended_attributes) / sizeof(extended_attributes[0]); index++) {
+		if (strcmp(name, extended_attributes[index].name) == 0) {
+			*address = extended_attributes[index].address;
+			return 1;
+		}
+	}
 
 	if (strcmp(name, "pthread_mutexattr_settype") == 0) {
 		*address = machgate_darwin_pthread_mutexattr_settype;

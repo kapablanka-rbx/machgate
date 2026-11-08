@@ -28,7 +28,7 @@
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
-#include <sys/xattr.h>
+#include "syscall/darwin_xattr.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -224,9 +224,6 @@
 #define DARWIN_MNT_NODEV  0x00000010u
 #define DARWIN_MNT_LOCAL  0x00001000u
 
-#define DARWIN_XATTR_NOFOLLOW 0x0001
-#define DARWIN_XATTR_CREATE   0x0002
-#define DARWIN_XATTR_REPLACE  0x0004
 
 #define DARWIN_ACCESSX_MAX_DESCRIPTORS 100
 #define DARWIN_ACCESSX_MAX_TABLESIZE   (16 * 1024)
@@ -4379,28 +4376,11 @@ static void handle_getdirentries64(struct machgate_syscall_frame* state)
 	set_success(state, (uint64_t)darwin_offset);
 }
 
-static int translate_xattr_options(uint32_t darwin_options, int* linux_flags)
-{
-	uint32_t supported = DARWIN_XATTR_NOFOLLOW | DARWIN_XATTR_CREATE |
-	                     DARWIN_XATTR_REPLACE;
-
-	if (darwin_options & ~supported)
-		return 0;
-
-	*linux_flags = 0;
-	if (darwin_options & DARWIN_XATTR_CREATE)
-		*linux_flags |= XATTR_CREATE;
-	if (darwin_options & DARWIN_XATTR_REPLACE)
-		*linux_flags |= XATTR_REPLACE;
-
-	return 1;
-}
-
 static void finish_xattr_result(struct machgate_syscall_frame* state,
                                 long result)
 {
 	if (result < 0)
-		set_failure(state, errno_to_darwin(errno ? errno : EIO));
+		set_failure(state, machgate_xattr_errno_from_linux(errno ? errno : EIO));
 	else
 		set_success(state, (uint64_t)result);
 }
@@ -4770,149 +4750,70 @@ int syscall_range_200_399_dispatch(struct machgate_syscall_frame* state)
 		return 1;
 	}
 	case DARWIN_SYS_getxattr: {
-		if (state->x[4] != 0) {
-			set_failure(state, DARWIN_EINVAL);
+		if (!state->x[0]) {
+			set_failure(state, EFAULT);
 			return 1;
 		}
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[5], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		errno = 0;
-		long result;
-		if ((uint32_t)state->x[5] & DARWIN_XATTR_NOFOLLOW)
-			result = syscall(SYS_lgetxattr, (const char*)state->x[0],
-			                 (const char*)state->x[1], (void*)state->x[2],
-			                 (size_t)state->x[3]);
-		else
-			result = syscall(SYS_getxattr, (const char*)state->x[0],
-			                 (const char*)state->x[1], (void*)state->x[2],
-			                 (size_t)state->x[3]);
-		(void)linux_flags;
+		long result = machgate_xattr_get((const char*)state->x[0], -1,
+			(const char*)state->x[1], (void*)state->x[2], (size_t)state->x[3],
+			(uint32_t)state->x[4], (int)state->x[5]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_fgetxattr: {
-		if (state->x[4] != 0) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[5], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		errno = 0;
-		long result = syscall(SYS_fgetxattr, (int)state->x[0],
-		                      (const char*)state->x[1], (void*)state->x[2],
-		                      (size_t)state->x[3]);
-		(void)linux_flags;
+		long result = machgate_xattr_get(NULL, (int)state->x[0],
+			(const char*)state->x[1], (void*)state->x[2], (size_t)state->x[3],
+			(uint32_t)state->x[4], (int)state->x[5]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_setxattr: {
-		if (state->x[4] != 0) {
-			set_failure(state, DARWIN_EINVAL);
+		if (!state->x[0]) {
+			set_failure(state, EFAULT);
 			return 1;
 		}
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[5], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		errno = 0;
-		long result;
-		if ((uint32_t)state->x[5] & DARWIN_XATTR_NOFOLLOW)
-			result = syscall(SYS_lsetxattr, (const char*)state->x[0],
-			                 (const char*)state->x[1],
-			                 (const void*)state->x[2], (size_t)state->x[3],
-			                 linux_flags);
-		else
-			result = syscall(SYS_setxattr, (const char*)state->x[0],
-			                 (const char*)state->x[1],
-			                 (const void*)state->x[2], (size_t)state->x[3],
-			                 linux_flags);
+		long result = machgate_xattr_set((const char*)state->x[0], -1,
+			(const char*)state->x[1], (const void*)state->x[2], (size_t)state->x[3],
+			(uint32_t)state->x[4], (int)state->x[5]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_fsetxattr: {
-		if (state->x[4] != 0) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[5], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		errno = 0;
-		long result = syscall(SYS_fsetxattr, (int)state->x[0],
-		                      (const char*)state->x[1],
-		                      (const void*)state->x[2], (size_t)state->x[3],
-		                      linux_flags);
+		long result = machgate_xattr_set(NULL, (int)state->x[0],
+			(const char*)state->x[1], (const void*)state->x[2], (size_t)state->x[3],
+			(uint32_t)state->x[4], (int)state->x[5]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_removexattr: {
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[2], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
+		if (!state->x[0]) {
+			set_failure(state, EFAULT);
 			return 1;
 		}
-		errno = 0;
-		long result;
-		if ((uint32_t)state->x[2] & DARWIN_XATTR_NOFOLLOW)
-			result = syscall(SYS_lremovexattr, (const char*)state->x[0],
-			                 (const char*)state->x[1]);
-		else
-			result = syscall(SYS_removexattr, (const char*)state->x[0],
-			                 (const char*)state->x[1]);
-		(void)linux_flags;
+		long result = machgate_xattr_remove((const char*)state->x[0], -1,
+			(const char*)state->x[1], (int)state->x[2]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_fremovexattr: {
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[2], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		errno = 0;
-		long result = syscall(SYS_fremovexattr, (int)state->x[0],
-		                      (const char*)state->x[1]);
-		(void)linux_flags;
+		long result = machgate_xattr_remove(NULL, (int)state->x[0],
+			(const char*)state->x[1], (int)state->x[2]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_listxattr: {
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[3], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
+		if (!state->x[0]) {
+			set_failure(state, EFAULT);
 			return 1;
 		}
-		errno = 0;
-		long result;
-		if ((uint32_t)state->x[3] & DARWIN_XATTR_NOFOLLOW)
-			result = syscall(SYS_llistxattr, (const char*)state->x[0],
-			                 (char*)state->x[1], (size_t)state->x[2]);
-		else
-			result = syscall(SYS_listxattr, (const char*)state->x[0],
-			                 (char*)state->x[1], (size_t)state->x[2]);
-		(void)linux_flags;
+		long result = machgate_xattr_list((const char*)state->x[0], -1,
+			(char*)state->x[1], (size_t)state->x[2], (int)state->x[3]);
 		finish_xattr_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_flistxattr: {
-		int linux_flags = 0;
-		if (!translate_xattr_options((uint32_t)state->x[3], &linux_flags)) {
-			set_failure(state, DARWIN_EINVAL);
-			return 1;
-		}
-		errno = 0;
-		long result = syscall(SYS_flistxattr, (int)state->x[0],
-		                      (char*)state->x[1], (size_t)state->x[2]);
-		(void)linux_flags;
+		long result = machgate_xattr_list(NULL, (int)state->x[0],
+			(char*)state->x[1], (size_t)state->x[2], (int)state->x[3]);
 		finish_xattr_result(state, result);
 		return 1;
 	}

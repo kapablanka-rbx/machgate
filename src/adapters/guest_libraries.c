@@ -4,6 +4,7 @@
 #include "macho_defs.h"
 #include "ports/guest_execution.h"
 #include "ports/guest_image_view.h"
+#include "ports/guest_symbol_lookup.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -26,6 +27,7 @@ static size_t library_count;
 
 void machgate_release_guest_libraries(void)
 {
+	machgate_release_guest_symbol_lookup();
 	while (library_count)
 		machgate_release_guest_image(libraries[--library_count].image);
 	memset(libraries, 0, sizeof(libraries));
@@ -41,6 +43,13 @@ void machgate_begin_guest_linkage(struct machgate_guest_image* image)
 struct machgate_guest_image* machgate_main_guest_image(void)
 {
 	return main_image;
+}
+
+struct machgate_guest_image* machgate_guest_image_at_index(size_t index)
+{
+	if (index == 0)
+		return main_image;
+	return index <= library_count ? libraries[index - 1].image : NULL;
 }
 
 static void record_dependency(struct machgate_guest_image* importer, size_t dependency)

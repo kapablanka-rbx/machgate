@@ -157,6 +157,19 @@ and warm; host `dlsym` coverage alone did not catch this integration bug.
 
 ## Verification
 
+On November 8, the targeted xattr/environment/symbol round rechecked the actual
+archive `build/libsystem_shim.so` against the fixture and current providers:
+**849/849 exports, zero missing, no fixture drift**. Both strict guest binding
+and host export checks passed in the final **113/113** core regression suite.
+This verifies symbol coverage, not full implementation parity.
+
+The selected optimized engine probes improved from **18/47 to 47/47 passing**:
+Crashpad diagnostics 18/21 to 21/21, and Backtrace/symbol-cache tests 0/13 to
+13/13 on each platform. Expanded TDS checks passed **102/102** with both flag
+modes, zero crashes/timeouts and metrics disabled. These include four
+native-module cases per platform beyond the controlled before/after sample.
+No full-corpus improvement or complete archive behavior parity is claimed.
+
 The initial normal build passed **85/85 MachGate test scripts**, **42/42 engine
 launcher tests**, and five focused engine cases. That validation missed an ICU
 dependency regression: GNU RTTI interposed the guest's LLVM C++ runtime. The

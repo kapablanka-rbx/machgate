@@ -387,29 +387,6 @@ void dyld_stub_binder(void)
 {
 }
 
-uint32_t _dyld_image_count(void)
-{
-	return 1;
-}
-
-const void* _dyld_get_image_header(uint32_t image_index)
-{
-	(void)image_index;
-	return NULL;
-}
-
-const char* _dyld_get_image_name(uint32_t image_index)
-{
-	(void)image_index;
-	return NULL;
-}
-
-intptr_t _dyld_get_image_vmaddr_slide(uint32_t image_index)
-{
-	(void)image_index;
-	return 0;
-}
-
 int issetugid(void)
 {
 	return 0;

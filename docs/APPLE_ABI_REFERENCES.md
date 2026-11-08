@@ -1,5 +1,42 @@
 # Apple ABI references used for the archive port
 
+The November 8 targeted TC/local failure round checked these contracts:
+
+- XNU `bsd/sys/xattr.h`, `bsd/sys/errno.h`,
+  `bsd/vfs/vfs_syscalls.c` and `bsd/vfs/vfs_xattr.c`: Darwin xattr names
+  occupy an unqualified namespace, missing attributes report `ENOATTR` (93),
+  and CREATE/REPLACE options differ from Linux. Direct syscall and guest
+  import paths share one backend that maps names into Linux `user.` storage,
+  removes that prefix when listing, and translates errors contextually.
+  Nonzero resource-fork positions and extended options remain unsupported.
+- Libc `stdlib/FreeBSD/setenv.c`, `getenv.c` and `putenv.c`: environment
+  mutation and lookup use the array returned by `_NSGetEnviron`; `putenv`
+  retains the supplied storage. Guest mutation adapters now update that
+  same launch environment after host libc changes its array. The regression
+  verifies replacement, overwrite control, removal and borrowed storage.
+- dyld `dyld/DyldAPIs.cpp::dladdr` and
+  `common/MachOLoaded.cpp::findClosestSymbol`: report the containing Mach-O
+  image and the closest real section symbol, strip the linker underscore,
+  and use `__dso_handle` for an image-header address. The image adapter caches
+  sorted symbol indexes; its port exposes descriptions without leaking Mach-O
+  parsing into the shim. Tests include an executable and an adjacent dylib.
+- Libc `gen/backtrace.c`: Darwin symbol strings use image, hexadecimal PC,
+  symbol and decimal offset fields. The descriptor writer uses a bounded
+  stack buffer. Shared-cache redaction/UUID lookup is not implemented.
+- LLVM `llvm/include/llvm/BinaryFormat/MachO.h`: `nlist_64`, N_STAB/N_SECT
+  and section numbering. The full source reviewed is the sibling
+  `machgate-archive/extern/llvm-project`; the current `extern/llvm-project`
+  directory is not a complete source checkout.
+
+Archive revision `8848b2ebad98b5cccade03df02477393b342d2f0` retains the xattr
+namespace/error defect and dyld image stubs. Its environment lookup also
+prefers the launch snapshot, with a special HOME override, and contains no
+matching guest mutation adapters. Copying those implementations would not
+provide these corrections. A fresh compiled-shim comparison still finds all
+849 archive exports in the current providers; export presence is independent
+of behavioral correctness. No GUI or workload-specific implementation is
+part of this round.
+
 The November 8 iOS follow-up corrected mutex attribute type translation:
 
 - libpthread `include/pthread/pthread.h:166-169` defines NORMAL0,
