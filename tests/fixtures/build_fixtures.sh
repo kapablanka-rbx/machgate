@@ -26,11 +26,40 @@ CLANGXX="${CLANGXX:-$(command -v clang++ || command -v clang++-18 || true)}"
 
 echo "Building test fixtures..."
 
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
+    -o dynamic_lookup_stub.o dynamic_lookup_stub.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -dylib -install_name /usr/lib/libSystem.B.dylib \
+    -o dynamic_lookup_stub.dylib dynamic_lookup_stub.o
+"$CLANGXX" -target arm64-apple-macos11 -x c -O2 -fno-builtin \
+    -fno-stack-protector -nostdlib -c darwin_dynamic_lookup.c \
+    -o darwin_dynamic_lookup.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_dynamic_lookup -e _main darwin_dynamic_lookup.o \
+    dynamic_lookup_stub.dylib
+rm -f dynamic_lookup_stub.o darwin_dynamic_lookup.o
+echo "  Built darwin_dynamic_lookup"
+
+"$CLANGXX" -target arm64-apple-macos11 -x c -O2 -fno-builtin \
+    -fno-stack-protector -nostdlib -c darwin_dlopen_flags.c \
+    -o darwin_dlopen_flags.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_dlopen_flags -e _main darwin_dlopen_flags.o \
+    dynamic_lookup_stub.dylib
+echo "  Built darwin_dlopen_flags"
+
 # --- darwin_exit42: static arm64 Mach-O, Darwin SYS_exit(42) ---
 "$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj -o darwin_exit42.o darwin_exit42.s
 "$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 -o darwin_exit42 -e _main darwin_exit42.o
 rm -f darwin_exit42.o
 echo "  Built darwin_exit42"
+
+"$LLVM_MC" -triple arm64-apple-ios14 -filetype=obj \
+    -o darwin_ios_exit42.o darwin_exit42.s
+"$LD64_LLD" -arch arm64 -platform_version ios 14.0.0 14.0.0 \
+    -o darwin_ios_exit42 -e _main darwin_ios_exit42.o
+rm -f darwin_ios_exit42.o
+echo "  Built darwin_ios_exit42"
 
 # --- darwin_zero_vmsize_debug: debug bytes in a nonmapped segment ---
 "$CLANGXX" -target arm64-apple-macos11 -x c -g -nostdlib \
@@ -157,6 +186,16 @@ EOF
 rm -f cpp_many_ctors.o cpp_many_ctors.cpp
 echo "  Built cpp_many_ctors"
 
+# --- darwin_initializer_working_directory: constructor creates a file beside executable ---
+"$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
+    -fno-stack-protector -nostdlib -c darwin_initializer_working_directory.c \
+    -o darwin_initializer_working_directory.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_initializer_working_directory -e _main \
+    darwin_initializer_working_directory.o
+rm -f darwin_initializer_working_directory.o
+echo "  Built darwin_initializer_working_directory"
+
 # --- darwin_init_offsets: LLVM offset-based static initializer table ---
 "$CLANGXX" -target arm64-apple-macos11 -x c -fno-builtin \
     -fno-stack-protector -nostdlib -c darwin_init_offsets.c \
@@ -198,6 +237,24 @@ rm -f libsystem_fixture.o dynamic_libsystem_call.o \
 echo "  Built dynamic_libsystem_call"
 echo "  Built dynamic_chained_libsystem_call"
 echo "  Built dynamic_resource_limit_imports"
+
+# --- darwin_popen_exit42: popen() of a Mach-O guest re-execs via the loader ---
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
+    -o darwin_popen_exit42.o darwin_popen_exit42.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_popen_exit42 -e _main darwin_popen_exit42.o libsystem_fixture.dylib
+rm -f darwin_popen_exit42.o
+echo "  Built darwin_popen_exit42"
+
+# --- darwin_thread_local_termination: main return runs TLV and TSD cleanup ---
+"$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
+    -fno-stack-protector -nostdlib -c darwin_thread_local_termination.c \
+    -o darwin_thread_local_termination.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_thread_local_termination -e _main \
+    darwin_thread_local_termination.o libsystem_fixture.dylib
+rm -f darwin_thread_local_termination.o
+echo "  Built darwin_thread_local_termination"
 
 "$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
     -fno-stack-protector -fexceptions -funwind-tables -nostdlib \
@@ -246,6 +303,30 @@ echo "  Built dynamic_guest_unwind_registers"
 rm -f dynamic_flat_provider_precedence.o
 echo "  Built dynamic_flat_provider_precedence"
 
+# --- darwin_imported_socket: native imported libSystem socket ABI ---
+"$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
+    -fno-stack-protector -nostdlib -c darwin_imported_socket.c \
+    -o darwin_imported_socket.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_imported_socket -e _main darwin_imported_socket.o \
+    libsystem_fixture.dylib
+rm -f darwin_imported_socket.o
+echo "  Built darwin_imported_socket"
+
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
+    -o interface_addresses_stub.o interface_addresses_stub.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -dylib -install_name /usr/lib/libSystem.B.dylib \
+    -o interface_addresses_stub.dylib interface_addresses_stub.o
+"$CLANGXX" -target arm64-apple-macos11 -x c -O2 -fno-builtin \
+    -fno-stack-protector -nostdlib -c darwin_interface_addresses.c \
+    -o darwin_interface_addresses.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_interface_addresses -e _main darwin_interface_addresses.o \
+    interface_addresses_stub.dylib
+rm -f interface_addresses_stub.o darwin_interface_addresses.o
+echo "  Built darwin_interface_addresses"
+
 # --- darwin_variadic_abi: Darwin stack varargs and char-pointer va_list ---
 "$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
     -fno-stack-protector -nostdlib -c darwin_variadic_abi.c \
@@ -256,7 +337,7 @@ echo "  Built dynamic_flat_provider_precedence"
 rm -f darwin_variadic_abi.o
 echo "  Built darwin_variadic_abi"
 
-# --- darwin_file_variadic_abi: Darwin fcntl/ioctl stack arguments ---
+# --- darwin_file_variadic_abi: Darwin open/fcntl/ioctl file ABI ---
 "$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
     -fno-stack-protector -nostdlib -c darwin_file_variadic_abi.c \
     -o darwin_file_variadic_abi.o
@@ -387,7 +468,7 @@ for fixture in dynamic_lazy_unused dynamic_lazy_called dynamic_skipped_data \
     echo "  Built $fixture"
 done
 
-for fixture in dynamic_lazy_unused dynamic_lazy_called; do
+for fixture in dynamic_lazy_unused dynamic_lazy_called dynamic_stubbed_function; do
     chained_fixture="${fixture/dynamic_/dynamic_chained_}"
     "$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
         -o "$chained_fixture.o" "$fixture.s"
@@ -432,6 +513,18 @@ for backward_bind_case in "${backward_bind_cases[@]}"; do
 done
 
 
+# --- darwin_socket_translation: raw socket ABI regression probe ---
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj -o darwin_socket_translation.o darwin_socket_translation.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 -o darwin_socket_translation -e _main darwin_socket_translation.o
+rm -f darwin_socket_translation.o
+echo "  Built darwin_socket_translation"
+
+# --- darwin_kqueue_psynch: raw kqueue and psynch probe ---
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj -o darwin_kqueue_psynch.o darwin_kqueue_psynch.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 -o darwin_kqueue_psynch -e _main darwin_kqueue_psynch.o
+rm -f darwin_kqueue_psynch.o
+echo "  Built darwin_kqueue_psynch"
+
 # --- darwin_range_000_099: range dispatcher probe ---
 "$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj -o darwin_range_000_099.o darwin_range_000_099.s
 "$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 -o darwin_range_000_099 -e _main darwin_range_000_099.o
@@ -474,6 +567,12 @@ echo "  Built fat_binary"
     -o machgate_trampoline_target -e _main machgate_trampoline_target.o
 rm -f machgate_trampoline_target.o
 echo "  Built machgate_trampoline_target"
+
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
+    -o darwin_cached_syscall.o darwin_cached_syscall.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o darwin_cached_syscall -e _main darwin_cached_syscall.o
+rm -f darwin_cached_syscall.o
 
 # --- native MachGate trampoline provider ---
 gcc -shared -fPIC -o libmachgate_test_provider.so machgate_native_provider.c

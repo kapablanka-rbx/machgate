@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <limits.h>
 #include <sched.h>
+#include <pthread.h>
 #include <semaphore.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -14,6 +16,7 @@ enum machgate_dispatch_kind {
 	MACHGATE_DISPATCH_SEMAPHORE = 1,
 	MACHGATE_DISPATCH_QUEUE = 2,
 	MACHGATE_DISPATCH_DATA = 3,
+	MACHGATE_DISPATCH_GROUP = 4,
 };
 
 struct machgate_dispatch_header {
@@ -66,6 +69,8 @@ static struct machgate_dispatch_queue global_default_queue = {
 	"com.apple.root.default",
 };
 
+static void dispose_dispatch_extensions(void* object);
+
 static uint64_t read_clock_nanoseconds(clockid_t clock)
 {
 	struct timespec current;
@@ -74,6 +79,16 @@ static uint64_t read_clock_nanoseconds(clockid_t clock)
 		return 0;
 	return (uint64_t)current.tv_sec * 1000000000ULL +
 	       (uint64_t)current.tv_nsec;
+}
+
+static clockid_t deadline_clock(uint64_t deadline)
+{
+	return (int64_t)deadline < 0 ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+}
+
+static uint64_t deadline_value(uint64_t deadline)
+{
+	return (int64_t)deadline < 0 ? 0 - deadline : deadline;
 }
 
 static struct timespec realtime_deadline(uint64_t remaining_nanoseconds)
@@ -127,10 +142,15 @@ long dispatch_semaphore_wait(void* semaphore, uint64_t deadline)
 		return result;
 	}
 
-	uint64_t now = read_clock_nanoseconds(CLOCK_MONOTONIC);
-	if (deadline <= now)
+	clockid_t clock = deadline_clock(deadline);
+	uint64_t expiration = deadline_value(deadline);
+	uint64_t now = read_clock_nanoseconds(clock);
+	if (expiration <= now)
 		return sem_trywait(&value->native_semaphore);
-	struct timespec absolute = realtime_deadline(deadline - now);
+	struct timespec absolute = clock == CLOCK_REALTIME
+		? (struct timespec){(time_t)(expiration / 1000000000ULL),
+			(long)(expiration % 1000000000ULL)}
+		: realtime_deadline(expiration - now);
 	int result;
 	do {
 		result = sem_timedwait(&value->native_semaphore, &absolute);
@@ -257,29 +277,35 @@ uint64_t dispatch_time(uint64_t base, int64_t delta)
 		return UINT64_MAX;
 	if (base == 0)
 		base = read_clock_nanoseconds(CLOCK_MONOTONIC);
+	int wall = deadline_clock(base) == CLOCK_REALTIME;
+	uint64_t value = deadline_value(base);
+	if (value > INT64_MAX)
+		return UINT64_MAX;
 	if (delta >= 0) {
 		uint64_t addition = (uint64_t)delta;
-		if (addition > UINT64_MAX - base)
+		if (addition > (uint64_t)INT64_MAX - value)
 			return UINT64_MAX;
-		return base + addition;
+		value += addition;
+	} else {
+		uint64_t subtraction = (uint64_t)(-(delta + 1)) + 1;
+		value = subtraction >= value ? (wall ? 2 : 1) : value - subtraction;
 	}
-
-	uint64_t subtraction = (uint64_t)(-(delta + 1)) + 1;
-	if (subtraction >= base)
-		return 1;
-	return base - subtraction;
+	if (wall && value < 2)
+		value = 2;
+	return wall ? 0 - value : value;
 }
 
 uint64_t dispatch_walltime(const struct timespec* time, int64_t delta)
 {
-	uint64_t base;
-
-	if (time)
-		base = (uint64_t)time->tv_sec * 1000000000ULL +
-		       (uint64_t)time->tv_nsec;
-	else
-		base = read_clock_nanoseconds(CLOCK_REALTIME);
-	return dispatch_time(base, delta);
+	__int128 result = time
+		? (__int128)time->tv_sec * 1000000000 + time->tv_nsec
+		: read_clock_nanoseconds(CLOCK_REALTIME);
+	result += delta;
+	if (result > INT64_MAX)
+		return UINT64_MAX;
+	if (result < 2)
+		return delta >= 0 ? UINT64_MAX : UINT64_MAX - 1;
+	return 0 - (uint64_t)result;
 }
 
 void* dispatch_data_create(const void* buffer, size_t size, void* queue,
@@ -318,9 +344,316 @@ void dispatch_release(void* object)
 	                                         memory_order_acq_rel);
 	if (previous != 1)
 		return;
+	dispose_dispatch_extensions(object);
 	if (header->kind == MACHGATE_DISPATCH_SEMAPHORE) {
 		struct machgate_dispatch_semaphore* semaphore = object;
 		sem_destroy(&semaphore->native_semaphore);
 	}
 	free(object);
+}
+
+extern void* _Block_copy(const void*);
+extern void _Block_release(const void*);
+
+struct dispatch_metadata {
+	void* object;
+	void* context;
+	void (*finalizer)(void*);
+	struct dispatch_metadata* next;
+};
+
+struct dispatch_notification {
+	void* queue;
+	void* block;
+	struct dispatch_notification* next;
+};
+
+struct dispatch_group {
+	struct machgate_dispatch_header header;
+	unsigned long pending;
+	struct dispatch_notification* head;
+	struct dispatch_notification* tail;
+};
+
+static atomic_flag extensions_lock = ATOMIC_FLAG_INIT;
+static struct dispatch_metadata* metadata;
+
+static void lock_extensions(void)
+{
+	while (atomic_flag_test_and_set_explicit(&extensions_lock, memory_order_acquire))
+		sched_yield();
+}
+
+static void unlock_extensions(void)
+{
+	atomic_flag_clear_explicit(&extensions_lock, memory_order_release);
+}
+
+static struct dispatch_metadata* object_metadata(void* object, int create)
+{
+	for (struct dispatch_metadata* entry = metadata; entry; entry = entry->next)
+		if (entry->object == object)
+			return entry;
+	if (!create || !object)
+		return NULL;
+	struct dispatch_metadata* result = calloc(1, sizeof(*result));
+	if (result) {
+		result->object = object;
+		result->next = metadata;
+		metadata = result;
+	}
+	return result;
+}
+
+void dispatch_set_context(void* object, void* context)
+{
+	lock_extensions();
+	struct dispatch_metadata* entry = object_metadata(object, 1);
+	if (entry)
+		entry->context = context;
+	unlock_extensions();
+}
+
+void* dispatch_get_context(void* object)
+{
+	lock_extensions();
+	struct dispatch_metadata* entry = object_metadata(object, 0);
+	void* result = entry ? entry->context : NULL;
+	unlock_extensions();
+	return result;
+}
+
+void dispatch_set_finalizer_f(void* object, void (*finalizer)(void*))
+{
+	lock_extensions();
+	struct dispatch_metadata* entry = object_metadata(object, 1);
+	if (entry)
+		entry->finalizer = finalizer;
+	unlock_extensions();
+}
+
+static void dispose_dispatch_extensions(void* object)
+{
+	lock_extensions();
+	struct dispatch_metadata** link = &metadata;
+	while (*link && (*link)->object != object)
+		link = &(*link)->next;
+	struct dispatch_metadata* entry = *link;
+	if (entry)
+		*link = entry->next;
+	unlock_extensions();
+	if (entry && entry->finalizer && entry->context)
+		entry->finalizer(entry->context);
+	free(entry);
+	struct machgate_dispatch_header* header = object;
+	if (header->kind != MACHGATE_DISPATCH_GROUP)
+		return;
+	struct dispatch_group* group = object;
+	while (group->head) {
+		struct dispatch_notification* notification = group->head;
+		group->head = notification->next;
+		_Block_release(notification->block);
+		dispatch_release(notification->queue);
+		free(notification);
+	}
+}
+
+void* dispatch_queue_create_with_target(const char* label, void* attributes, void* target)
+{
+	(void)target;
+	return dispatch_queue_create(label, attributes);
+}
+
+const char* dispatch_queue_get_label(void* queue)
+{
+	struct machgate_dispatch_queue* value = queue ? queue : &_dispatch_main_q;
+	return value->header.kind == MACHGATE_DISPATCH_QUEUE ? value->label : "";
+}
+
+void dispatch_async_f(void* queue, void* context, void (*function)(void*))
+{
+	(void)queue;
+	if (function)
+		function(context);
+}
+
+void dispatch_sync_f(void* queue, void* context, void (*function)(void*))
+{
+	dispatch_async_f(queue, context, function);
+}
+
+void* dispatch_group_create(void)
+{
+	struct dispatch_group* result = calloc(1, sizeof(*result));
+	if (result) {
+		result->header.kind = MACHGATE_DISPATCH_GROUP;
+		atomic_init(&result->header.reference_count, 1);
+	}
+	return result;
+}
+
+void dispatch_group_enter(void* object)
+{
+	struct dispatch_group* group = object;
+	if (!group)
+		return;
+	lock_extensions();
+	group->pending++;
+	unlock_extensions();
+}
+
+static void post_notifications(struct dispatch_notification* notification)
+{
+	while (notification) {
+		struct dispatch_notification* next = notification->next;
+		dispatch_async(notification->queue, notification->block);
+		_Block_release(notification->block);
+		dispatch_release(notification->queue);
+		free(notification);
+		notification = next;
+	}
+}
+
+void dispatch_group_leave(void* object)
+{
+	struct dispatch_group* group = object;
+	if (!group)
+		return;
+	lock_extensions();
+	if (!group->pending) {
+		unlock_extensions();
+		abort();
+	}
+	struct dispatch_notification* ready = NULL;
+	if (--group->pending == 0) {
+		ready = group->head;
+		group->head = group->tail = NULL;
+	}
+	unlock_extensions();
+	post_notifications(ready);
+}
+
+void dispatch_group_notify(void* object, void* queue, void* block)
+{
+	struct dispatch_group* group = object;
+	if (!group || !block)
+		return;
+	struct dispatch_notification* notification = calloc(1, sizeof(*notification));
+	if (!notification)
+		return;
+	notification->block = _Block_copy(block);
+	notification->queue = queue;
+	dispatch_retain(queue);
+	lock_extensions();
+	if (group->pending) {
+		if (group->tail)
+			group->tail->next = notification;
+		else
+			group->head = notification;
+		group->tail = notification;
+		unlock_extensions();
+		return;
+	}
+	unlock_extensions();
+	post_notifications(notification);
+}
+
+struct delayed_dispatch {
+	uint64_t deadline;
+	void* queue;
+	void* block;
+	void* context;
+	void (*function)(void*);
+};
+
+static void* invoke_delayed(void* argument)
+{
+	struct delayed_dispatch* item = argument;
+	uint64_t expiration = deadline_value(item->deadline);
+	struct timespec deadline = {
+		.tv_sec = (time_t)(expiration / 1000000000ULL),
+		.tv_nsec = (long)(expiration % 1000000000ULL),
+	};
+	int result;
+	do {
+		result = clock_nanosleep(deadline_clock(item->deadline), TIMER_ABSTIME, &deadline, NULL);
+	} while (result == EINTR);
+	if (result == 0) {
+		if (item->block)
+			dispatch_async(item->queue, item->block);
+		else
+			dispatch_async_f(item->queue, item->context, item->function);
+	}
+	_Block_release(item->block);
+	dispatch_release(item->queue);
+	free(item);
+	return NULL;
+}
+
+static void schedule_delayed(uint64_t when, void* queue, void* block,
+	void* context, void (*function)(void*))
+{
+	if (when == UINT64_MAX)
+		return;
+	if (deadline_value(when) <= read_clock_nanoseconds(deadline_clock(when))) {
+		if (block)
+			dispatch_async(queue, block);
+		else
+			dispatch_async_f(queue, context, function);
+		return;
+	}
+	int (*create_thread)(pthread_t*, const pthread_attr_t*, void*(*)(void*), void*) =
+		dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.17");
+	struct delayed_dispatch* item = create_thread ? malloc(sizeof(*item)) : NULL;
+	if (!item)
+		return;
+	*item = (struct delayed_dispatch){when, queue, _Block_copy(block), context, function};
+	dispatch_retain(queue);
+	pthread_t thread;
+	if (create_thread(&thread, NULL, invoke_delayed, item) == 0) {
+		pthread_detach(thread);
+		return;
+	}
+	_Block_release(item->block);
+	dispatch_release(queue);
+	free(item);
+}
+
+void dispatch_after_f(uint64_t when, void* queue, void* context, void (*function)(void*))
+{
+	if (function)
+		schedule_delayed(when, queue, NULL, context, function);
+}
+
+void dispatch_after(uint64_t when, void* queue, void* block)
+{
+	if (block)
+		schedule_delayed(when, queue, block, NULL, NULL);
+}
+
+void dispatch_source_set_timer(void* source, uint64_t start, uint64_t interval, uint64_t leeway)
+{
+	(void)source;
+	(void)start;
+	(void)interval;
+	(void)leeway;
+}
+
+void dispatch_source_set_cancel_handler(void* source, void* handler)
+{
+	(void)source;
+	(void)handler;
+}
+
+void dispatch_source_cancel(void* source)
+{
+	(void)source;
+}
+
+const void* machgate_dispatch_data_bytes(void* object, size_t* size)
+{
+	struct machgate_dispatch_data* data = object;
+	if (size)
+		*size = data && data->header.kind == MACHGATE_DISPATCH_DATA ? data->size : 0;
+	return data && data->header.kind == MACHGATE_DISPATCH_DATA ? data->bytes : NULL;
 }

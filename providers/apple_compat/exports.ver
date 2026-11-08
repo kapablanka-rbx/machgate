@@ -1,0 +1,20 @@
+{
+    global:
+        FSEvent*;
+        IOHID*;
+        CFRunLoop*;
+        LSOpenCFURLRef;
+        mach_msg_server_once;
+        mach_port_allocate;
+        mach_port_construct;
+        mach_port_insert_right;
+        mach_port_set_attributes;
+        thread_get_state;
+        thread_info;
+        thread_resume;
+        thread_set_exception_ports;
+        thread_suspend;
+        machgate_resolve_guest_import_v1;
+        machgate_guest_section_loaded_v1;
+    local: *;
+};

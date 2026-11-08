@@ -2,8 +2,20 @@
 
 #include "file_abi.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+_Static_assert(sizeof(struct machgate_darwin_flock) == 24,
+	       "Darwin flock must occupy 24 bytes");
+_Static_assert(offsetof(struct machgate_darwin_flock, type) == 20,
+	       "Darwin flock lock type must be at byte 20");
+_Static_assert(sizeof(struct machgate_darwin_fstore) == 32,
+	       "Darwin fstore must occupy 32 bytes");
 
 enum darwin_at_value {
 	DARWIN_AT_CURRENT_WORKING_DIRECTORY = -2,
@@ -11,6 +23,17 @@ enum darwin_at_value {
 	DARWIN_AT_DO_NOT_FOLLOW_SYMLINK = 0x0020,
 	DARWIN_AT_FOLLOW_SYMLINK = 0x0040,
 	DARWIN_AT_REMOVE_DIRECTORY = 0x0080,
+};
+
+enum darwin_lock_value {
+	DARWIN_LOCK_READ = 1,
+	DARWIN_LOCK_UNLOCK = 2,
+	DARWIN_LOCK_WRITE = 3,
+};
+
+enum darwin_preallocate_value {
+	DARWIN_PREALLOCATE_ALL = 0x04,
+	DARWIN_POSITION_END_OF_FILE = 3,
 };
 
 enum darwin_open_value {
@@ -99,4 +122,90 @@ int machgate_linux_at_flags(int darwin_flags)
 	if (darwin_flags & DARWIN_AT_REMOVE_DIRECTORY)
 		result |= AT_REMOVEDIR;
 	return result;
+}
+
+int machgate_darwin_flock_to_linux(
+	const struct machgate_darwin_flock* darwin_flock,
+	struct flock* linux_flock)
+{
+	if (!darwin_flock || !linux_flock) {
+		errno = EFAULT;
+		return -1;
+	}
+
+	memset(linux_flock, 0, sizeof(*linux_flock));
+	switch (darwin_flock->type) {
+	case DARWIN_LOCK_READ:
+		linux_flock->l_type = F_RDLCK;
+		break;
+	case DARWIN_LOCK_WRITE:
+		linux_flock->l_type = F_WRLCK;
+		break;
+	case DARWIN_LOCK_UNLOCK:
+		linux_flock->l_type = F_UNLCK;
+		break;
+	default:
+		errno = EINVAL;
+		return -1;
+	}
+	linux_flock->l_whence = darwin_flock->whence;
+	linux_flock->l_start = darwin_flock->start;
+	linux_flock->l_len = darwin_flock->length;
+	linux_flock->l_pid = darwin_flock->process;
+	return 0;
+}
+
+void machgate_linux_flock_to_darwin(
+	const struct flock* linux_flock,
+	struct machgate_darwin_flock* darwin_flock)
+{
+	switch (linux_flock->l_type) {
+	case F_RDLCK:
+		darwin_flock->type = DARWIN_LOCK_READ;
+		break;
+	case F_WRLCK:
+		darwin_flock->type = DARWIN_LOCK_WRITE;
+		break;
+	default:
+		darwin_flock->type = DARWIN_LOCK_UNLOCK;
+		break;
+	}
+	darwin_flock->whence = linux_flock->l_whence;
+	darwin_flock->start = linux_flock->l_start;
+	darwin_flock->length = linux_flock->l_len;
+	darwin_flock->process = linux_flock->l_pid;
+}
+
+long machgate_darwin_preallocate(
+	int descriptor, const struct machgate_darwin_fstore* store)
+{
+	if (!store) {
+		errno = EFAULT;
+		return -1;
+	}
+	if ((store->position_mode != 0 &&
+	     store->position_mode != DARWIN_POSITION_END_OF_FILE) ||
+	    store->offset < 0 || store->length < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	struct stat file_status;
+	if (syscall(SYS_fstat, descriptor, &file_status) != 0)
+		return -1;
+
+	off_t allocate_from = store->position_mode == DARWIN_POSITION_END_OF_FILE ?
+	                      file_status.st_size : store->offset;
+	if (store->length > INT64_MAX - allocate_from) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	off_t allocate_end = allocate_from + store->length;
+
+	if (store->flags & DARWIN_PREALLOCATE_ALL) {
+		if (allocate_end <= file_status.st_size)
+			return 0;
+		return syscall(SYS_ftruncate, descriptor, allocate_end);
+	}
+	return syscall(SYS_fallocate, descriptor, 0, allocate_from, store->length);
 }

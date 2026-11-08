@@ -128,6 +128,27 @@ int machgate_fstatat(int directory, const char* path, void* output,
 	                        machgate_linux_at_flags(darwin_flags));
 }
 
+int stat_darwin(const char* path, void* output)
+{
+	return read_path_status(AT_FDCWD, path, output, 0);
+}
+
+int fstat_darwin(int descriptor, void* output)
+{
+	return read_descriptor_status(descriptor, output);
+}
+
+int lstat_darwin(const char* path, void* output)
+{
+	return read_path_status(AT_FDCWD, path, output, AT_SYMLINK_NOFOLLOW);
+}
+
+int fstatat_darwin(int directory, const char* path, void* output, int darwin_flags)
+{
+	return read_path_status(machgate_linux_dirfd(directory), path, output,
+		machgate_linux_at_flags(darwin_flags));
+}
+
 struct machgate_darwin_directory_entry {
 	uint64_t inode;
 	uint64_t seek_offset;

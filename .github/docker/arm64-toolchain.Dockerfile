@@ -10,11 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     file \
     git \
+    libicu-dev \
     lld-18 \
     llvm-18 \
     llvm-18-tools \
     ninja-build \
     pkg-config \
+    python3 \
     strace \
     unzip \
     zlib1g-dev \

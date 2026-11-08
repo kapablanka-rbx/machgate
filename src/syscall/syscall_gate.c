@@ -1,3 +1,4 @@
+#include "ports/socket_state.h"
 #include "syscall_gate.h"
 #include "arm64_enc.h"
 #include "loader.h"
@@ -7,8 +8,10 @@
 #include "syscall_range_100_199.h"
 #include "syscall_range_200_399.h"
 #include "syscall_range_400_plus.h"
+#include "../shim/kqueue_compat.h"
 
 #include "guest_vm_dispatch.h"
+#include "adapters/startup_cache.h"
 #include "log.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -292,40 +295,15 @@ static void finish_syscall_result(struct machgate_syscall_frame* state, long res
 		set_success(state, (uint64_t)result);
 }
 
-static long write_syscall_with_sigpipe_guard(long syscall_number, int fd,
-                                             const void* buffer,
-                                             size_t size_or_count)
-{
-	struct sigaction ignore_action;
-	struct sigaction old_action;
-	int changed = 0;
-
-	memset(&ignore_action, 0, sizeof(ignore_action));
-	ignore_action.sa_handler = SIG_IGN;
-	sigemptyset(&ignore_action.sa_mask);
-	if (sigaction(SIGPIPE, &ignore_action, &old_action) == 0)
-		changed = 1;
-
-	errno = 0;
-	long result = syscall(syscall_number, fd, buffer, size_or_count);
-	int saved_errno = errno;
-
-	if (changed && old_action.sa_handler != SIG_DFL)
-		sigaction(SIGPIPE, &old_action, NULL);
-
-	errno = saved_errno;
-	return result;
-}
-
 long machgate_syscall_write_no_sigpipe(int fd, const void* buffer, size_t size)
 {
-	return write_syscall_with_sigpipe_guard(SYS_write, fd, buffer, size);
+	return machgate_socket_write(fd, buffer, size);
 }
 
 long machgate_syscall_writev_no_sigpipe(int fd, const struct iovec* iov,
                                         int iovcnt)
 {
-	return write_syscall_with_sigpipe_guard(SYS_writev, fd, iov, (size_t)iovcnt);
+	return machgate_socket_writev(fd, iov, iovcnt);
 }
 
 void syscall_gate_dispatch(struct machgate_syscall_frame* state)
@@ -364,6 +342,10 @@ void syscall_gate_dispatch(struct machgate_syscall_frame* state)
 	case DARWIN_SYS_close: {
 		errno = 0;
 		long result = syscall(SYS_close, (int)state->x[0]);
+		if (result == 0) {
+			machgate_socket_state_close((int)state->x[0]);
+			machgate_kqueue_fd_did_close((int)state->x[0]);
+		}
 		finish_syscall_result(state, result);
 		return;
 	}
@@ -626,20 +608,10 @@ static int patch_instruction(uint32_t* instr)
 	return 0;
 }
 
-static int patch_section(uint32_t* code, size_t size)
+static int patch_cached_syscall(uint32_t* instruction, void* context)
 {
-	int patched = 0;
-	size_t count = size / 4;
-
-	for (size_t i = 0; i < count; i++) {
-		if (code[i] != DARWIN_SVC_0X80)
-			continue;
-		if (patch_instruction(&code[i]) < 0)
-			return -1;
-		patched++;
-	}
-
-	return patched;
+	(void)context;
+	return patch_instruction(instruction);
 }
 
 int syscall_gate_patch(struct machgate_guest_image* image)
@@ -675,7 +647,10 @@ int syscall_gate_patch(struct machgate_guest_image* image)
 					    !(sect->flags & S_ATTR_PURE_INSTRUCTIONS))
 						continue;
 					uint32_t* code = (uint32_t*)(sect->addr + machgate_guest_image_slide(image));
-					int result = patch_section(code, sect->size);
+					int result = machgate_startup_cache_patch(
+						machgate_guest_image_startup_cache(image), MACHGATE_CACHE_SYSCALLS, code, sect->size,
+						UINT32_MAX, DARWIN_SVC_0X80,
+						patch_cached_syscall, NULL);
 					if (result < 0)
 						return -1;
 					total += result;

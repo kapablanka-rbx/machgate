@@ -67,11 +67,17 @@ jobs:
               test -x /work/package/opt/machgate/bin/machgate
               test -f /work/package/opt/machgate/lib/libmachgate_vm_interpose.so
               test -f /work/package/opt/machgate/lib/libsystem_shim.so
+              for provider in apple_compat foundation icu; do
+                test -f "/work/package/opt/machgate/lib/libmachgate_${provider}.so"
+              done
               MACHGATE_SHIM_LIB=/work/build-arm64-release/libsystem_shim.so scripts/build-libcxx.sh
               MACHGATE_REQUIRE_LIBCXX_OVERLAY=1 LIBCXX_DIR=/work/build-libcxx/lib bash tests/test_libcxx_allocator_overlay.sh
               MACHGATE_REQUIRE_LIBCXX_CTYPE_ABI=1 BUILD_DIR=/work/build-arm64-release LIBCXX_DIR=/work/build-libcxx/lib bash tests/test_libcxx_ctype_abi_surface.sh
               cp -a build-libcxx/lib/libc++.so* /work/package/opt/machgate/lib/
               cp -a build-libcxx/lib/libc++abi.so* /work/package/opt/machgate/lib/
+              for dependency in libicui18n.so.74 libicuuc.so.74 libicudata.so.74 libstdc++.so.6 libgcc_s.so.1; do
+                cp -a /usr/lib/aarch64-linux-gnu/${dependency}* /work/package/opt/machgate/lib/
+              done
               if compgen -G "/usr/lib/aarch64-linux-gnu/libatomic.so.1*" >/dev/null; then
                 cp -a /usr/lib/aarch64-linux-gnu/libatomic.so.1* /work/package/opt/machgate/lib/
               else
@@ -86,6 +92,13 @@ jobs:
                 cp /usr/share/doc/libatomic1/copyright /work/package/opt/machgate/share/doc/machgate/LICENSE.libatomic.txt
               fi
               cp docs/*.md /work/package/opt/machgate/share/doc/machgate/
+              cp providers/foundation/archive/COPYING /work/package/opt/machgate/share/doc/machgate/LICENSE.foundation-archive.txt
+              cp providers/foundation/archive/NOTICE.md /work/package/opt/machgate/share/doc/machgate/NOTICE.foundation-archive.md
+              cp providers/apple_compat/COPYING /work/package/opt/machgate/share/doc/machgate/LICENSE.apple-compat.txt
+              cp providers/apple_compat/NOTICE.md /work/package/opt/machgate/share/doc/machgate/NOTICE.apple-compat.md
+              cp /usr/share/doc/libicu74/copyright /work/package/opt/machgate/share/doc/machgate/LICENSE.icu.txt
+              cp /usr/share/doc/libstdc++6/copyright /work/package/opt/machgate/share/doc/machgate/LICENSE.libstdcxx.txt
+              cp /usr/share/doc/libgcc-s1/copyright /work/package/opt/machgate/share/doc/machgate/LICENSE.libgcc.txt
             '
           version="${RELEASE_TAG#v}"
           tar -C package/opt -czf "dist/machgate-${version}-linux-arm64.tar.gz" machgate
@@ -106,6 +119,18 @@ jobs:
             BUILD_DIR="$tmpdir/machgate/lib" \
             LIBCXX_DIR="$tmpdir/machgate/lib" \
             bash tests/test_libcxx_ctype_abi_surface.sh
+          docker run --rm -v "$PWD:/work" -v "$tmpdir:/package" -w /work \
+            machgate-arm64-toolchain bash -lc '
+              set -euo pipefail
+              export LD_LIBRARY_PATH=/package/machgate/lib
+              export BUILD_DIR=/package/machgate/lib
+              export MACHGATE_TEST_BINARY=/package/machgate/bin/machgate
+              export MACHGATE_TEST_ICU_PROVIDER=/package/machgate/lib/libmachgate_icu.so
+              export MACHGATE_TEST_LIBCXX=/package/machgate/lib/libc++.so.1
+              export MACHGATE_REQUIRE_LIBCXX=1
+              bash tests/test_icu_runtime_isolation.sh
+              bash tests/test_objc_exception_personality.sh
+            '
           rm -rf "$tmpdir"
           sha256sum "dist/machgate-${version}-linux-arm64.tar.gz" > "dist/machgate-${version}-linux-arm64.tar.gz.sha256"
 

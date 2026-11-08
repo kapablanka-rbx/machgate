@@ -1,4 +1,6 @@
+#include "ports/socket_state.h"
 #include "syscall_range_100_199.h"
+#include "darwin_socket.h"
 #include "guest_vm_dispatch.h"
 
 #include <errno.h>
@@ -486,139 +488,22 @@ static int translate_mmap_flags(int darwin_flags)
 
 static int translate_socket_domain(int darwin_domain, int* linux_domain)
 {
-	switch (darwin_domain) {
-	case DARWIN_AF_UNIX:
-		*linux_domain = AF_UNIX;
-		return 1;
-	case DARWIN_AF_INET:
-		*linux_domain = AF_INET;
-		return 1;
-	case DARWIN_AF_INET6:
-		*linux_domain = AF_INET6;
-		return 1;
-	default:
-		return 0;
-	}
+	return machgate_darwin_socket_domain_to_linux(darwin_domain, linux_domain);
 }
 
 static int translate_socket_option(int darwin_level, int darwin_option,
                                    int* linux_level, int* linux_option)
 {
-	if (darwin_level != DARWIN_SOL_SOCKET) {
-		*linux_level = darwin_level;
-		*linux_option = darwin_option;
-		return 1;
-	}
-
-	*linux_level = SOL_SOCKET;
-	switch (darwin_option) {
-	case DARWIN_SO_DEBUG:
-		*linux_option = SO_DEBUG;
-		return 1;
-	case DARWIN_SO_ACCEPTCONN:
-		*linux_option = SO_ACCEPTCONN;
-		return 1;
-	case DARWIN_SO_REUSEADDR:
-		*linux_option = SO_REUSEADDR;
-		return 1;
-	case DARWIN_SO_KEEPALIVE:
-		*linux_option = SO_KEEPALIVE;
-		return 1;
-	case DARWIN_SO_DONTROUTE:
-		*linux_option = SO_DONTROUTE;
-		return 1;
-	case DARWIN_SO_BROADCAST:
-		*linux_option = SO_BROADCAST;
-		return 1;
-	case DARWIN_SO_LINGER:
-		*linux_option = SO_LINGER;
-		return 1;
-	case DARWIN_SO_OOBINLINE:
-		*linux_option = SO_OOBINLINE;
-		return 1;
-#ifdef SO_REUSEPORT
-	case DARWIN_SO_REUSEPORT:
-		*linux_option = SO_REUSEPORT;
-		return 1;
-#endif
-	case DARWIN_SO_TYPE:
-		*linux_option = SO_TYPE;
-		return 1;
-	case DARWIN_SO_ERROR:
-		*linux_option = SO_ERROR;
-		return 1;
-	default:
-		return 0;
-	}
+	return machgate_darwin_socket_option_to_linux(darwin_level, darwin_option,
+	                                              linux_level, linux_option);
 }
 
 static int translate_sockaddr(const void* darwin_addr, uint64_t darwin_len,
                               struct sockaddr_storage* linux_addr,
                               socklen_t* linux_len)
 {
-	const unsigned char* raw = (const unsigned char*)darwin_addr;
-	int linux_domain;
-
-	if (!darwin_addr) {
-		*linux_len = 0;
-		return 1;
-	}
-
-	if (darwin_len < 2 || darwin_len > sizeof(*linux_addr)) {
-		errno = EINVAL;
-		return 0;
-	}
-
-	if (!translate_socket_domain(raw[1], &linux_domain)) {
-		errno = EAFNOSUPPORT;
-		return 0;
-	}
-
-	memset(linux_addr, 0, sizeof(*linux_addr));
-	switch (raw[1]) {
-	case DARWIN_AF_UNIX: {
-		struct sockaddr_un* unix_addr = (struct sockaddr_un*)linux_addr;
-		size_t path_len = darwin_len - 2;
-		if (path_len > sizeof(unix_addr->sun_path)) {
-			errno = ENAMETOOLONG;
-			return 0;
-		}
-		unix_addr->sun_family = AF_UNIX;
-		memcpy(unix_addr->sun_path, raw + 2, path_len);
-		*linux_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
-		                         path_len);
-		return 1;
-	}
-	case DARWIN_AF_INET: {
-		struct sockaddr_in* inet_addr = (struct sockaddr_in*)linux_addr;
-		if (darwin_len < 16) {
-			errno = EINVAL;
-			return 0;
-		}
-		inet_addr->sin_family = AF_INET;
-		memcpy(&inet_addr->sin_port, raw + 2, 2);
-		memcpy(&inet_addr->sin_addr, raw + 4, 4);
-		*linux_len = sizeof(*inet_addr);
-		return 1;
-	}
-	case DARWIN_AF_INET6: {
-		struct sockaddr_in6* inet6_addr = (struct sockaddr_in6*)linux_addr;
-		if (darwin_len < 28) {
-			errno = EINVAL;
-			return 0;
-		}
-		inet6_addr->sin6_family = AF_INET6;
-		memcpy(&inet6_addr->sin6_port, raw + 2, 2);
-		memcpy(&inet6_addr->sin6_flowinfo, raw + 4, 4);
-		memcpy(&inet6_addr->sin6_addr, raw + 8, 16);
-		memcpy(&inet6_addr->sin6_scope_id, raw + 24, 4);
-		*linux_len = sizeof(*inet6_addr);
-		return 1;
-	}
-	default:
-		errno = EAFNOSUPPORT;
-		return 0;
-	}
+	return machgate_darwin_sockaddr_to_linux(darwin_addr, darwin_len,
+	                                        linux_addr, linux_len);
 }
 
 static int translate_rlimit_resource(uint64_t darwin_resource, int* linux_resource)
@@ -960,38 +845,106 @@ static void handle_fstatfs_fd(struct machgate_syscall_frame* state)
 
 static void handle_setsockopt(struct machgate_syscall_frame* state)
 {
+	int darwin_level = (int)state->x[1];
+	int darwin_option = (int)state->x[2];
 	int linux_level;
 	int linux_option;
+	unsigned char value_buffer[256];
+	socklen_t linux_value_len = sizeof(value_buffer);
 
-	if (!translate_socket_option((int)state->x[1], (int)state->x[2],
+	if (machgate_darwin_socket_option_value_is_noop(darwin_level,
+	                                               darwin_option)) {
+		if (!state->x[3] || state->x[4] < sizeof(int)) {
+			set_failure(state, state->x[3] ? DARWIN_EINVAL : DARWIN_EFAULT);
+			return;
+		}
+		int enabled;
+		memcpy(&enabled, (void*)state->x[3], sizeof(enabled));
+		finish_syscall_result(state, machgate_socket_nosigpipe_set((int)state->x[0], enabled));
+		return;
+	}
+	if (!translate_socket_option(darwin_level, darwin_option,
 	                             &linux_level, &linux_option)) {
 		set_failure(state, DARWIN_ENOPROTOOPT);
+		return;
+	}
+	if (state->x[4] > sizeof(value_buffer) ||
+	    !machgate_darwin_socket_option_value_to_linux(
+		    darwin_level, darwin_option, (const void*)state->x[3],
+		    (uint32_t)state->x[4], value_buffer, &linux_value_len)) {
+		set_failure(state, state->x[4] > sizeof(value_buffer) ?
+		           DARWIN_EINVAL : darwin_errno_from_linux(errno));
 		return;
 	}
 
 	errno = 0;
 	long result = syscall(SYS_setsockopt, (int)state->x[0], linux_level,
-	                      linux_option, (const void*)state->x[3],
-	                      (socklen_t)state->x[4]);
+	                      linux_option, value_buffer, linux_value_len);
 	finish_syscall_result(state, result);
 }
 
 static void handle_getsockopt(struct machgate_syscall_frame* state)
 {
+	int darwin_level = (int)state->x[1];
+	int darwin_option = (int)state->x[2];
 	int linux_level;
 	int linux_option;
+	unsigned char value_buffer[256];
+	socklen_t* darwin_value_len = (socklen_t*)state->x[4];
+	socklen_t linux_value_len = sizeof(value_buffer);
+	socklen_t darwin_capacity;
 
-	if (!translate_socket_option((int)state->x[1], (int)state->x[2],
+	if (machgate_darwin_socket_option_value_is_noop(darwin_level, darwin_option)) {
+		if (!darwin_value_len || (!state->x[3] && *darwin_value_len)) {
+			set_failure(state, DARWIN_EFAULT);
+			return;
+		}
+		int result = machgate_socket_nosigpipe_get((int)state->x[0]);
+		if (result < 0) {
+			finish_syscall_result(state, result);
+			return;
+		}
+		socklen_t size = *darwin_value_len < sizeof(result) ? *darwin_value_len : sizeof(result);
+		if (size)
+			memcpy((void*)state->x[3], &result, size);
+		*darwin_value_len = size;
+		set_success(state, 0);
+		return;
+	}
+
+	if (!translate_socket_option(darwin_level, darwin_option,
 	                             &linux_level, &linux_option)) {
 		set_failure(state, DARWIN_ENOPROTOOPT);
 		return;
 	}
+	if (darwin_value_len) {
+		darwin_capacity = *darwin_value_len;
+		if (darwin_capacity < linux_value_len)
+			linux_value_len = darwin_capacity;
+	}
 
 	errno = 0;
 	long result = syscall(SYS_getsockopt, (int)state->x[0], linux_level,
-	                      linux_option, (void*)state->x[3],
-	                      (socklen_t*)state->x[4]);
-	finish_syscall_result(state, result);
+	                      linux_option, value_buffer, &linux_value_len);
+	if (result < 0) {
+		finish_syscall_result(state, result);
+		return;
+	}
+	if (state->x[3] && linux_value_len > sizeof(value_buffer)) {
+		set_failure(state, DARWIN_EINVAL);
+		return;
+	}
+	if (state->x[3] && linux_value_len)
+		memcpy((void*)state->x[3], value_buffer, linux_value_len);
+	if (darwin_value_len)
+		*darwin_value_len = linux_value_len;
+	if (state->x[3] && !machgate_darwin_socket_option_value_from_linux(
+			darwin_level, darwin_option, (void*)state->x[3],
+			darwin_value_len)) {
+		set_failure(state, darwin_errno_from_linux(errno));
+		return;
+	}
+	set_success(state, 0);
 }
 
 static void handle_bind(struct machgate_syscall_frame* state)
@@ -1029,7 +982,7 @@ static void handle_sendto(struct machgate_syscall_frame* state)
 	errno = 0;
 	long result = syscall(SYS_sendto, (int)state->x[0],
 	                      (const void*)state->x[1], (size_t)state->x[2],
-	                      (int)state->x[3],
+	                      machgate_socket_send_flags((int)state->x[0], machgate_darwin_send_flags_to_linux((int)state->x[3])),
 	                      (const struct sockaddr*)linux_addr_ptr, linux_len);
 	finish_syscall_result(state, result);
 }

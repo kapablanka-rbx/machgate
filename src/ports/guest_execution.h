@@ -18,6 +18,7 @@ int machgate_prepare_guest_image(const char* executable_path,
 				 struct machgate_guest_image** image,
 				 char* error, size_t error_size);
 void machgate_release_guest_image(struct machgate_guest_image* image);
+void machgate_complete_guest_image_preparation(struct machgate_guest_image* image);
 int machgate_prepare_native_linkage(struct machgate_guest_image* image,
 				    char* error, size_t error_size);
 int machgate_prepare_guest_unwind(struct machgate_guest_image* image,

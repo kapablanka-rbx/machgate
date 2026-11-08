@@ -42,6 +42,8 @@ _walk_frameless_saved:
 	add sp, sp, #32
 	ret
 	.cfi_endproc
+.globl _walk_frameless_saved_end
+_walk_frameless_saved_end:
 
 .globl _walk_no_unwind
 .p2align 2

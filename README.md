@@ -17,14 +17,14 @@ The current scope is intentionally narrow:
 - a single guest thread
 - direct Darwin syscall translation
 
-MachGate does not target x86-64 guests, graphical applications, Apple
+MachGate's core does not target x86-64 guests, graphical applications, Apple
 frameworks, Mach IPC, or general macOS application compatibility.
 
 ## Verification status
 
 | Gate | Result | Where |
 | --- | --- | --- |
-| Unit and behavior suite | 56/56 passed | `ci.yml` on every push and PR |
+| Unit and behavior suite | 86/86 passed locally | ARM64 Linux; [archive port evidence and engine limits](docs/ARCHIVE_SHIM_PARITY.md) |
 | Extended external corpus gate | 57/57 passed, 0 crashes, 0 harness failures | `external-macho.yml`, weekly and on demand |
 | Bitcoin Core runner gate | 7/7 passed (versions 25.2 through 31.0) | focused manifest, on demand |
 | Architecture layer policy | enforced on every change | `repository-review.yml` |
@@ -63,6 +63,12 @@ See [syscall patching](docs/SYSCALL_PATCHING.md) for the gateway design and
 [the syscall table](docs/DARWIN_SYSCALL_TABLE_STATUS.md) for dispatcher coverage.
 The [domain model](docs/DOMAIN_MODEL.md) defines the ubiquitous language,
 bounded contexts, invariants, and application workflow.
+The [Image Preparation cache](docs/STARTUP_CACHE.md) reuses derived startup
+artifacts across launches without modifying the Guest Executable.
+The optional [Apple compatibility providers](docs/ARCHIVE_SHIM_PARITY.md)
+restore the archive's 849 exported names through separate Foundation, ICU and
+composite libraries. Their ABI checks reference
+[Apple OSS and the local LLVM sources](docs/APPLE_ABI_REFERENCES.md).
 The [external corpus status](docs/EXTERNAL_CORPUS_STATUS.md) classifies the
 current compatibility baseline by bounded context.
 [ASan-instrumented guest support](docs/ASAN_SUPPORT.md) documents the mapped
@@ -84,6 +90,12 @@ The build produces:
 - `build/machgate`
 - `build/libsystem_shim.so`
 - `build/libmachgate_vm_interpose.so`
+
+The default build also produces `libmachgate_foundation.so`,
+`libmachgate_icu.so`, and `libmachgate_apple_compat.so` in `build/`, requiring
+ICU 74 development files. Disable them with
+`-DMACHGATE_BUILD_APPLE_PROVIDERS=OFF` for a core-only build. Providers are
+selected through the dependency map; see their compatibility limits above.
 
 Run a guest with:
 
@@ -115,12 +127,18 @@ guest allocator bridge tests.
 `MACHGATE_DYLIB_MAP` names a `key = native-library` map for other Mach-O
 dependencies. Keys use the dependency basename without the `.dylib` suffix.
 
+`MACHGATE_GUEST_PLATFORM` can be set to `macos` or `ios` to override the
+platform recorded by the guest's `LC_BUILD_VERSION` command.
+
 `MACHGATE_TRAMPOLINE_LIB` and `MACHGATE_TRAMPOLINE_PREFIX` enable explicit
 prefix-based redirection of guest definitions to symbols in a native shared
 library.
 
 `MACHGATE_TRACE_CXX_ALLOCATORS` prints the number of guest C++ allocation hooks
 connected to the shim.
+
+`MACHGATE_TRACE_SHIM` enables shim diagnostics. Its value is read on first use
+and retained for the process lifetime; restart the process to change it.
 
 Additional narrowly scoped trace variables live next to the subsystem that
 implements them. They are diagnostics, not a stable public interface.

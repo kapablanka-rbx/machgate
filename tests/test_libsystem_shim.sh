@@ -34,11 +34,6 @@ for removed_symbol in [
     'mach_port_construct',
     'mach_port_insert_right',
     'mach_port_set_attributes',
-    'mmap_registry_add',
-    'stat_darwin',
-    'fstat_darwin',
-    'lstat_darwin',
-    'fstatat_darwin',
     'thread_get_state',
     'thread_info',
     'thread_resume',
@@ -189,13 +184,13 @@ assert process_ns > 0, 'process CPU clock returned zero'
 assert thread_ns > 0, 'thread CPU clock returned zero'
 
 lib.task_info.restype = ctypes.c_int
-assert lib.task_info(0, 0, None, None) == 46, 'unsupported task_info did not fail explicitly'
+task_self = ctypes.c_uint32.in_dll(lib, 'mach_task_self_').value
+assert lib.task_info(task_self, 0, None, None) == 46, 'unknown task_info flavor did not fail explicitly'
 lib.task_policy_set.argtypes = [
     ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32),
     ctypes.c_uint32,
 ]
 lib.task_policy_set.restype = ctypes.c_int32
-task_self = ctypes.c_uint32.in_dll(lib, 'mach_task_self_').value
 default_application = ctypes.c_int32(7)
 assert lib.task_policy_set(
     task_self, 1, ctypes.byref(default_application), 1
@@ -304,6 +299,17 @@ lib.sysctlnametomib.argtypes = [
     ctypes.POINTER(ctypes.c_size_t),
 ]
 lib.sysctlnametomib.restype = ctypes.c_int
+
+cpu_type_size = ctypes.c_size_t(0)
+assert lib.sysctlbyname(b'hw.cputype', None, ctypes.byref(cpu_type_size), None, 0) == 0
+assert cpu_type_size.value == ctypes.sizeof(ctypes.c_int32)
+cpu_type = (ctypes.c_int32 * 2)(-1, 0x12345678)
+assert lib.sysctlbyname(
+    b'hw.cputype', cpu_type, ctypes.byref(cpu_type_size), None, 0
+) == 0
+assert cpu_type[0] == 0x0100000c, 'ARM64 guests must discover CPU_TYPE_ARM64'
+assert cpu_type[1] == 0x12345678
+assert cpu_type_size.value == ctypes.sizeof(ctypes.c_int32)
 
 cpu_size = ctypes.c_size_t()
 assert lib.sysctlbyname(b'hw.ncpu', None, ctypes.byref(cpu_size), None, 0) == 0
@@ -1138,7 +1144,7 @@ ulock_word = ctypes.c_uint32(1)
 assert lib.__ulock_wait2(
     DARWIN_UL_COMPARE_AND_WAIT | DARWIN_ULF_NO_ERRNO,
     ctypes.byref(ulock_word), 2, 0, 0
-) == -35, '__ulock_wait2 did not return negative Darwin EAGAIN in no-errno mode'
+) >= 0, '__ulock_wait2 must succeed when the compared value changed'
 
 class FloatPair(ctypes.Structure):
     _fields_ = [('first', ctypes.c_float), ('second', ctypes.c_float)]

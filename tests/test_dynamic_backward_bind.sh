@@ -25,8 +25,8 @@ for case_index in 1 2 3; do
     fixture="tests/fixtures/dynamic_backward_bind_$case_index"
     yaml="$("$OBJ2YAML" "$fixture")"
     expected_operand="${expected_operands[$((case_index - 1))]}"
-    printf '%s\n' "$yaml" | grep -q 'BIND_OPCODE_ADD_ADDR_ULEB'
-    printf '%s\n' "$yaml" | grep -qi "$expected_operand"
+    [[ "$yaml" == *BIND_OPCODE_ADD_ADDR_ULEB* ]]
+    [[ "${yaml,,}" == *"$expected_operand"* ]]
 
     MACHGATE_DYLIB_MAP="$MAP_FILE" \
         "$BUILD_DIR/machgate" "$fixture"

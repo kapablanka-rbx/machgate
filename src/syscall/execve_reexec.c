@@ -241,6 +241,13 @@ static int path_is_macho_forksafe(const char* path, int* darwin_error)
 	return path_is_macho_common(path, darwin_error, 0);
 }
 
+int machgate_path_is_macho(const char* path)
+{
+	int result;
+
+	return path && path_is_macho_forksafe(path, &result);
+}
+
 static int read_loader_path(char* loader_path, size_t loader_path_size)
 {
 	ssize_t length;

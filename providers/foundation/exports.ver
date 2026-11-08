@@ -1,0 +1,13 @@
+{
+    global:
+        objc_*;
+        __objc_personality_v0;
+        OBJC_*;
+        NS*;
+        __NSArray0__;
+        __NSDictionary0__;
+        machgate_shim_register_objc_class;
+        machgate_guest_section_loaded_v1;
+        shim_objc_*;
+    local: *;
+};

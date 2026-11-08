@@ -3,6 +3,7 @@
 #include "instruction_adaptation.h"
 #include "macho_defs.h"
 #include "ports/guest_image_view.h"
+#include "adapters/startup_cache.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,6 +24,8 @@
 #define MACHGATE_MAX_LOAD_COMMAND_BYTES (16u * 1024u * 1024u)
 #define MACHGATE_MAX_MAPPED_SEGMENTS 128u
 #define MACHGATE_POOL_SEARCH_STEP (1024u * 1024u)
+#define MACHGATE_PLATFORM_MACOS 1u
+#define MACHGATE_PLATFORM_IOS 2u
 
 struct file_slice {
 	uint64_t offset;
@@ -36,17 +39,28 @@ struct mapped_segment {
 };
 
 struct machgate_guest_image {
+	struct machgate_startup_cache* startup_cache;
+	char* path;
+	void* reservation;
+	size_t reservation_size;
 	void* header;
 	intptr_t slide;
 	uintptr_t mapping_start;
 	uintptr_t mapping_end;
 	uintptr_t entry_point;
+	uint32_t platform;
 	struct mapped_segment segments[MACHGATE_MAX_MAPPED_SEGMENTS];
 	size_t segment_count;
 };
 
 struct load_context {
 	int file_descriptor;
+	uint32_t expected_file_type;
+	intptr_t slide;
+	void* reservation;
+	size_t reservation_size;
+	uintptr_t minimum_virtual_address;
+	uintptr_t maximum_virtual_address;
 	struct file_slice slice;
 	struct mach_header_64 header;
 	uint8_t* commands;
@@ -213,9 +227,10 @@ static int read_load_commands(struct load_context* context, char* error,
 
 	if (context->header.magic != MH_MAGIC_64 ||
 	    context->header.cputype != CPU_TYPE_ARM64 ||
-	    context->header.filetype != MH_EXECUTE) {
+	    context->header.filetype != context->expected_file_type) {
 		snprintf(error, error_size,
-		         "Mach-O slice is not an ARM64 executable");
+		         "Mach-O slice is not an ARM64 %s",
+		         context->expected_file_type == MH_EXECUTE ? "executable" : "dylib");
 		return -1;
 	}
 	if (context->header.sizeofcmds > MACHGATE_MAX_LOAD_COMMAND_BYTES ||
@@ -237,6 +252,59 @@ static int read_load_commands(struct load_context* context, char* error,
 	                  error_size);
 }
 
+static int select_guest_platform_override(struct machgate_guest_image* image,
+					  int* overridden, char* error,
+					  size_t error_size)
+{
+	const char* override = getenv("MACHGATE_GUEST_PLATFORM");
+	*overridden = 0;
+	if (!override || !*override)
+		return 0;
+	if (strcmp(override, "macos") == 0) {
+		image->platform = MACHGATE_PLATFORM_MACOS;
+		*overridden = 1;
+		return 0;
+	}
+	if (strcmp(override, "ios") == 0) {
+		image->platform = MACHGATE_PLATFORM_IOS;
+		*overridden = 1;
+		return 0;
+	}
+	snprintf(error, error_size,
+		 "MACHGATE_GUEST_PLATFORM must be macos or ios");
+	return -1;
+}
+
+static int select_guest_platform(struct load_context* context,
+				 struct machgate_guest_image* image,
+				 char* error, size_t error_size)
+{
+	image->platform = MACHGATE_PLATFORM_MACOS;
+	int overridden;
+	if (select_guest_platform_override(image, &overridden, error,
+					   error_size) != 0)
+		return -1;
+	if (overridden)
+		return 0;
+
+	uint8_t* cursor = context->commands;
+	for (uint32_t index = 0; index < context->header.ncmds; index++) {
+		struct load_command* command = (void*)cursor;
+		if (command->cmd == LC_BUILD_VERSION) {
+			if (command->cmdsize < sizeof(struct build_version_command)) {
+				snprintf(error, error_size,
+					 "invalid LC_BUILD_VERSION command");
+				return -1;
+			}
+			struct build_version_command* build_version = (void*)command;
+			if (build_version->platform == MACHGATE_PLATFORM_IOS)
+				image->platform = MACHGATE_PLATFORM_IOS;
+		}
+		cursor += command->cmdsize;
+	}
+	return 0;
+}
+
 static int native_protection(int protection)
 {
 	int result = PROT_NONE;
@@ -253,10 +321,13 @@ static int validate_segment(const struct load_context* context,
 			    const struct segment_command_64* segment,
 			    char* error, size_t error_size)
 {
+	if (segment->cmdsize < sizeof(*segment)) {
+		snprintf(error, error_size, "invalid Mach-O segment command");
+		return -1;
+	}
 	uint64_t section_bytes =
 		(uint64_t)segment->nsects * sizeof(struct section_64);
-	if (segment->cmdsize < sizeof(*segment) ||
-	    section_bytes > segment->cmdsize - sizeof(*segment)) {
+	if (section_bytes > segment->cmdsize - sizeof(*segment)) {
 		snprintf(error, error_size, "invalid Mach-O segment command");
 		return -1;
 	}
@@ -293,7 +364,7 @@ static int map_segment(struct load_context* context,
 		return -1;
 	}
 	uintptr_t page_size = (uintptr_t)page_size_result;
-	uintptr_t virtual_address = (uintptr_t)segment->vmaddr;
+	uintptr_t virtual_address = (uintptr_t)segment->vmaddr + context->slide;
 	uintptr_t segment_end = virtual_address + (uintptr_t)segment->vmsize;
 	uintptr_t map_start = virtual_address & ~(page_size - 1);
 	uintptr_t map_end = (segment_end + page_size - 1) & ~(page_size - 1);
@@ -303,9 +374,24 @@ static int map_segment(struct load_context* context,
 	}
 
 	size_t map_size = map_end - map_start;
+	if (context->reservation) {
+		uintptr_t reserved_start = (uintptr_t)context->reservation;
+		if (map_start < reserved_start || map_end - reserved_start > context->reservation_size) {
+			snprintf(error, error_size, "Mach-O segment exceeds its reserved image range");
+			return -1;
+		}
+		for (size_t index = 0; index < context->segment_count; index++) {
+			const struct mapped_segment* previous = &context->segments[index];
+			if (map_start < previous->address + previous->size && map_end > previous->address) {
+				snprintf(error, error_size, "Mach-O dylib segments overlap");
+				return -1;
+			}
+		}
+	}
 	void* mapping = mmap((void*)map_start, map_size,
 	                     PROT_READ | PROT_WRITE,
-	                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+	                     MAP_PRIVATE | MAP_ANONYMOUS |
+	                         (context->reservation ? MAP_FIXED : MAP_FIXED_NOREPLACE),
 	                     -1, 0);
 	if (mapping == MAP_FAILED) {
 		snprintf(error, error_size,
@@ -335,8 +421,9 @@ static int map_segment(struct load_context* context,
 	return 0;
 }
 
-static int walk_segments(struct load_context* context, char* error,
-			 size_t error_size)
+static int walk_segments(struct load_context* context,
+	int (*visit)(struct load_context*, const struct segment_command_64*, char*, size_t),
+	char* error, size_t error_size)
 {
 	uint8_t* cursor = context->commands;
 	uint8_t* end = context->commands + context->header.sizeofcmds;
@@ -353,7 +440,7 @@ static int walk_segments(struct load_context* context, char* error,
 			return -1;
 		}
 		if (command->cmd == LC_SEGMENT_64 &&
-		    map_segment(context, (void*)command, error, error_size) != 0)
+		    visit(context, (void*)command, error, error_size) != 0)
 			return -1;
 		cursor += command->cmdsize;
 	}
@@ -362,6 +449,50 @@ static int walk_segments(struct load_context* context, char* error,
 		snprintf(error, error_size, "Mach-O load-command size mismatch");
 		return -1;
 	}
+	return 0;
+}
+
+static int measure_library_segment(struct load_context* context,
+	const struct segment_command_64* segment, char* error, size_t error_size)
+{
+	if (validate_segment(context, segment, error, error_size) != 0)
+		return -1;
+	if (!segment->vmsize || !segment->initprot)
+		return 0;
+	if (segment->vmaddr < context->minimum_virtual_address)
+		context->minimum_virtual_address = segment->vmaddr;
+	if (segment->vmaddr + segment->vmsize > context->maximum_virtual_address)
+		context->maximum_virtual_address = segment->vmaddr + segment->vmsize;
+	return 0;
+}
+
+static int reserve_library_image(struct load_context* context,
+	char* error, size_t error_size)
+{
+	if (context->expected_file_type == MH_EXECUTE)
+		return 0;
+	context->minimum_virtual_address = UINTPTR_MAX;
+	if (walk_segments(context, measure_library_segment, error, error_size) != 0)
+		return -1;
+	long page_size_result = sysconf(_SC_PAGESIZE);
+	if (page_size_result <= 0 ||
+	    context->minimum_virtual_address >= context->maximum_virtual_address ||
+	    context->maximum_virtual_address > INTPTR_MAX - (uintptr_t)page_size_result) {
+		snprintf(error, error_size, "Mach-O dylib has an invalid virtual address range");
+		return -1;
+	}
+	uintptr_t page_mask = (uintptr_t)page_size_result - 1;
+	uintptr_t minimum = context->minimum_virtual_address & ~page_mask;
+	uintptr_t maximum = (context->maximum_virtual_address + page_mask) & ~page_mask;
+	context->reservation_size = maximum - minimum;
+	void* result = mmap(NULL, context->reservation_size, PROT_NONE,
+	                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (result == MAP_FAILED) {
+		snprintf(error, error_size, "could not reserve Mach-O dylib address space: %s", strerror(errno));
+		return -1;
+	}
+	context->reservation = result;
+	context->slide = (intptr_t)result - (intptr_t)minimum;
 	return 0;
 }
 
@@ -401,19 +532,21 @@ static int locate_header_and_entry(struct load_context* context,
 		if (command->cmd == LC_SEGMENT_64) {
 			struct segment_command_64* segment = (void*)command;
 			if (segment->fileoff == 0 && segment->filesize >= sizeof(context->header))
-				image->header = (void*)(uintptr_t)segment->vmaddr;
+				image->header = (void*)((uintptr_t)segment->vmaddr + context->slide);
 			if (has_main_entry && entry_offset >= segment->fileoff &&
 			    entry_offset - segment->fileoff < segment->filesize) {
-				image->entry_point = (uintptr_t)segment->vmaddr +
+				image->entry_point = (uintptr_t)segment->vmaddr + context->slide +
 				                      (uintptr_t)(entry_offset - segment->fileoff);
 			}
 		}
 		cursor += command->cmdsize;
 	}
 
-	if (!image->entry_point)
-		image->entry_point = unix_thread_entry;
-	if (!image->header || !image->entry_point) {
+	if (!image->entry_point && unix_thread_entry)
+		image->entry_point = unix_thread_entry + context->slide;
+	if (!image->header || !machgate_guest_image_contains(image, (uintptr_t)image->header,
+	    sizeof(context->header) + context->header.sizeofcmds) ||
+	    (context->expected_file_type == MH_EXECUTE && !image->entry_point)) {
 		snprintf(error, error_size,
 		         "Mach-O executable has no supported mapped entry point");
 		return -1;
@@ -442,12 +575,16 @@ static int protect_segments(struct load_context* context, char* error,
 
 static void unmap_segments(struct load_context* context)
 {
+	if (context->reservation) {
+		munmap(context->reservation, context->reservation_size);
+		return;
+	}
 	for (size_t index = 0; index < context->segment_count; index++)
 		munmap((void*)context->segments[index].address,
 		       context->segments[index].size);
 }
 
-int machgate_load_executable(const char* path,
+static int load_guest_image(const char* path, uint32_t file_type,
 			     struct machgate_guest_image** image_result,
 			     char* error, size_t error_size)
 {
@@ -465,6 +602,7 @@ int machgate_load_executable(const char* path,
 	struct load_context context;
 	memset(&context, 0, sizeof(context));
 	context.file_descriptor = -1;
+	context.expected_file_type = file_type;
 
 	context.file_descriptor = open(path, O_RDONLY | O_CLOEXEC);
 	if (context.file_descriptor < 0) {
@@ -487,25 +625,39 @@ int machgate_load_executable(const char* path,
 	if (select_slice(context.file_descriptor, (uint64_t)status.st_size,
 	                 &context.slice, error, error_size) != 0 ||
 	    read_load_commands(&context, error, error_size) != 0 ||
-	    walk_segments(&context, error, error_size) != 0 ||
-	    locate_header_and_entry(&context, image, error, error_size) != 0)
+	    reserve_library_image(&context, error, error_size) != 0 ||
+	    walk_segments(&context, map_segment, error, error_size) != 0)
 		goto done;
 
-	image->slide = 0;
+	image->slide = context.slide;
+	image->reservation = context.reservation;
+	image->reservation_size = context.reservation_size;
 	image->mapping_start = context.mapping_start;
 	image->mapping_end = context.mapping_end;
-	if (machgate_adapt_guest_instructions(image, error, error_size) < 0 ||
-	    protect_segments(&context, error, error_size) != 0)
-		goto done;
 	memcpy(image->segments, context.segments,
 	       context.segment_count * sizeof(context.segments[0]));
 	image->segment_count = context.segment_count;
+	if (locate_header_and_entry(&context, image, error, error_size) != 0 ||
+	    select_guest_platform(&context, image, error, error_size) != 0)
+		goto done;
+	image->path = realpath(path, NULL);
+	if (!image->path) {
+		snprintf(error, error_size, "could not resolve Mach-O image path: %s", strerror(errno));
+		goto done;
+	}
+	image->startup_cache = machgate_startup_cache_begin(path, &status, context.slice.offset,
+				   context.slice.size);
+	if (machgate_adapt_guest_instructions(image, error, error_size) < 0 ||
+	    protect_segments(&context, error, error_size) != 0)
+		goto done;
 	*image_result = image;
 	load_result = 0;
 
 done:
 	if (load_result != 0) {
+		machgate_startup_cache_close(image->startup_cache);
 		unmap_segments(&context);
+		free(image->path);
 		free(image);
 	}
 	free(context.commands);
@@ -513,14 +665,51 @@ done:
 	return load_result;
 }
 
+int machgate_load_executable(const char* path,
+	struct machgate_guest_image** image, char* error, size_t error_size)
+{
+	return load_guest_image(path, MH_EXECUTE, image, error, error_size);
+}
+
+int machgate_load_guest_library(const char* path,
+	struct machgate_guest_image** image, char* error, size_t error_size)
+{
+	return load_guest_image(path, MH_DYLIB, image, error, error_size);
+}
+
 void machgate_unload_guest_image(struct machgate_guest_image* image)
 {
 	if (!image)
 		return;
-	for (size_t index = 0; index < image->segment_count; index++)
-		munmap((void*)image->segments[index].address,
-		       image->segments[index].size);
+	machgate_startup_cache_close(image->startup_cache);
+	if (image->reservation)
+		munmap(image->reservation, image->reservation_size);
+	else
+		for (size_t index = 0; index < image->segment_count; index++)
+			munmap((void*)image->segments[index].address,
+			       image->segments[index].size);
+	free(image->path);
 	free(image);
+}
+
+const char* machgate_guest_image_path(const struct machgate_guest_image* image)
+{
+	return image ? image->path : NULL;
+}
+
+struct machgate_startup_cache* machgate_guest_image_startup_cache(
+	const struct machgate_guest_image* image)
+{
+	return image ? image->startup_cache : NULL;
+}
+
+void machgate_complete_guest_image_preparation(struct machgate_guest_image* image)
+{
+	if (!image)
+		return;
+	machgate_startup_cache_publish(image->startup_cache);
+	machgate_startup_cache_close(image->startup_cache);
+	image->startup_cache = NULL;
 }
 
 void* machgate_guest_image_validated_header(
@@ -552,13 +741,24 @@ uintptr_t machgate_guest_image_entry_point(
 	return image ? image->entry_point : 0;
 }
 
+int machgate_guest_image_platform(const struct machgate_guest_image* image)
+{
+	return image ? (int)image->platform : 0;
+}
+
 int machgate_guest_image_contains(const struct machgate_guest_image* image,
 				 uintptr_t address, uint64_t size)
 {
 	if (!image || address < image->mapping_start ||
 	    address > image->mapping_end)
 		return 0;
-	return size <= image->mapping_end - address;
+	for (size_t index = 0; index < image->segment_count; index++) {
+		const struct mapped_segment* segment = &image->segments[index];
+		if (address >= segment->address && address - segment->address <= segment->size &&
+		    size <= segment->size - (address - segment->address))
+			return 1;
+	}
+	return 0;
 }
 
 static uintptr_t align_up(uintptr_t value, size_t alignment)

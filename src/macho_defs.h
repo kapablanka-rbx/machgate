@@ -9,12 +9,14 @@
 
 #define CPU_TYPE_ARM64 0x0100000cu
 #define MH_EXECUTE 2u
+#define MH_DYLIB 6u
 
 #define LC_SEGMENT_64 0x19u
 #define LC_SYMTAB 0x2u
 #define LC_DYSYMTAB 0xbu
 #define LC_UNIXTHREAD 0x5u
 #define LC_MAIN 0x80000028u
+#define LC_BUILD_VERSION 0x32u
 #define LC_LOAD_DYLIB 0xcu
 #define LC_LOAD_WEAK_DYLIB 0x80000018u
 #define LC_REEXPORT_DYLIB 0x8000001fu
@@ -40,6 +42,7 @@
 #define S_MOD_INIT_FUNC_POINTERS 0x00000009u
 #define S_THREAD_LOCAL_REGULAR 0x00000011u
 #define S_THREAD_LOCAL_ZEROFILL 0x00000012u
+#define S_THREAD_LOCAL_VARIABLES 0x00000013u
 #define S_INIT_FUNC_OFFSETS 0x00000016u
 
 #define INDIRECT_SYMBOL_LOCAL 0x80000000u
@@ -110,6 +113,15 @@ struct section_64 {
 	uint32_t reserved1;
 	uint32_t reserved2;
 	uint32_t reserved3;
+};
+
+struct build_version_command {
+	uint32_t cmd;
+	uint32_t cmdsize;
+	uint32_t platform;
+	uint32_t minos;
+	uint32_t sdk;
+	uint32_t ntools;
 };
 
 struct entry_point_command {

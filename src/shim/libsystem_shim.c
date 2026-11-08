@@ -1,11 +1,20 @@
 #define _GNU_SOURCE
+#include "ports/socket_state.h"
 #include "../syscall/execve_reexec.h"
+#include "allocation_ledger.h"
 #include "darwin_errno.h"
 #include "fd_lifecycle.h"
 #include "file_abi.h"
 #include "host_facts.h"
+#include "guest_hardware_compat.h"
+#include "initializer_context.h"
+#include "registered_memory_compat.h"
+#include "pthread_attr_compat.h"
+#include "thread_local_compat.h"
+#include "kqueue_compat.h"
 #include "variadic_abi_compat.h"
 #include "guest_process_runtime.h"
+#include "native_provider_guest_import.h"
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -145,8 +154,8 @@ double exp2(double value)
 
 /* mach_task_self_ is a global variable in libSystem, not a function */
 uint32_t mach_task_self_ = 0x103; /* dummy port number */
-uint32_t vm_page_size = 4096;
-uint32_t vm_kernel_page_size = 4096;
+uint64_t vm_page_size = 4096;
+uint64_t vm_kernel_page_size = 4096;
 uint32_t kIOMasterPortDefault = 0;
 uint32_t kIOMainPortDefault = 0;
 
@@ -166,16 +175,6 @@ uint32_t mach_host_self(void)
 uint32_t mach_thread_self(void)
 {
 	return (uint32_t)syscall(SYS_gettid);
-}
-
-int task_info(uint32_t target_task, uint32_t flavor,
-              void* task_info_out, uint32_t* task_info_count)
-{
-	(void)target_task;
-	(void)flavor;
-	(void)task_info_out;
-	(void)task_info_count;
-	return MACHGATE_KERN_NOT_SUPPORTED;
 }
 
 int thread_switch(uint32_t thread_name, int option, uint32_t option_time)
@@ -280,17 +279,6 @@ int vm_protect(uint32_t target_task, uint64_t address, uint64_t size,
 	return 2;
 }
 
-int host_statistics(uint32_t host_priv, int flavor, void* host_info_out,
-                    uint32_t* host_info_count)
-{
-	(void)host_priv;
-	(void)flavor;
-
-	if (host_info_out && host_info_count)
-		memset(host_info_out, 0, (size_t)*host_info_count * sizeof(int));
-	return 0;
-}
-
 struct darwin_host_basic_info {
 	int32_t max_cpus;
 	int32_t avail_cpus;
@@ -315,7 +303,7 @@ int host_info(uint32_t host, int flavor, void* info, uint32_t* info_count)
 	if (flavor == 1) {
 		struct darwin_host_basic_info basic;
 		memset(&basic, 0, sizeof(basic));
-		basic.max_cpus = machgate_host_cpu_count();
+		basic.max_cpus = machgate_guest_cpu_count();
 		basic.avail_cpus = basic.max_cpus;
 		basic.memory_size = 0x80000000U;
 		basic.cpu_type = 0x0100000c;
@@ -352,7 +340,7 @@ int host_processor_info(uint32_t host, int flavor, uint32_t* out_processor_count
 	if (flavor != DARWIN_PROCESSOR_CPU_LOAD_INFO)
 		return 5;
 
-	uint32_t processor_count = (uint32_t)machgate_host_cpu_count();
+	uint32_t processor_count = (uint32_t)machgate_guest_cpu_count();
 	uint32_t info_count = processor_count * DARWIN_CPU_STATE_MAX;
 	size_t info_size = (size_t)info_count * sizeof(uint32_t);
 	uint32_t* processor_info = mmap(NULL, info_size, PROT_READ | PROT_WRITE,
@@ -374,17 +362,6 @@ int host_processor_info(uint32_t host, int flavor, uint32_t* out_processor_count
 #undef DARWIN_CPU_STATE_SYSTEM
 #undef DARWIN_CPU_STATE_MAX
 #undef DARWIN_PROCESSOR_CPU_LOAD_INFO
-}
-
-int host_statistics64(uint32_t host, int flavor, void* info,
-                      uint32_t* info_count)
-{
-	(void)host;
-	(void)flavor;
-
-	if (info && info_count)
-		memset(info, 0, (size_t)*info_count * sizeof(uint64_t));
-	return 0;
 }
 
 int __mb_cur_max = 4;
@@ -1352,9 +1329,20 @@ CFStringRef CFBundleCopyExecutableURL(CFStringRef bundle)
 
 CFStringRef CFUUIDCreate(CFAllocatorRef allocator)
 {
-	return CFStringCreateWithCString(allocator,
-	                                 "00000000-0000-0000-0000-000000000000",
-	                                 0);
+	uint8_t uuid[16];
+	char uuid_string[37];
+
+	if (CCRandomGenerateBytes(uuid, sizeof(uuid)) != 0)
+		return NULL;
+	uuid[6] = (uuid[6] & 0x0f) | 0x40;
+	uuid[8] = (uuid[8] & 0x3f) | 0x80;
+	snprintf(uuid_string, sizeof(uuid_string),
+	         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+	         "%02x%02x%02x%02x%02x%02x",
+	         uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5],
+	         uuid[6], uuid[7], uuid[8], uuid[9], uuid[10], uuid[11],
+	         uuid[12], uuid[13], uuid[14], uuid[15]);
+	return CFStringCreateWithCString(allocator, uuid_string, 0);
 }
 
 CFStringRef CFUUIDCreateString(CFAllocatorRef allocator, CFStringRef uuid)
@@ -2396,20 +2384,6 @@ __asm__(".globl strerror_r\n\t.set strerror_r, machgate_xsi_strerror_r");
 
 /* ===== Darwin process and filesystem surface ===== */
 
-int mach_vm_region(uint32_t target_task, uint64_t* address, uint64_t* size,
-                   int flavor, void* info, uint32_t* info_count,
-                   uint32_t* object_name)
-{
-	(void)target_task;
-	(void)address;
-	(void)size;
-	(void)flavor;
-	(void)info;
-	(void)info_count;
-	(void)object_name;
-	return 1;
-}
-
 int mach_vm_map(uint32_t target_task, uint64_t* address, uint64_t size,
                 uint64_t mask, int flags, uint32_t object, uint64_t offset,
                 uint8_t copy, int cur_protection, int max_protection,
@@ -2901,32 +2875,17 @@ int execve(const char* path, char* const argv[], char* const envp[])
 	return -1;
 }
 
-static ssize_t shim_write_with_sigpipe_guard(long syscall_number, int fd,
-                                             const void* buffer,
-                                             size_t size_or_count)
+static ssize_t shim_write_result(long syscall_number, int fd,
+                                  const void* buffer, size_t size_or_count)
 {
-	struct sigaction ignore_action;
-	struct sigaction old_action;
-	int changed = 0;
-
-	memset(&ignore_action, 0, sizeof(ignore_action));
-	ignore_action.sa_handler = SIG_IGN;
-	sigemptyset(&ignore_action.sa_mask);
-	if (sigaction(SIGPIPE, &ignore_action, &old_action) == 0)
-		changed = 1;
-
 	errno = 0;
-	ssize_t result = syscall(syscall_number, fd, buffer, size_or_count);
-	int saved_errno = errno;
-	if (result < 0)
-		saved_errno = machgate_darwin_errno_from_linux(saved_errno);
+	ssize_t result = syscall_number == SYS_write ?
+		machgate_socket_write(fd, buffer, size_or_count) :
+		machgate_socket_writev(fd, buffer, (int)size_or_count);
+	int saved_errno = result < 0 ? machgate_darwin_errno_from_linux(errno) : errno;
 	shim_fd_trace_log("write caller=%p fd=%d size=%zu result=%zd errno=%d\n",
 	                  SHIM_CALLER_RETURN_ADDRESS(), fd, size_or_count,
 	                  result, result < 0 ? saved_errno : 0);
-
-	if (changed && old_action.sa_handler != SIG_DFL)
-		sigaction(SIGPIPE, &old_action, NULL);
-
 	errno = saved_errno;
 	return result;
 }
@@ -2967,32 +2926,12 @@ ssize_t readv(int fd, const struct iovec* iov, int iovcnt)
 
 ssize_t write(int fd, const void* buffer, size_t size)
 {
-	return shim_write_with_sigpipe_guard(SYS_write, fd, buffer, size);
+	return shim_write_result(SYS_write, fd, buffer, size);
 }
 
 ssize_t writev(int fd, const struct iovec* iov, int iovcnt)
 {
-	return shim_write_with_sigpipe_guard(SYS_writev, fd, iov, (size_t)iovcnt);
-}
-
-ssize_t recvmsg_x(int fd, void* msgp, unsigned int cnt, int flags)
-{
-	(void)fd;
-	(void)msgp;
-	(void)cnt;
-	(void)flags;
-	errno = ENOSYS;
-	return -1;
-}
-
-ssize_t sendmsg_x(int fd, void* msgp, unsigned int cnt, int flags)
-{
-	(void)fd;
-	(void)msgp;
-	(void)cnt;
-	(void)flags;
-	errno = ENOSYS;
-	return -1;
+	return shim_write_result(SYS_writev, fd, iov, (size_t)iovcnt);
 }
 
 int sscanf_l(const char* string, locale_t locale, const char* format, ...)
@@ -3527,7 +3466,9 @@ static int darwin_signal_to_linux(int darwin_signal);
 #define DARWIN_TSD_LAST_KEY 511
 #define DARWIN_TSD_KEY_COUNT (DARWIN_TSD_LAST_KEY - DARWIN_TSD_FIRST_KEY + 1)
 
-static unsigned int next_darwin_tsd_key = DARWIN_TSD_FIRST_KEY;
+static pthread_mutex_t darwin_tsd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t darwin_tsd_generations[DARWIN_TSD_KEY_COUNT];
+static __thread uint64_t darwin_tsd_value_generations[DARWIN_TSD_KEY_COUNT];
 static void (*darwin_tsd_destructors[DARWIN_TSD_KEY_COUNT])(void *);
 static __thread void *darwin_tsd_values[DARWIN_TSD_KEY_COUNT];
 static pthread_t machgate_main_pthread;
@@ -3666,34 +3607,72 @@ static void init_pthread_identity(void)
 	register_current_pthread_identity();
 }
 
-int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
+static int create_darwin_tsd_key(pthread_key_t* key, void (*destructor)(void*))
 {
-	unsigned int value;
-	int index;
+	pthread_mutex_lock(&darwin_tsd_mutex);
+	for (int index = 0; index < DARWIN_TSD_KEY_COUNT; index++) {
+		uint64_t generation = __atomic_load_n(&darwin_tsd_generations[index], __ATOMIC_RELAXED);
+		if (generation & 1)
+			continue;
+		darwin_tsd_destructors[index] = destructor;
+		darwin_tsd_values[index] = NULL;
+		darwin_tsd_value_generations[index] = generation + 1;
+		__atomic_store_n(&darwin_tsd_generations[index], generation + 1, __ATOMIC_RELEASE);
+		*key = (pthread_key_t)(index + DARWIN_TSD_FIRST_KEY);
+		uintptr_t* mirror_base = darwin_tsd_mirror_base();
+		if (mirror_base)
+			mirror_base[*key] = 0;
+		pthread_mutex_unlock(&darwin_tsd_mutex);
+		return 0;
+	}
+	pthread_mutex_unlock(&darwin_tsd_mutex);
+	return EAGAIN;
+}
 
-	value = __sync_fetch_and_add(&next_darwin_tsd_key, 1);
-	if (value > DARWIN_TSD_LAST_KEY)
-		return EAGAIN;
-
-	index = (int)(value - DARWIN_TSD_FIRST_KEY);
-	darwin_tsd_destructors[index] = destructor;
+static int delete_darwin_tsd_key(pthread_key_t key)
+{
+	int index = darwin_tsd_key_index(key);
+	if (index < 0)
+		return EINVAL;
+	pthread_mutex_lock(&darwin_tsd_mutex);
+	uint64_t generation = __atomic_load_n(&darwin_tsd_generations[index], __ATOMIC_RELAXED);
+	if (!(generation & 1)) {
+		pthread_mutex_unlock(&darwin_tsd_mutex);
+		return EINVAL;
+	}
+	__atomic_store_n(&darwin_tsd_generations[index], generation + 1, __ATOMIC_RELEASE);
+	darwin_tsd_destructors[index] = NULL;
 	darwin_tsd_values[index] = NULL;
-	*key = (pthread_key_t)value;
-
-	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_key_create -> %u\n", value);
-
+	uintptr_t* mirror_base = darwin_tsd_mirror_base();
+	if (mirror_base)
+		mirror_base[key] = 0;
+	pthread_mutex_unlock(&darwin_tsd_mutex);
 	return 0;
 }
 
-int pthread_setspecific(pthread_key_t key, const void *value)
+int pthread_key_delete(pthread_key_t key)
+{
+	return delete_darwin_tsd_key(key);
+}
+
+int machgate_darwin_pthread_key_delete(uint64_t key)
+{
+	if (key > DARWIN_TSD_LAST_KEY)
+		return 22;
+	return machgate_darwin_errno_from_linux(delete_darwin_tsd_key((pthread_key_t)key));
+}
+
+static int set_darwin_tsd_value(pthread_key_t key, const void *value)
 {
 	uintptr_t *mirror_base;
 	int index = darwin_tsd_key_index(key);
 
 	if (index < 0)
 		return EINVAL;
-
+	uint64_t generation = __atomic_load_n(&darwin_tsd_generations[index], __ATOMIC_ACQUIRE);
+	if (!(generation & 1))
+		return EINVAL;
+	darwin_tsd_value_generations[index] = generation;
 	darwin_tsd_values[index] = (void *)value;
 	mirror_base = darwin_tsd_mirror_base();
 	if (mirror_base)
@@ -3706,16 +3685,90 @@ int pthread_setspecific(pthread_key_t key, const void *value)
 	return 0;
 }
 
-void *pthread_getspecific(pthread_key_t key)
+static void* get_darwin_tsd_value(pthread_key_t key)
 {
 	int index = darwin_tsd_key_index(key);
 
 	if (index < 0)
 		return NULL;
+	uint64_t generation = __atomic_load_n(&darwin_tsd_generations[index], __ATOMIC_ACQUIRE);
+	if (!(generation & 1) || darwin_tsd_value_generations[index] != generation)
+		return NULL;
 	if (shim_trace_enabled())
 		fprintf(stderr, "libsystem_shim: pthread_getspecific(%u) -> %p\n",
 		        (unsigned int)key, darwin_tsd_values[index]);
 	return darwin_tsd_values[index];
+}
+
+int pthread_key_create(pthread_key_t* key, void (*destructor)(void*))
+{
+	return create_darwin_tsd_key(key, destructor);
+}
+
+int pthread_setspecific(pthread_key_t key, const void* value)
+{
+	return set_darwin_tsd_value(key, value);
+}
+
+void* pthread_getspecific(pthread_key_t key)
+{
+	return get_darwin_tsd_value(key);
+}
+
+int machgate_darwin_pthread_key_create(uint64_t* key, void (*destructor)(void*))
+{
+	pthread_key_t native_key;
+	int result = create_darwin_tsd_key(&native_key, destructor);
+	if (result == 0)
+		*key = native_key;
+	return machgate_darwin_errno_from_linux(result);
+}
+
+int machgate_darwin_pthread_setspecific(uint64_t key, const void* value)
+{
+	if (key > DARWIN_TSD_LAST_KEY)
+		return 22;
+	return machgate_darwin_errno_from_linux(
+		set_darwin_tsd_value((pthread_key_t)key, value));
+}
+
+void* machgate_darwin_pthread_getspecific(uint64_t key)
+{
+	if (key > DARWIN_TSD_LAST_KEY)
+		return NULL;
+	return get_darwin_tsd_value((pthread_key_t)key);
+}
+
+void machgate_run_darwin_tsd_destructors(void)
+{
+	for (int pass = 0; pass < PTHREAD_DESTRUCTOR_ITERATIONS; pass++) {
+		int values_remain = 0;
+
+		for (int index = 0; index < DARWIN_TSD_KEY_COUNT; index++) {
+			void* value = get_darwin_tsd_value((pthread_key_t)(index + DARWIN_TSD_FIRST_KEY));
+			pthread_mutex_lock(&darwin_tsd_mutex);
+			void (*destructor)(void*) = darwin_tsd_destructors[index];
+			pthread_mutex_unlock(&darwin_tsd_mutex);
+
+			if (!value || !destructor)
+				continue;
+			darwin_tsd_values[index] = NULL;
+			uintptr_t* mirror_base = darwin_tsd_mirror_base();
+			if (mirror_base)
+				mirror_base[index + DARWIN_TSD_FIRST_KEY] = 0;
+			destructor(value);
+			if (darwin_tsd_values[index])
+				values_remain = 1;
+		}
+		if (!values_remain)
+			break;
+	}
+}
+
+void machgate_run_thread_local_termination_callbacks(void)
+{
+	machgate_run_tlv_exit_callbacks();
+	machgate_run_darwin_tsd_destructors();
 }
 
 int pthread_once(pthread_once_t *once_control, void (*init_routine)(void))
@@ -3745,8 +3798,14 @@ int pthread_once(pthread_once_t *once_control, void (*init_routine)(void))
 
 static int shim_trace_enabled(void)
 {
+	static int configured = -1;
+	int result = __atomic_load_n(&configured, __ATOMIC_ACQUIRE);
+	if (result >= 0)
+		return result;
 	const char* value = getenv("MACHGATE_TRACE_SHIM");
-	return value && value[0] && strcmp(value, "0") != 0;
+	result = value && value[0] && strcmp(value, "0") != 0;
+	__atomic_store_n(&configured, result, __ATOMIC_RELEASE);
+	return result;
 }
 
 static int shim_cxx_init_full_trace_enabled(void)
@@ -4019,7 +4078,8 @@ static const char* shim_host_environment_value(const char* name)
 {
 	size_t name_length = strlen(name);
 	for (char** entry = environ; entry && *entry; entry++) {
-		if (strncmp(*entry, name, name_length) == 0 &&
+		if ((*entry)[0] == name[0] &&
+		    strncmp(*entry, name, name_length) == 0 &&
 		    (*entry)[name_length] == '=')
 			return *entry + name_length + 1;
 	}
@@ -4312,119 +4372,6 @@ static FILE* shim_open_trace_file(void)
 	return fopen(trace_file, "a");
 }
 
-#define ATTR_SLOT_COUNT 64
-
-struct pthread_attr_slot {
-	const void* key;
-	pthread_attr_t native;
-	int used;
-};
-
-static struct pthread_attr_slot pthread_attr_slots[ATTR_SLOT_COUNT];
-
-static struct pthread_attr_slot* pthread_attr_slot_find(const void* key)
-{
-	for (int i = 0; i < ATTR_SLOT_COUNT; i++) {
-		if (pthread_attr_slots[i].used && pthread_attr_slots[i].key == key)
-			return &pthread_attr_slots[i];
-	}
-	return NULL;
-}
-
-static struct pthread_attr_slot* pthread_attr_slot_alloc(const void* key)
-{
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(key);
-	if (slot)
-		return slot;
-
-	for (int i = 0; i < ATTR_SLOT_COUNT; i++) {
-		if (!pthread_attr_slots[i].used) {
-			pthread_attr_slots[i].used = 1;
-			pthread_attr_slots[i].key = key;
-			return &pthread_attr_slots[i];
-		}
-	}
-	return NULL;
-}
-
-int pthread_attr_init(pthread_attr_t* attr)
-{
-	static int (*real_pthread_attr_init)(pthread_attr_t*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_alloc(attr);
-
-	if (!real_pthread_attr_init)
-		real_pthread_attr_init = dlsym(RTLD_NEXT, "pthread_attr_init");
-	if (!real_pthread_attr_init)
-		return ENOSYS;
-	if (!slot)
-		return ENOMEM;
-
-	int result = real_pthread_attr_init(&slot->native);
-	if (result == 0)
-		memset(attr, 0, sizeof(uint64_t));
-	return result;
-}
-
-int pthread_attr_destroy(pthread_attr_t* attr)
-{
-	static int (*real_pthread_attr_destroy)(pthread_attr_t*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
-
-	if (!real_pthread_attr_destroy)
-		real_pthread_attr_destroy = dlsym(RTLD_NEXT, "pthread_attr_destroy");
-	if (!real_pthread_attr_destroy)
-		return ENOSYS;
-	if (!slot)
-		return real_pthread_attr_destroy(attr);
-
-	int result = real_pthread_attr_destroy(&slot->native);
-	slot->used = 0;
-	slot->key = NULL;
-	return result;
-}
-
-int pthread_attr_setstacksize(pthread_attr_t* attr, size_t stack_size)
-{
-	static int (*real_pthread_attr_setstacksize)(pthread_attr_t*, size_t) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
-
-	if (!real_pthread_attr_setstacksize)
-		real_pthread_attr_setstacksize = dlsym(RTLD_NEXT, "pthread_attr_setstacksize");
-	if (!real_pthread_attr_setstacksize)
-		return ENOSYS;
-	return real_pthread_attr_setstacksize(slot ? &slot->native : attr, stack_size);
-}
-
-int pthread_attr_getstacksize(const pthread_attr_t* attr, size_t* stack_size)
-{
-	static int (*real_pthread_attr_getstacksize)(const pthread_attr_t*, size_t*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
-
-	if (!real_pthread_attr_getstacksize)
-		real_pthread_attr_getstacksize = dlsym(RTLD_NEXT, "pthread_attr_getstacksize");
-	if (!real_pthread_attr_getstacksize)
-		return ENOSYS;
-	return real_pthread_attr_getstacksize(slot ? &slot->native : attr, stack_size);
-}
-
-int pthread_attr_setdetachstate(pthread_attr_t* attr, int detach_state)
-{
-	static int (*real_pthread_attr_setdetachstate)(pthread_attr_t*, int) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
-	int linux_state = detach_state;
-
-	if (!real_pthread_attr_setdetachstate)
-		real_pthread_attr_setdetachstate = dlsym(RTLD_NEXT, "pthread_attr_setdetachstate");
-	if (!real_pthread_attr_setdetachstate)
-		return ENOSYS;
-
-	if (detach_state == 1)
-		linux_state = PTHREAD_CREATE_JOINABLE;
-	else if (detach_state == 2)
-		linux_state = PTHREAD_CREATE_DETACHED;
-	return real_pthread_attr_setdetachstate(slot ? &slot->native : attr, linux_state);
-}
-
 static struct shim_thread_start_context* alloc_thread_start_context(
 	void* (*start_routine)(void*), void* arg)
 {
@@ -4457,30 +4404,24 @@ static void* shim_pthread_start(void* raw_context)
 
 	register_current_pthread_identity();
 	free_thread_start_context(context);
-	return start_routine(arg);
+	void* result = start_routine(arg);
+	machgate_run_thread_local_termination_callbacks();
+	return result;
 }
 
 int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                    void* (*start_routine)(void*), void* arg)
 {
-	static int (*real_pthread_create)(pthread_t*, const pthread_attr_t*,
-	                                  void* (*)(void*), void*) = NULL;
-	struct pthread_attr_slot* slot = pthread_attr_slot_find(attr);
 	struct shim_thread_start_context* context;
 	int result;
 
-	if (!real_pthread_create)
-		real_pthread_create = dlsym(RTLD_NEXT, "pthread_create");
-	if (!real_pthread_create)
-		return ENOSYS;
 	context = alloc_thread_start_context(start_routine, arg);
 	if (!context)
 		return EAGAIN;
 	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_create(start=%p arg=%p attr=%p native=%p)\n",
-		        start_routine, arg, attr, slot ? (void*)&slot->native : NULL);
-	result = real_pthread_create(thread, slot ? &slot->native : attr,
-	                             shim_pthread_start, context);
+		fprintf(stderr, "libsystem_shim: pthread_create(start=%p arg=%p attr=%p)\n",
+		        start_routine, arg, attr);
+	result = machgate_native_pthread_create(thread, attr, shim_pthread_start, context);
 	if (result != 0) {
 		free_thread_start_context(context);
 		return result;
@@ -4609,9 +4550,8 @@ long sysconf(int name)
 	case DARWIN_SC_PAGESIZE:
 		return real_sysconf(_SC_PAGESIZE);
 	case DARWIN_SC_NPROCESSORS_CONF:
-		return real_sysconf(_SC_NPROCESSORS_CONF);
 	case DARWIN_SC_NPROCESSORS_ONLN:
-		return real_sysconf(_SC_NPROCESSORS_ONLN);
+		return machgate_guest_cpu_count();
 	default:
 		return real_sysconf(name);
 	}
@@ -4635,529 +4575,45 @@ int pthread_cond_timedwait_relative_np(pthread_cond_t* cond,
 	return pthread_cond_timedwait(cond, mutex, &deadline);
 }
 
-static void remember_kqueue_fd(int fd, int canonical_fd);
-
 int kqueue(void)
 {
-	int result = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	if (result >= 0)
-		remember_kqueue_fd(result, result);
-	shim_fd_trace_log("kqueue caller=%p result=%d errno=%d\n",
-	                  SHIM_CALLER_RETURN_ADDRESS(), result,
-	                  result < 0 ? errno : 0);
-	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: kqueue() -> %d errno=%d\n",
-		        result, result < 0 ? errno : 0);
-	return result;
+	return machgate_kqueue_open();
 }
 
-struct darwin_kevent_placeholder {
-	uint64_t ident;
-	int16_t filter;
-	uint16_t flags;
-	uint32_t fflags;
-	int64_t data;
-	void* udata;
-};
-
-#define DARWIN_EVFILT_READ (-1)
-#define DARWIN_EVFILT_WRITE (-2)
-#define DARWIN_EVFILT_USER (-10)
-#define DARWIN_EV_DELETE 0x0002
-#define DARWIN_EV_DISABLE 0x0008
-#define DARWIN_EV_CLEAR 0x0020
-#define DARWIN_EV_RECEIPT 0x0040
-#define DARWIN_EV_ERROR 0x4000
-#define DARWIN_EV_EOF 0x8000
-#define DARWIN_NOTE_TRIGGER 0x01000000
-#define KQUEUE_REGISTRATION_COUNT 1024
-#define KQUEUE_ALIAS_COUNT 1024
-
-struct shim_kqueue_registration {
-	int used;
-	int kq;
-	uint64_t ident;
-	int16_t filter;
-	uint16_t flags;
-	uint32_t fflags;
-	int64_t data;
-	void* udata;
-	int triggered;
-	int ready;
-};
-
-struct shim_kqueue_poll_registration {
-	struct shim_kqueue_registration* registration;
-	struct shim_kqueue_registration snapshot;
-};
-
-static pthread_mutex_t kqueue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct shim_kqueue_registration kqueue_registrations[KQUEUE_REGISTRATION_COUNT];
-static int kqueue_aliases[KQUEUE_ALIAS_COUNT];
-
-__attribute__((constructor))
-static void init_kqueue_aliases(void)
+int kevent(int kq, const struct machgate_darwin_kevent* changelist,
+           int nchanges, struct machgate_darwin_kevent* eventlist,
+           int nevents, const struct timespec* timeout)
 {
-	for (int i = 0; i < KQUEUE_ALIAS_COUNT; i++)
-		kqueue_aliases[i] = -1;
+	return machgate_kqueue_event(kq, changelist, nchanges, eventlist, nevents,
+	                             timeout);
 }
 
-static int resolve_kqueue_fd_unlocked(int kq)
+int kevent64(int kq, const struct machgate_darwin_kevent64* changelist,
+             int nchanges, struct machgate_darwin_kevent64* eventlist,
+             int nevents, unsigned int flags, const struct timespec* timeout)
 {
-	if (kq >= 0 && kq < KQUEUE_ALIAS_COUNT && kqueue_aliases[kq] >= 0)
-		return kqueue_aliases[kq];
-	return kq;
-}
-
-static void remember_kqueue_fd_unlocked(int fd, int canonical_fd)
-{
-	if (fd >= 0 && fd < KQUEUE_ALIAS_COUNT)
-		kqueue_aliases[fd] = canonical_fd;
-}
-
-static void remember_kqueue_fd(int fd, int canonical_fd)
-{
-	pthread_mutex_lock(&kqueue_mutex);
-	remember_kqueue_fd_unlocked(fd, canonical_fd);
-	pthread_mutex_unlock(&kqueue_mutex);
-}
-
-void machgate_fd_did_duplicate(int from_fd, int to_fd)
-{
-	pthread_mutex_lock(&kqueue_mutex);
-	int canonical_fd = resolve_kqueue_fd_unlocked(from_fd);
-	if (canonical_fd != from_fd ||
-	    (from_fd >= 0 && from_fd < KQUEUE_ALIAS_COUNT &&
-	     kqueue_aliases[from_fd] >= 0))
-		remember_kqueue_fd_unlocked(to_fd, canonical_fd);
-	pthread_mutex_unlock(&kqueue_mutex);
-}
-
-static void forget_kqueue_fd_unlocked(int fd)
-{
-	int canonical_fd = resolve_kqueue_fd_unlocked(fd);
-	int closing_kqueue = fd >= 0 && fd < KQUEUE_ALIAS_COUNT &&
-	    kqueue_aliases[fd] >= 0;
-
-	for (int i = 0; i < KQUEUE_REGISTRATION_COUNT; i++) {
-		struct shim_kqueue_registration* registration = &kqueue_registrations[i];
-		if (!registration->used)
-			continue;
-		if (closing_kqueue && registration->kq == canonical_fd) {
-			memset(registration, 0, sizeof(*registration));
-			continue;
-		}
-		if ((registration->filter == DARWIN_EVFILT_READ ||
-		     registration->filter == DARWIN_EVFILT_WRITE) &&
-		    (int)registration->ident == fd)
-			memset(registration, 0, sizeof(*registration));
+	if (flags) {
+		errno = ENOSYS;
+		return -1;
 	}
-
-	if (fd >= 0 && fd < KQUEUE_ALIAS_COUNT)
-		kqueue_aliases[fd] = -1;
-	if (closing_kqueue && fd == canonical_fd) {
-		for (int i = 0; i < KQUEUE_ALIAS_COUNT; i++) {
-			if (kqueue_aliases[i] == canonical_fd)
-				kqueue_aliases[i] = -1;
-		}
-	}
+	return machgate_kqueue_event64(kq, changelist, nchanges, eventlist,
+	                               nevents, timeout);
 }
 
 void machgate_fd_did_close(int fd)
 {
-	pthread_mutex_lock(&kqueue_mutex);
-	forget_kqueue_fd_unlocked(fd);
-	pthread_mutex_unlock(&kqueue_mutex);
+	{
+		machgate_socket_state_close(fd);
+		machgate_kqueue_fd_did_close(fd);
+	}
 }
 
-static struct shim_kqueue_registration* find_kqueue_registration(int kq,
-                                                                 uint64_t ident,
-                                                                 int16_t filter)
+void machgate_fd_did_duplicate(int from_fd, int to_fd)
 {
-	for (int i = 0; i < KQUEUE_REGISTRATION_COUNT; i++) {
-		struct shim_kqueue_registration* registration = &kqueue_registrations[i];
-		if (registration->used &&
-		    registration->kq == resolve_kqueue_fd_unlocked(kq) &&
-		    registration->ident == ident && registration->filter == filter)
-			return registration;
+	{
+		machgate_socket_state_duplicate(from_fd, to_fd);
+		machgate_kqueue_fd_did_duplicate(from_fd, to_fd);
 	}
-	return NULL;
-}
-
-static struct shim_kqueue_registration* alloc_kqueue_registration(void)
-{
-	for (int i = 0; i < KQUEUE_REGISTRATION_COUNT; i++) {
-		if (!kqueue_registrations[i].used)
-			return &kqueue_registrations[i];
-	}
-	return NULL;
-}
-
-static void ensure_kqueue_poll_fd_nonblocking(int fd)
-{
-	int flags;
-
-	if (fd < 0)
-		return;
-
-	flags = (int)syscall(SYS_fcntl, fd, F_GETFL, 0);
-	if (flags < 0 || (flags & O_NONBLOCK))
-		return;
-
-	syscall(SYS_fcntl, fd, F_SETFL, (unsigned long)(flags | O_NONBLOCK));
-}
-
-static int update_kqueue_registration(int kq,
-                                      const struct darwin_kevent_placeholder* change)
-{
-	struct shim_kqueue_registration* registration =
-		find_kqueue_registration(kq, change->ident, change->filter);
-
-	if (shim_trace_enabled())
-		fprintf(stderr,
-		        "libsystem_shim: kevent change kq=%d ident=%llu filter=%d flags=%#x fflags=%#x data=%lld udata=%p\n",
-		        kq, (unsigned long long)change->ident, change->filter,
-		        change->flags, change->fflags, (long long)change->data,
-		        change->udata);
-	shim_fd_trace_log("kevent_change caller=%p kq=%d ident=%llu filter=%d flags=%#x fflags=%#x data=%lld udata=%p\n",
-	                  SHIM_CALLER_RETURN_ADDRESS(), kq,
-	                  (unsigned long long)change->ident, change->filter,
-	                  change->flags, change->fflags, (long long)change->data,
-	                  change->udata);
-
-	if (change->flags & DARWIN_EV_DELETE) {
-		if (registration)
-			memset(registration, 0, sizeof(*registration));
-		return 0;
-	}
-
-	if (change->filter != DARWIN_EVFILT_READ &&
-	    change->filter != DARWIN_EVFILT_WRITE &&
-	    change->filter != DARWIN_EVFILT_USER)
-		return 0;
-
-	if (change->filter == DARWIN_EVFILT_READ ||
-	    change->filter == DARWIN_EVFILT_WRITE)
-		ensure_kqueue_poll_fd_nonblocking((int)change->ident);
-
-	if (!registration) {
-		registration = alloc_kqueue_registration();
-		if (!registration)
-			return -1;
-	}
-
-	registration->used = 1;
-	registration->kq = resolve_kqueue_fd_unlocked(kq);
-	registration->ident = change->ident;
-	registration->filter = change->filter;
-	registration->flags = change->flags;
-	registration->fflags = change->fflags;
-	registration->data = change->data;
-	registration->udata = change->udata;
-	registration->ready = 0;
-	if (change->fflags & DARWIN_NOTE_TRIGGER)
-		registration->triggered = 1;
-	if (change->filter == DARWIN_EVFILT_USER &&
-	    (change->fflags & DARWIN_NOTE_TRIGGER)) {
-		uint64_t value = 1;
-		ssize_t write_result = write(registration->kq, &value, sizeof(value));
-		(void)write_result;
-	}
-
-	return 0;
-}
-
-static int apply_kqueue_changes(int kq,
-                                const struct darwin_kevent_placeholder* changelist,
-                                int nchanges)
-{
-	for (int i = 0; i < nchanges; i++) {
-		if (update_kqueue_registration(kq, &changelist[i]) < 0) {
-			errno = ENOMEM;
-			return -1;
-		}
-	}
-	return 0;
-}
-
-static int emit_kqueue_receipts(const struct darwin_kevent_placeholder* changelist,
-                                int nchanges,
-                                struct darwin_kevent_placeholder* eventlist,
-                                int nevents)
-{
-	int result = 0;
-
-	for (int index = 0; index < nchanges && result < nevents; index++) {
-		const struct darwin_kevent_placeholder* change = &changelist[index];
-		if (!(change->flags & DARWIN_EV_RECEIPT))
-			continue;
-
-		eventlist[result].ident = change->ident;
-		eventlist[result].filter = change->filter;
-		eventlist[result].flags = change->flags | DARWIN_EV_ERROR;
-		eventlist[result].fflags = change->fflags;
-		eventlist[result].data = 0;
-		eventlist[result].udata = change->udata;
-		result++;
-	}
-
-	return result;
-}
-
-static int kevent_timeout_ms(const struct timespec* timeout)
-{
-	if (!timeout)
-		return -1;
-	if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
-	    timeout->tv_nsec >= 1000000000L)
-		return -1;
-	if (timeout->tv_sec > INT32_MAX / 1000)
-		return INT32_MAX;
-	int result = (int)(timeout->tv_sec * 1000);
-	result += (int)((timeout->tv_nsec + 999999L) / 1000000L);
-	return result;
-}
-
-static short kqueue_poll_events(int16_t filter)
-{
-	if (filter == DARWIN_EVFILT_READ || filter == DARWIN_EVFILT_USER)
-		return POLLIN;
-	if (filter == DARWIN_EVFILT_WRITE)
-		return POLLOUT;
-	return 0;
-}
-
-static int collect_kqueue_pollfds(int kq, struct pollfd* pollfds,
-                                  struct shim_kqueue_poll_registration* registrations,
-                                  int max_events)
-{
-	int count = 0;
-
-	for (int i = 0; i < KQUEUE_REGISTRATION_COUNT && count < max_events; i++) {
-		struct shim_kqueue_registration* registration = &kqueue_registrations[i];
-		if (!registration->used ||
-		    registration->kq != resolve_kqueue_fd_unlocked(kq))
-			continue;
-		if (registration->flags & DARWIN_EV_DISABLE)
-			continue;
-		if (registration->filter == DARWIN_EVFILT_USER) {
-			pollfds[count].fd = kq;
-			pollfds[count].events = POLLIN;
-		} else {
-			pollfds[count].fd = (int)registration->ident;
-		pollfds[count].events = kqueue_poll_events(registration->filter);
-		}
-		pollfds[count].revents = 0;
-		registrations[count].registration = registration;
-		registrations[count].snapshot = *registration;
-		count++;
-	}
-
-	return count;
-}
-
-static int kqueue_registration_matches_snapshot(
-	const struct shim_kqueue_registration* registration,
-	const struct shim_kqueue_registration* snapshot)
-{
-	return registration && registration->used &&
-	    registration->kq == snapshot->kq &&
-	    registration->ident == snapshot->ident &&
-	    registration->filter == snapshot->filter;
-}
-
-static int64_t kqueue_event_data(const struct shim_kqueue_registration* registration,
-                                 short revents)
-{
-	if (registration->filter == DARWIN_EVFILT_READ) {
-		int available = 0;
-		if (syscall(SYS_ioctl, (int)registration->ident, FIONREAD,
-		            &available) == 0 && available > 0)
-			return available;
-		return 0;
-	}
-	if (registration->filter == DARWIN_EVFILT_WRITE) {
-		if (revents & (POLLERR | POLLHUP | POLLNVAL))
-			return 0;
-		return 1;
-	}
-	return 0;
-}
-
-static int emit_kqueue_events(struct pollfd* pollfds,
-                              struct shim_kqueue_poll_registration* registrations,
-                              int pollfd_count,
-                              struct darwin_kevent_placeholder* eventlist,
-                              int nevents)
-{
-	int result = 0;
-
-	for (int i = 0; i < pollfd_count && result < nevents; i++) {
-		struct shim_kqueue_registration* live_registration =
-			registrations[i].registration;
-		struct shim_kqueue_registration* registration =
-			&registrations[i].snapshot;
-		int live_matches = kqueue_registration_matches_snapshot(
-			live_registration, registration);
-		short revents = pollfds[i].revents;
-		int ready = revents != 0;
-
-		if (!ready && registration->filter != DARWIN_EVFILT_USER) {
-			if (live_matches)
-				live_registration->ready = 0;
-			continue;
-		}
-		if (!ready && !registration->triggered)
-			continue;
-		if ((registration->flags & DARWIN_EV_CLEAR) &&
-		    registration->filter == DARWIN_EVFILT_WRITE) {
-			if (live_matches && live_registration->ready)
-				continue;
-			if (live_matches)
-				live_registration->ready = 1;
-		}
-
-		eventlist[result].ident = registration->ident;
-		eventlist[result].filter = registration->filter;
-		eventlist[result].flags = registration->flags;
-		eventlist[result].fflags = registration->fflags;
-		eventlist[result].data = kqueue_event_data(registration, revents);
-		eventlist[result].udata = registration->udata;
-		if (revents & (POLLHUP | POLLERR | POLLNVAL))
-			eventlist[result].flags |= DARWIN_EV_EOF;
-
-		if (shim_trace_enabled())
-			fprintf(stderr,
-			        "libsystem_shim: kevent event ident=%llu filter=%d flags=%#x fflags=%#x data=%lld udata=%p revents=%#x\n",
-			        (unsigned long long)eventlist[result].ident,
-			        eventlist[result].filter, eventlist[result].flags,
-			        eventlist[result].fflags,
-			        (long long)eventlist[result].data,
-			        eventlist[result].udata, revents);
-		shim_fd_trace_log("kevent_event caller=%p ident=%llu filter=%d flags=%#x fflags=%#x data=%lld udata=%p revents=%#x\n",
-		                  SHIM_CALLER_RETURN_ADDRESS(),
-		                  (unsigned long long)eventlist[result].ident,
-		                  eventlist[result].filter, eventlist[result].flags,
-		                  eventlist[result].fflags,
-		                  (long long)eventlist[result].data,
-		                  eventlist[result].udata, revents);
-
-		if (registration->filter == DARWIN_EVFILT_USER) {
-			uint64_t value;
-			while (read(registration->kq, &value, sizeof(value)) > 0) {
-			}
-			if (live_matches)
-				live_registration->triggered = 0;
-		}
-
-		result++;
-	}
-
-	return result;
-}
-
-static void sleep_for_kevent_timeout(const struct timespec* timeout)
-{
-	if (!timeout)
-		return;
-	if (timeout->tv_sec == 0 && timeout->tv_nsec == 0)
-		return;
-	if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
-	    timeout->tv_nsec >= 1000000000L)
-		return;
-
-	struct timespec sleep_time = *timeout;
-	if (sleep_time.tv_sec > 0 || sleep_time.tv_nsec > 1000000L) {
-		sleep_time.tv_sec = 0;
-		sleep_time.tv_nsec = 1000000L;
-	}
-	syscall(SYS_nanosleep, &sleep_time, NULL);
-}
-
-int kevent(int kq, const struct darwin_kevent_placeholder* changelist,
-           int nchanges, struct darwin_kevent_placeholder* eventlist,
-           int nevents, const struct timespec* timeout)
-{
-	int result = 0;
-
-	if (kq < 0) {
-		errno = EBADF;
-		return -1;
-	}
-	if (nevents < 0) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	pthread_mutex_lock(&kqueue_mutex);
-	if (changelist && nchanges > 0)
-		result = apply_kqueue_changes(kq, changelist, nchanges);
-	pthread_mutex_unlock(&kqueue_mutex);
-	if (result < 0)
-		return result;
-
-	if (changelist && nchanges > 0) {
-		if (eventlist && nevents > 0)
-			result = emit_kqueue_receipts(changelist, nchanges, eventlist,
-			                              nevents);
-		if (shim_trace_enabled())
-			fprintf(stderr, "libsystem_shim: kevent(kq=%d nchanges=%d nevents=%d receipts=%d) -> %d errno=0\n",
-			        kq, nchanges, nevents, result, result);
-		shim_fd_trace_log("kevent caller=%p kq=%d nchanges=%d nevents=%d receipts=%d result=%d errno=0\n",
-		                  SHIM_CALLER_RETURN_ADDRESS(), kq, nchanges,
-		                  nevents, result, result);
-		return result;
-	}
-
-	if (eventlist && nevents > 0) {
-		struct pollfd pollfds[64];
-		struct shim_kqueue_poll_registration registrations[64];
-		int max_events = nevents < 64 ? nevents : 64;
-		int pollfd_count;
-		int poll_result;
-
-		pthread_mutex_lock(&kqueue_mutex);
-		pollfd_count = collect_kqueue_pollfds(kq, pollfds, registrations,
-		                                      max_events);
-		pthread_mutex_unlock(&kqueue_mutex);
-
-		if (pollfd_count == 0) {
-			sleep_for_kevent_timeout(timeout);
-			result = 0;
-		} else {
-			poll_result = poll(pollfds, (nfds_t)pollfd_count,
-			                   kevent_timeout_ms(timeout));
-			if (poll_result < 0)
-				result = -1;
-			else {
-				pthread_mutex_lock(&kqueue_mutex);
-				result = emit_kqueue_events(pollfds, registrations,
-				                            pollfd_count, eventlist,
-				                            nevents);
-				pthread_mutex_unlock(&kqueue_mutex);
-			}
-		}
-	}
-	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: kevent(kq=%d nchanges=%d nevents=%d timeout=%p timeout_value=%lld.%09ld) -> %d errno=%d\n",
-		        kq, nchanges, nevents, timeout,
-		        timeout ? (long long)timeout->tv_sec : -1,
-		        timeout ? timeout->tv_nsec : -1L,
-		        result, result < 0 ? errno : 0);
-	shim_fd_trace_log("kevent caller=%p kq=%d nchanges=%d nevents=%d timeout=%p timeout_value=%lld.%09ld result=%d errno=%d\n",
-	                  SHIM_CALLER_RETURN_ADDRESS(), kq, nchanges, nevents,
-	                  timeout, timeout ? (long long)timeout->tv_sec : -1,
-	                  timeout ? timeout->tv_nsec : -1L, result,
-	                  result < 0 ? errno : 0);
-	return result;
-}
-
-int kevent64(int kq, const struct darwin_kevent_placeholder* changelist,
-             int nchanges, struct darwin_kevent_placeholder* eventlist,
-             int nevents, uint32_t flags, const struct timespec* timeout)
-{
-	(void)flags;
-	return kevent(kq, changelist, nchanges, eventlist, nevents, timeout);
 }
 
 void* xpc_date_create_from_current(void)
@@ -5647,6 +5103,7 @@ static void trace_signal_dispatcher(int signum, siginfo_t* info, void* ucontext)
 	if (shim_signal_trace_enabled()) {
 		uintptr_t pc = trace_ucontext_pc(ucontext);
 		uintptr_t lr = trace_ucontext_reg(ucontext, 30);
+		machgate_trace_initializer_context();
 		fprintf(stderr,
 		        "libsystem_shim: guest signal signum=%d darwin=%d code=%d addr=%p pc=%p lr=%p sp=%p fp=%p\n",
 		        signum, linux_signal_to_darwin(signum), info ? info->si_code : 0,
@@ -6016,34 +5473,6 @@ int sigwait(const sigset_t *set, int *sig)
 	return result;
 }
 
-/* ===== Blocks runtime ===== */
-
-void *_NSConcreteGlobalBlock = NULL;
-void *_NSConcreteStackBlock = NULL;
-void *_NSConcreteMallocBlock = NULL;
-
-void* _Block_copy(const void* block)
-{
-	return (void*)block;
-}
-
-void _Block_release(const void* block)
-{
-	(void)block;
-}
-
-void _Block_object_assign(void *dst, const void *src, int flags)
-{
-	(void)dst; (void)src; (void)flags;
-	fprintf(stderr, "libsystem_shim: WARNING: _Block_object_assign is unsupported\n");
-}
-
-void _Block_object_dispose(const void *obj, int flags)
-{
-	(void)obj; (void)flags;
-	fprintf(stderr, "libsystem_shim: WARNING: _Block_object_dispose is unsupported\n");
-}
-
 void _os_signpost_emit_with_name_impl(void* dso, void* log, uint32_t type,
                                       uint64_t signpost_id, const char* name,
                                       const char* format, ...)
@@ -6100,81 +5529,6 @@ void os_unfair_lock_unlock(uint32_t* lock)
 void os_unfair_lock_assert_owner(uint32_t* lock)
 {
 	(void)lock;
-}
-
-#define DARWIN_UL_OPCODE_MASK 0x000000ffU
-#define DARWIN_ULF_NO_ERRNO 0x01000000U
-#define DARWIN_ULF_WAKE_ALL 0x00000100U
-
-static int ulock_result(int result, uint32_t operation)
-{
-	if (result == 0)
-		return 0;
-	if (operation & DARWIN_ULF_NO_ERRNO)
-		return -machgate_darwin_errno_from_linux(errno ? errno : EIO);
-	return -1;
-}
-
-int __ulock_wait2(uint32_t operation, void* address, uint64_t value,
-                  uint64_t timeout, uint64_t value2)
-{
-	(void)value2;
-
-	if (!address) {
-		errno = EFAULT;
-		return ulock_result(-1, operation);
-	}
-
-	uint32_t opcode = operation & DARWIN_UL_OPCODE_MASK;
-	int futex_op = FUTEX_WAIT_PRIVATE;
-	const struct timespec* timeout_ptr = NULL;
-	struct timespec timeout_value;
-
-	if (timeout) {
-		timeout_value.tv_sec = (time_t)(timeout / 1000000000ULL);
-		timeout_value.tv_nsec = (long)(timeout % 1000000000ULL);
-		timeout_ptr = &timeout_value;
-	}
-
-	long result;
-	if (opcode == 5 || opcode == 6) {
-		result = syscall(SYS_futex, address, futex_op, value,
-		                 timeout_ptr, NULL, 0);
-	} else {
-		result = syscall(SYS_futex, address, futex_op, (uint32_t)value,
-		                 timeout_ptr, NULL, 0);
-	}
-
-	if (result == 0)
-		return 0;
-	return ulock_result(-1, operation);
-}
-
-int __ulock_wait(uint32_t operation, void* address, uint64_t value,
-                 uint32_t timeout)
-{
-	uint64_t timeout_ns = (uint64_t)timeout * 1000ULL;
-	return __ulock_wait2(operation, address, value, timeout_ns, 0);
-}
-
-int __ulock_wake(uint32_t operation, void* address, uint64_t wake_value)
-{
-	if (!address) {
-		errno = EFAULT;
-		return ulock_result(-1, operation);
-	}
-
-	int wake_count = 1;
-	if ((operation & DARWIN_ULF_WAKE_ALL) || wake_value > INT32_MAX)
-		wake_count = INT32_MAX;
-	else if (wake_value > 0)
-		wake_count = (int)wake_value;
-
-	long result = syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, wake_count,
-	                      NULL, NULL, 0);
-	if (result >= 0)
-		return 0;
-	return ulock_result(-1, operation);
 }
 
 pid_t vfork(void)
@@ -6375,13 +5729,15 @@ int mprotect(void *addr, size_t len, int prot)
 static void* (*real_dlopen)(const char*, int) = NULL;
 static void* (*real_dlsym)(void*, const char*) = NULL;
 
+#define DARWIN_RTLD_NEXT ((void*)-1L)
 #define DARWIN_RTLD_DEFAULT ((void*)-2L)
 #define DARWIN_RTLD_SELF ((void*)-3L)
 #define DARWIN_RTLD_MAIN_ONLY ((void*)-5L)
 
 static void* translate_dlsym_handle(void* handle)
 {
-	if (handle == DARWIN_RTLD_DEFAULT ||
+	if (handle == DARWIN_RTLD_NEXT ||
+	    handle == DARWIN_RTLD_DEFAULT ||
 	    handle == DARWIN_RTLD_SELF ||
 	    handle == DARWIN_RTLD_MAIN_ONLY)
 		return RTLD_DEFAULT;
@@ -6405,30 +5761,45 @@ static void* (*resolve_real_dlsym(void))(void*, const char*)
 	return NULL;
 }
 
+__attribute__((visibility("default")))
+void* machgate_darwin_dlsym_impl(void* handle, const char* symbol)
+{
+	static machgate_native_symbol_resolver_function native_resolver;
+	if (!real_dlsym)
+		real_dlsym = resolve_real_dlsym();
+	if (!real_dlsym)
+		return NULL;
+	if (!native_resolver)
+		native_resolver = (machgate_native_symbol_resolver_function)
+			real_dlsym(RTLD_DEFAULT, MACHGATE_NATIVE_SYMBOL_RESOLVER_SYMBOL);
+	void* native_handle = translate_dlsym_handle(handle);
+	void* result = NULL;
+	if (native_resolver && native_resolver(native_handle, symbol, &result))
+		return result;
+	return real_dlsym(native_handle, symbol);
+}
+
+void* dlsym(void* handle, const char* symbol) __asm__("dlsym");
 void* dlsym(void* handle, const char* symbol)
 {
 	if (!real_dlsym)
 		real_dlsym = resolve_real_dlsym();
+	return real_dlsym ? real_dlsym(handle, symbol) : NULL;
+}
 
-	if (!real_dlsym)
-		return NULL;
-	return real_dlsym(translate_dlsym_handle(handle), symbol);
+__attribute__((visibility("hidden")))
+void* machgate_guest_dlsym_address(void)
+{
+	return machgate_darwin_dlsym_impl;
 }
 
 static int translate_dlopen_flags(int flags)
 {
-	int result = 0;
-
-	if (flags & RTLD_NOW)
-		result |= RTLD_NOW;
-	else
-		result |= RTLD_LAZY;
-
-	if (flags & RTLD_GLOBAL)
-		result |= RTLD_GLOBAL;
-	else
-		result |= RTLD_LOCAL;
-
+	const int darwin_rtld_now = 0x2;
+	const int darwin_rtld_global = 0x8;
+	unsigned int mode_flags = (unsigned int)flags;
+	int result = (mode_flags & darwin_rtld_now) ? RTLD_NOW : RTLD_LAZY;
+	result |= (mode_flags & darwin_rtld_global) ? RTLD_GLOBAL : RTLD_LOCAL;
 	return result;
 }
 
@@ -6439,10 +5810,22 @@ static int is_shim_framework_path(const char* path)
 	        strstr(path, "CoreServices.framework"));
 }
 
-void* dlopen(const char* path, int flags)
+static int initialize_real_dlopen(void)
 {
+	if (!real_dlsym)
+		real_dlsym = resolve_real_dlsym();
+	if (!real_dlsym)
+		return 0;
 	if (!real_dlopen)
-		real_dlopen = dlsym(RTLD_NEXT, "dlopen");
+		real_dlopen = real_dlsym(RTLD_NEXT, "dlopen");
+	return real_dlopen != NULL;
+}
+
+__attribute__((visibility("default")))
+void* machgate_darwin_dlopen_impl(const char* path, int flags)
+{
+	if (!initialize_real_dlopen())
+		return NULL;
 
 	int linux_flags = translate_dlopen_flags(flags);
 
@@ -6455,6 +5838,20 @@ void* dlopen(const char* path, int flags)
 	}
 
 	return real_dlopen(path, linux_flags);
+}
+
+void* dlopen(const char* path, int flags) __asm__("dlopen");
+void* dlopen(const char* path, int flags)
+{
+	if (!initialize_real_dlopen())
+		return NULL;
+	return real_dlopen(path, flags);
+}
+
+__attribute__((visibility("hidden")))
+void* machgate_guest_dlopen_address(void)
+{
+	return machgate_darwin_dlopen_impl;
 }
 
 __attribute__((noreturn))
@@ -6492,381 +5889,6 @@ static host_posix_memalign_function real_posix_memalign;
 static unsigned char bootstrap_storage[4096];
 static size_t bootstrap_used;
 
-#define MACHGATE_ALLOCATION_INITIAL_TABLE_SIZE 262144
-#define MACHGATE_ALLOCATION_MAX_TABLE_SIZE 4194304
-
-struct machgate_allocation_record {
-	void* ptr;
-	size_t size;
-	void* zone;
-	unsigned flags;
-};
-
-static struct machgate_allocation_record allocation_records_static[MACHGATE_ALLOCATION_INITIAL_TABLE_SIZE];
-static struct machgate_allocation_record* allocation_records = allocation_records_static;
-static size_t allocation_records_capacity = MACHGATE_ALLOCATION_INITIAL_TABLE_SIZE;
-static size_t allocation_records_live_count;
-static size_t allocation_records_tombstone_count;
-static int allocation_records_drop_warned;
-static volatile int allocation_records_lock;
-
-#define MACHGATE_ALLOCATION_GUEST_CXX 1u
-
-static void lock_allocation_records(void)
-{
-	while (__sync_lock_test_and_set(&allocation_records_lock, 1))
-		sched_yield();
-}
-
-static void unlock_allocation_records(void)
-{
-	__sync_lock_release(&allocation_records_lock);
-}
-
-static size_t allocation_record_index(const void* ptr, size_t capacity)
-{
-	uintptr_t value = (uintptr_t)ptr;
-
-	value >>= 4;
-	value ^= value >> 17;
-	value ^= value >> 31;
-	return value & (capacity - 1);
-}
-
-static int insert_allocation_record(struct machgate_allocation_record* records,
-                                    size_t capacity, void* ptr, size_t size,
-                                    void* zone, unsigned flags,
-                                    int* inserted_out,
-                                    int* reused_tombstone_out)
-{
-	size_t index = allocation_record_index(ptr, capacity);
-	struct machgate_allocation_record* reusable_record = NULL;
-
-	if (inserted_out)
-		*inserted_out = 0;
-	if (reused_tombstone_out)
-		*reused_tombstone_out = 0;
-
-	for (size_t probe = 0; probe < capacity; probe++) {
-		struct machgate_allocation_record* record =
-		    &records[(index + probe) & (capacity - 1)];
-
-		if (record->ptr == ptr) {
-			if (record->size == 0) {
-				if (inserted_out)
-					*inserted_out = 1;
-				if (reused_tombstone_out)
-					*reused_tombstone_out = 1;
-			}
-			record->ptr = ptr;
-			record->size = size;
-			record->zone = zone;
-			record->flags = flags;
-			return 1;
-		}
-		if (record->ptr && record->size == 0 && !reusable_record)
-			reusable_record = record;
-		if (!record->ptr) {
-			if (reusable_record)
-				record = reusable_record;
-			if (inserted_out)
-				*inserted_out = 1;
-			if (reused_tombstone_out && reusable_record)
-				*reused_tombstone_out = 1;
-			record->ptr = ptr;
-			record->size = size;
-			record->zone = zone;
-			record->flags = flags;
-			return 1;
-		}
-	}
-	if (reusable_record) {
-		if (inserted_out)
-			*inserted_out = 1;
-		if (reused_tombstone_out)
-			*reused_tombstone_out = 1;
-		reusable_record->ptr = ptr;
-		reusable_record->size = size;
-		reusable_record->zone = zone;
-		reusable_record->flags = flags;
-		return 1;
-	}
-	return 0;
-}
-
-static void note_inserted_allocation_record(int inserted, int reused_tombstone)
-{
-	if (!inserted)
-		return;
-	allocation_records_live_count++;
-	if (reused_tombstone && allocation_records_tombstone_count > 0)
-		allocation_records_tombstone_count--;
-}
-
-static int compact_allocation_records(void)
-{
-	size_t capacity = allocation_records_capacity;
-	size_t bytes = capacity * sizeof(*allocation_records);
-	struct machgate_allocation_record* old_records = allocation_records;
-	struct machgate_allocation_record* new_records;
-	size_t live_count = 0;
-
-	new_records = (struct machgate_allocation_record*)syscall(
-	    SYS_mmap, NULL, bytes, PROT_READ | PROT_WRITE,
-	    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (new_records == MAP_FAILED)
-		return 0;
-
-	for (size_t index = 0; index < capacity; index++) {
-		struct machgate_allocation_record* record = &old_records[index];
-		if (!record->ptr || record->size == 0)
-			continue;
-		if (!insert_allocation_record(new_records, capacity, record->ptr,
-		                              record->size, record->zone,
-		                              record->flags, NULL, NULL)) {
-			syscall(SYS_munmap, new_records, bytes);
-			return 0;
-		}
-		live_count++;
-	}
-
-	allocation_records = new_records;
-	allocation_records_live_count = live_count;
-	allocation_records_tombstone_count = 0;
-	if (old_records != allocation_records_static)
-		syscall(SYS_munmap, old_records, bytes);
-	return 1;
-}
-
-static int allocation_records_should_compact(void)
-{
-	return allocation_records_tombstone_count > 4096 &&
-	       (allocation_records_tombstone_count > allocation_records_live_count ||
-	        allocation_records_tombstone_count > allocation_records_capacity / 4);
-}
-
-static void warn_allocation_record_drop_once(void* ptr, size_t size, void* zone,
-                                            unsigned flags)
-{
-	if (allocation_records_drop_warned)
-		return;
-	allocation_records_drop_warned = 1;
-	fprintf(stderr,
-	        "libsystem_shim: WARNING: allocation ledger full after %zu slots; first dropped ptr=%p size=%zu zone=%p flags=%#x\n",
-	        allocation_records_capacity, ptr, size, zone, flags);
-}
-
-static int grow_allocation_records(void)
-{
-	size_t old_capacity = allocation_records_capacity;
-	size_t new_capacity = old_capacity * 2;
-	size_t new_bytes;
-	struct machgate_allocation_record* old_records = allocation_records;
-	struct machgate_allocation_record* new_records;
-
-	if (old_capacity >= MACHGATE_ALLOCATION_MAX_TABLE_SIZE)
-		return 0;
-	if (new_capacity > MACHGATE_ALLOCATION_MAX_TABLE_SIZE)
-		new_capacity = MACHGATE_ALLOCATION_MAX_TABLE_SIZE;
-	if (new_capacity <= old_capacity)
-		return 0;
-
-	new_bytes = new_capacity * sizeof(*new_records);
-	new_records = (struct machgate_allocation_record*)syscall(
-	    SYS_mmap, NULL, new_bytes, PROT_READ | PROT_WRITE,
-	    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (new_records == MAP_FAILED)
-		return 0;
-
-	for (size_t index = 0; index < old_capacity; index++) {
-		struct machgate_allocation_record* record = &old_records[index];
-		if (!record->ptr || record->size == 0)
-			continue;
-		if (!insert_allocation_record(new_records, new_capacity, record->ptr,
-		                              record->size, record->zone,
-		                              record->flags, NULL, NULL)) {
-			syscall(SYS_munmap, new_records, new_bytes);
-			return 0;
-		}
-	}
-
-	allocation_records = new_records;
-	allocation_records_capacity = new_capacity;
-	allocation_records_tombstone_count = 0;
-	if (old_records != allocation_records_static)
-		syscall(SYS_munmap, old_records, old_capacity * sizeof(*old_records));
-	return 1;
-}
-
-static void record_allocation_with_zone(void* ptr, size_t size, void* zone)
-{
-	int inserted = 0;
-	int reused_tombstone = 0;
-
-	if (!ptr)
-		return;
-
-	lock_allocation_records();
-	if (allocation_records_should_compact())
-		compact_allocation_records();
-	while (!insert_allocation_record(allocation_records,
-	                                 allocation_records_capacity, ptr, size,
-	                                 zone, 0, &inserted, &reused_tombstone)) {
-		if (grow_allocation_records())
-			continue;
-		warn_allocation_record_drop_once(ptr, size, zone, 0);
-		break;
-	}
-	note_inserted_allocation_record(inserted, reused_tombstone);
-	unlock_allocation_records();
-}
-
-static void record_allocation(void* ptr, size_t size)
-{
-	record_allocation_with_zone(ptr, size, NULL);
-}
-
-static int lookup_allocation(const void* ptr, size_t* size_out, void** zone_out,
-                             unsigned* flags_out)
-{
-	size_t index;
-
-	if (!ptr)
-		return 0;
-
-	lock_allocation_records();
-	index = allocation_record_index(ptr, allocation_records_capacity);
-	for (size_t probe = 0; probe < allocation_records_capacity; probe++) {
-		const struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (allocation_records_capacity - 1)];
-
-		if (!record->ptr) {
-			unlock_allocation_records();
-			return 0;
-		}
-		if (record->ptr == ptr) {
-			if (size_out)
-				*size_out = record->size;
-			if (zone_out)
-				*zone_out = record->zone;
-			if (flags_out)
-				*flags_out = record->flags;
-			unlock_allocation_records();
-			return 1;
-		}
-	}
-
-	unlock_allocation_records();
-	return 0;
-}
-
-static int lookup_allocation_size(const void* ptr, size_t* size_out)
-{
-	return lookup_allocation(ptr, size_out, NULL, NULL);
-}
-
-static size_t recorded_allocation_size(void* ptr, size_t requested_size)
-{
-	(void)ptr;
-	if (requested_size > 0)
-		return requested_size;
-	return 1;
-}
-
-static void forget_allocation(const void* ptr)
-{
-	size_t index;
-
-	if (!ptr)
-		return;
-
-	lock_allocation_records();
-	index = allocation_record_index(ptr, allocation_records_capacity);
-	for (size_t probe = 0; probe < allocation_records_capacity; probe++) {
-		struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (allocation_records_capacity - 1)];
-
-		if (!record->ptr) {
-			unlock_allocation_records();
-			return;
-		}
-		if (record->ptr == ptr) {
-			if (record->size != 0) {
-				allocation_records_live_count--;
-				allocation_records_tombstone_count++;
-			}
-			record->size = 0;
-			record->zone = NULL;
-			record->flags = 0;
-			unlock_allocation_records();
-			return;
-		}
-	}
-	unlock_allocation_records();
-}
-
-static void mark_guest_cxx_allocation(void* ptr, size_t size)
-{
-	size_t index;
-	struct machgate_allocation_record* reusable_record = NULL;
-
-	if (!ptr)
-		return;
-
-	lock_allocation_records();
-	if (allocation_records_should_compact())
-		compact_allocation_records();
-retry:
-	index = allocation_record_index(ptr, allocation_records_capacity);
-	reusable_record = NULL;
-	for (size_t probe = 0; probe < allocation_records_capacity; probe++) {
-		struct machgate_allocation_record* record =
-		    &allocation_records[(index + probe) & (allocation_records_capacity - 1)];
-
-		if (!record->ptr) {
-			if (reusable_record)
-				record = reusable_record;
-			allocation_records_live_count++;
-			if (reusable_record && allocation_records_tombstone_count > 0)
-				allocation_records_tombstone_count--;
-			record->ptr = ptr;
-			record->size = recorded_allocation_size(ptr, size);
-			record->zone = NULL;
-			record->flags = MACHGATE_ALLOCATION_GUEST_CXX;
-			unlock_allocation_records();
-			return;
-		}
-		if (record->ptr && record->size == 0 && !reusable_record)
-			reusable_record = record;
-		if (record->ptr == ptr) {
-			if (record->size == 0) {
-				allocation_records_live_count++;
-				if (allocation_records_tombstone_count > 0)
-					allocation_records_tombstone_count--;
-				record->size = recorded_allocation_size(ptr, size);
-			}
-			record->flags |= MACHGATE_ALLOCATION_GUEST_CXX;
-			unlock_allocation_records();
-			return;
-		}
-	}
-	if (reusable_record) {
-		allocation_records_live_count++;
-		if (allocation_records_tombstone_count > 0)
-			allocation_records_tombstone_count--;
-		reusable_record->ptr = ptr;
-		reusable_record->size = recorded_allocation_size(ptr, size);
-		reusable_record->zone = NULL;
-		reusable_record->flags = MACHGATE_ALLOCATION_GUEST_CXX;
-		unlock_allocation_records();
-		return;
-	}
-	if (grow_allocation_records())
-		goto retry;
-	warn_allocation_record_drop_once(ptr, size, NULL, MACHGATE_ALLOCATION_GUEST_CXX);
-	unlock_allocation_records();
-}
-
 static int should_forward_guest_cxx_delete(const void* ptr)
 {
 	size_t size = 0;
@@ -6874,7 +5896,7 @@ static int should_forward_guest_cxx_delete(const void* ptr)
 
 	if (!ptr)
 		return 0;
-	if (lookup_allocation(ptr, &size, NULL, &flags))
+	if (machgate_lookup_allocation(ptr, &size, NULL, &flags))
 		return size != 0 && (flags & MACHGATE_ALLOCATION_GUEST_CXX);
 	return 1;
 }
@@ -6901,7 +5923,7 @@ static void* allocate_from_bootstrap_storage(size_t size)
 	void* result = bootstrap_storage + start;
 	memset(result, 0, size);
 	bootstrap_used = start + size;
-	record_allocation(result, size ? size : 1);
+	machgate_record_allocation(result, size ? size : 1);
 	return result;
 }
 
@@ -6915,7 +5937,7 @@ static void *shim_malloc_impl_at(size_t size, void* caller)
 	void *p = real_malloc(size);
 	if (p) {
 		memset(p, 0, size);
-		record_allocation(p, recorded_allocation_size(p, size));
+		machgate_record_allocation(p, machgate_recorded_allocation_size(p, size));
 		shim_trace_alloc_event_at("malloc", p, size, 0, caller, 1);
 	}
 	return p;
@@ -6933,11 +5955,12 @@ static void shim_free_impl_at(void *ptr, void* caller)
 	int known;
 
 	if (!ptr) return;
-	known = lookup_allocation_size(ptr, &old_size);
+	if (machgate_release_registered_mapping(ptr))
+		return;
+	known = machgate_take_allocation(ptr, &old_size);
 	shim_trace_alloc_event_at("free", ptr, old_size, old_size, caller, known);
 	if (!known && shim_alloc_mismatch_trace_enabled())
 		shim_dump_recent_alloc_events("free-unknown-pointer", ptr);
-	forget_allocation(ptr);
 	if ((unsigned char*)ptr >= bootstrap_storage &&
 	    (unsigned char*)ptr < bootstrap_storage + sizeof(bootstrap_storage))
 		return;
@@ -6963,7 +5986,7 @@ static void *shim_calloc_impl_at(size_t nmemb, size_t size, void* caller)
 	}
 	void *p = real_calloc(nmemb, size);
 	if (p) {
-		record_allocation(p, recorded_allocation_size(p, nmemb * size));
+		machgate_record_allocation(p, machgate_recorded_allocation_size(p, nmemb * size));
 		shim_trace_alloc_event_at("calloc", p, nmemb * size, 0, caller, 1);
 	}
 	return p;
@@ -6982,18 +6005,18 @@ static void *shim_realloc_impl_at(void *ptr, size_t size, void* caller)
 
 	if (ptr && (unsigned char*)ptr >= bootstrap_storage &&
 	    (unsigned char*)ptr < bootstrap_storage + sizeof(bootstrap_storage)) {
-		lookup_allocation_size(ptr, &old_size);
+		machgate_lookup_allocation_size(ptr, &old_size);
 		void* new_ptr = shim_malloc_impl_at(size, caller);
 		if (!new_ptr && size != 0)
 			return NULL;
 		if (new_ptr && old_size)
 			memcpy(new_ptr, ptr, old_size < size ? old_size : size);
-		forget_allocation(ptr);
+		machgate_forget_allocation(ptr);
 		return new_ptr;
 	}
 
 	if (ptr) {
-		known = lookup_allocation_size(ptr, &old_size);
+		known = machgate_lookup_allocation_size(ptr, &old_size);
 		if (!known && shim_alloc_mismatch_trace_enabled())
 			shim_dump_recent_alloc_events("realloc-unknown-pointer", ptr);
 	}
@@ -7002,9 +6025,9 @@ static void *shim_realloc_impl_at(void *ptr, size_t size, void* caller)
 	if (!real_realloc) return NULL;
 	void *new_ptr = real_realloc(ptr, size);
 	if (new_ptr || size == 0)
-		forget_allocation(ptr);
+		machgate_forget_allocation(ptr);
 	if (new_ptr) {
-		record_allocation(new_ptr, recorded_allocation_size(new_ptr, size));
+		machgate_record_allocation(new_ptr, machgate_recorded_allocation_size(new_ptr, size));
 		shim_trace_alloc_event_at("realloc", new_ptr, size, old_size, caller, known);
 	}
 	return new_ptr;
@@ -7029,7 +6052,7 @@ static int shim_posix_memalign_impl_at(void **memptr, size_t alignment,
 		return ENOMEM;
 	int result = real_posix_memalign(memptr, alignment, size);
 	if (result == 0) {
-		record_allocation(*memptr, recorded_allocation_size(*memptr, size));
+		machgate_record_allocation(*memptr, machgate_recorded_allocation_size(*memptr, size));
 		shim_trace_alloc_event_at("posix_memalign", *memptr, size, alignment,
 		                          caller, 1);
 	}
@@ -7064,6 +6087,12 @@ void* machgate_shim_realloc(void* ptr, size_t size)
 void machgate_shim_free(void* ptr)
 {
 	shim_free_impl_at(ptr, MACHGATE_SHIM_CALLER());
+}
+
+void machgate_shim_record_external_allocation(void* ptr, size_t size)
+{
+	if (ptr)
+		machgate_record_allocation(ptr, size ? size : 1);
 }
 
 int machgate_shim_posix_memalign(void** memptr, size_t alignment, size_t size)
@@ -7236,7 +6265,7 @@ void* machgate_shim_guest_operator_new(size_t size)
 		guest_cxx_allocator_depth++;
 		void* result = guest_operator_new(size);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return shim_malloc_impl_at(size, MACHGATE_SHIM_CALLER());
@@ -7248,7 +6277,7 @@ void* machgate_shim_guest_operator_new_array(size_t size)
 		guest_cxx_allocator_depth++;
 		void* result = guest_operator_new_array(size);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return shim_malloc_impl_at(size, MACHGATE_SHIM_CALLER());
@@ -7260,7 +6289,7 @@ void* machgate_shim_guest_operator_new_aligned(size_t size, size_t alignment)
 		guest_cxx_allocator_depth++;
 		void* result = guest_operator_new_aligned(size, alignment);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return machgate_shim_operator_new_aligned_at(
@@ -7273,7 +6302,7 @@ void* machgate_shim_guest_operator_new_array_aligned(size_t size, size_t alignme
 		guest_cxx_allocator_depth++;
 		void* result = guest_operator_new_array_aligned(size, alignment);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return machgate_shim_operator_new_aligned_at(
@@ -7286,7 +6315,7 @@ void* machgate_shim_guest_operator_new_nothrow(size_t size, const void* nothrow_
 		guest_cxx_allocator_depth++;
 		void* result = guest_operator_new_nothrow(size, nothrow_arg);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return machgate_shim_guest_operator_new(size);
@@ -7299,7 +6328,7 @@ void* machgate_shim_guest_operator_new_array_nothrow(size_t size,
 		guest_cxx_allocator_depth++;
 		void* result = guest_operator_new_array_nothrow(size, nothrow_arg);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return machgate_shim_guest_operator_new_array(size);
@@ -7314,7 +6343,7 @@ void* machgate_shim_guest_operator_new_aligned_nothrow(size_t size,
 		void* result =
 		    guest_operator_new_aligned_nothrow(size, alignment, nothrow_arg);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return machgate_shim_operator_new_aligned_at(
@@ -7330,7 +6359,7 @@ void* machgate_shim_guest_operator_new_array_aligned_nothrow(size_t size,
 		void* result =
 		    guest_operator_new_array_aligned_nothrow(size, alignment, nothrow_arg);
 		guest_cxx_allocator_depth--;
-		mark_guest_cxx_allocation(result, size);
+		machgate_mark_guest_cxx_allocation(result, size);
 		return result;
 	}
 	return machgate_shim_operator_new_aligned_at(
@@ -7766,7 +6795,7 @@ static void* allocation_recorded_zone(const void* ptr)
 	size_t size = 0;
 	void* zone = NULL;
 
-	if (lookup_allocation(ptr, &size, &zone, NULL) && size != 0)
+	if (machgate_lookup_allocation(ptr, &size, &zone, NULL) && size != 0)
 		return zone;
 	return NULL;
 }
@@ -7807,7 +6836,7 @@ void* malloc_zone_malloc(void* zone, size_t size)
 	if (machgate_zone && machgate_zone->malloc) {
 		void* result = machgate_zone->malloc(zone, size);
 		if (result) {
-			record_allocation_with_zone(result,
+			machgate_record_allocation_with_zone(result,
 			                            zone_recorded_size(machgate_zone, zone, result, size),
 			                            zone);
 			shim_trace_alloc_event_at("malloc_zone_malloc", result, size, 0,
@@ -7827,9 +6856,9 @@ void* malloc_zone_realloc(void* zone, void* ptr, size_t size)
 		size_t old_size = malloc_zone_size(effective_zone, ptr);
 		void* result = machgate_zone->realloc(effective_zone, ptr, size);
 		if (result || size == 0)
-			forget_allocation(ptr);
+			machgate_forget_allocation(ptr);
 		if (result) {
-			record_allocation_with_zone(result,
+			machgate_record_allocation_with_zone(result,
 			                            zone_recorded_size(machgate_zone, effective_zone, result, size),
 			                            effective_zone);
 			shim_trace_alloc_event_at("malloc_zone_realloc", result, size, old_size,
@@ -7850,7 +6879,7 @@ void malloc_zone_free(void* zone, void* ptr)
 		shim_trace_alloc_event_at("malloc_zone_free", ptr, old_size, old_size,
 		                          caller, old_size != 0);
 		machgate_zone->free(effective_zone, ptr);
-		forget_allocation(ptr);
+		machgate_forget_allocation(ptr);
 		return;
 	}
 	shim_free_impl_at(ptr, caller);
@@ -7873,7 +6902,7 @@ void* malloc_zone_calloc(void* zone, size_t count, size_t size)
 		size_t total = count * size;
 		void* result = machgate_zone->calloc(zone, count, size);
 		if (result) {
-			record_allocation_with_zone(result,
+			machgate_record_allocation_with_zone(result,
 			                            zone_recorded_size(machgate_zone, zone, result, total),
 			                            zone);
 			shim_trace_alloc_event_at("malloc_zone_calloc", result, total, 0,
@@ -7891,7 +6920,7 @@ void* malloc_zone_valloc(void* zone, size_t size)
 	if (machgate_zone && machgate_zone->valloc) {
 		void* result = machgate_zone->valloc(zone, size);
 		if (result) {
-			record_allocation_with_zone(result,
+			machgate_record_allocation_with_zone(result,
 			                            zone_recorded_size(machgate_zone, zone, result, size),
 			                            zone);
 			shim_trace_alloc_event_at("malloc_zone_valloc", result, size, 0,
@@ -7927,7 +6956,7 @@ unsigned malloc_zone_batch_malloc(void* zone, size_t size,
 	if (machgate_zone && machgate_zone->batch_malloc) {
 		unsigned result = machgate_zone->batch_malloc(zone, size, results, count);
 		for (index = 0; index < result; index++) {
-			record_allocation_with_zone(results[index],
+			machgate_record_allocation_with_zone(results[index],
 			                            zone_recorded_size(machgate_zone, zone, results[index], size),
 			                            zone);
 			shim_trace_alloc_event_at("malloc_zone_batch_malloc", results[index],
@@ -7959,7 +6988,7 @@ void malloc_zone_batch_free(void* zone, void** pointers,
 		}
 		machgate_zone->batch_free(zone, pointers, count);
 		for (unsigned index = 0; index < count; index++)
-			forget_allocation(pointers[index]);
+			machgate_forget_allocation(pointers[index]);
 		return;
 	}
 
@@ -7978,7 +7007,7 @@ void* malloc_zone_memalign(void* zone, size_t alignment, size_t size)
 	if (machgate_zone && machgate_zone->memalign) {
 		result = machgate_zone->memalign(zone, alignment, size);
 		if (result) {
-			record_allocation_with_zone(result,
+			machgate_record_allocation_with_zone(result,
 			                            zone_recorded_size(machgate_zone, zone, result, size),
 			                            zone);
 			shim_trace_alloc_event_at("malloc_zone_memalign", result, size, alignment,
@@ -8000,7 +7029,7 @@ void malloc_zone_free_definite_size(void* zone, void* ptr, size_t size)
 		shim_trace_alloc_event_at("malloc_zone_free_definite_size", ptr, size, size,
 		                          caller, 1);
 		machgate_zone->free_definite_size(effective_zone, ptr, size);
-		forget_allocation(ptr);
+		machgate_forget_allocation(ptr);
 		return;
 	}
 	malloc_zone_free(effective_zone, ptr);
@@ -8035,7 +7064,7 @@ void* malloc_zone_malloc_with_options(void* zone, size_t alignment,
 	if (machgate_zone && machgate_zone->malloc_with_options) {
 		void* result = machgate_zone->malloc_with_options(zone, alignment, size, options);
 		if (result) {
-			record_allocation_with_zone(result,
+			machgate_record_allocation_with_zone(result,
 			                            zone_recorded_size(machgate_zone, zone, result, size),
 			                            zone);
 			shim_trace_alloc_event_at("malloc_zone_malloc_with_options", result,
@@ -8147,7 +7176,7 @@ void* malloc_zone_from_ptr(const void* ptr)
 
 	if (!ptr)
 		return NULL;
-	if (lookup_allocation(ptr, &size, &zone, NULL) && size != 0)
+	if (machgate_lookup_allocation(ptr, &size, &zone, NULL) && size != 0)
 		return zone ? zone : &default_malloc_zone;
 	if (malloc_usable_size((void*)ptr) > 0)
 		return &default_malloc_zone;
@@ -8172,7 +7201,7 @@ size_t malloc_size(const void* ptr)
 
 	if (!ptr)
 		return 0;
-	if (lookup_allocation_size(ptr, &size) && size != 0)
+	if (machgate_lookup_allocation_size(ptr, &size) && size != 0)
 		return size;
 	result = malloc_usable_size((void*)ptr);
 	if (result == 0 && shim_alloc_trace_enabled())

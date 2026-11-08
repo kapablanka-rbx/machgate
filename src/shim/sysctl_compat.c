@@ -1,4 +1,5 @@
 #include "host_facts.h"
+#include "guest_hardware_compat.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -23,6 +24,7 @@ enum darwin_sysctl_kern_proc_selector {
 enum {
 	DARWIN_KINFO_PROC_SIZE = 0x288,
 	DARWIN_PROCESS_TRACED = 0x00000800,
+	DARWIN_CPU_TYPE_ARM64 = 0x0100000c,
 };
 
 struct darwin_extern_proc_header {
@@ -52,6 +54,7 @@ enum darwin_sysctl_value_kind {
 	DARWIN_SYSCTL_ACTIVE_CPU_COUNT,
 	DARWIN_SYSCTL_ARGUMENT_LIMIT,
 	DARWIN_SYSCTL_BYTE_ORDER,
+	DARWIN_SYSCTL_CPU_TYPE,
 	DARWIN_SYSCTL_HOSTNAME,
 	DARWIN_SYSCTL_MACHINE,
 	DARWIN_SYSCTL_MEMORY_SIZE,
@@ -85,6 +88,7 @@ static const struct darwin_sysctl_entry darwin_sysctl_entries[] = {
 	{ "hw.machine", 6, 1, DARWIN_SYSCTL_MACHINE, 1 },
 	{ "hw.model", 6, 2, DARWIN_SYSCTL_MODEL, 1 },
 	{ "hw.ncpu", 6, 3, DARWIN_SYSCTL_ACTIVE_CPU_COUNT, 1 },
+	{ "hw.cputype", 0, 0, DARWIN_SYSCTL_CPU_TYPE, 0 },
 	{ "hw.byteorder", 6, 4, DARWIN_SYSCTL_BYTE_ORDER, 1 },
 	{ "hw.memsize", 6, 24, DARWIN_SYSCTL_MEMORY_SIZE, 1 },
 	{ "hw.pagesize", 6, 7, DARWIN_SYSCTL_PAGE_SIZE, 1 },
@@ -244,11 +248,13 @@ static int read_entry(const struct darwin_sysctl_entry* entry, void* output,
 {
 	switch (entry->value_kind) {
 	case DARWIN_SYSCTL_ACTIVE_CPU_COUNT:
-		return copy_integer(machgate_host_cpu_count(), output, output_size);
+		return copy_integer(machgate_guest_cpu_count(), output, output_size);
 	case DARWIN_SYSCTL_ARGUMENT_LIMIT:
 		return copy_integer(262144, output, output_size);
 	case DARWIN_SYSCTL_BYTE_ORDER:
 		return copy_integer(1234, output, output_size);
+	case DARWIN_SYSCTL_CPU_TYPE:
+		return copy_integer(DARWIN_CPU_TYPE_ARM64, output, output_size);
 	case DARWIN_SYSCTL_HOSTNAME:
 		return copy_hostname(output, output_size);
 	case DARWIN_SYSCTL_MACHINE:
@@ -324,8 +330,14 @@ int sysctl(const int* name, unsigned int name_length, void* output,
 int sysctlbyname(const char* name, void* output, size_t* output_size,
 	         const void* replacement, size_t replacement_size)
 {
-	(void)replacement;
-	(void)replacement_size;
+	int feature;
+	if (machgate_guest_arm_feature(name, &feature)) {
+		if (replacement || replacement_size) {
+			errno = EPERM;
+			return -1;
+		}
+		return copy_integer(feature, output, output_size);
+	}
 
 	const struct darwin_sysctl_entry* entry = find_named_entry(name);
 	if (!entry) {

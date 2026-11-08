@@ -1,4 +1,6 @@
+#include "ports/socket_state.h"
 #include "syscall_range_200_399.h"
+#include "../shim/kqueue_compat.h"
 #include "execve_reexec.h"
 #include "guest_process_runtime.h"
 
@@ -199,6 +201,7 @@
 #define DARWIN_EFAULT 14
 #define DARWIN_EINVAL 22
 #define DARWIN_ENOTSUP 45
+#define DARWIN_ETIMEDOUT 60
 #define SYSCALL_GATE_CARRY 0x20000000u
 
 #define DARWIN_SIG_BLOCK   1
@@ -4138,6 +4141,46 @@ static void handle_psynch_wake(struct machgate_syscall_frame* state, int wake_al
 #endif
 }
 
+static void handle_psynch_cvwait(struct machgate_syscall_frame* state)
+{
+	uint32_t* address = (uint32_t*)state->x[0];
+	uint32_t expected = (uint32_t)state->x[1];
+	struct timespec timeout;
+
+	if (!address) {
+		set_failure(state, DARWIN_EFAULT);
+		return;
+	}
+	if (!state->x[5] && !state->x[6]) {
+		set_failure(state, DARWIN_ETIMEDOUT);
+		return;
+	}
+	if (state->x[5] > INT64_MAX || state->x[6] >= 1000000000) {
+		set_failure(state, DARWIN_EINVAL);
+		return;
+	}
+	timeout.tv_sec = (time_t)state->x[5];
+	timeout.tv_nsec = (long)state->x[6];
+
+#ifdef SYS_futex
+	errno = 0;
+	long result = syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected,
+	                      &timeout, NULL, 0);
+	if (result < 0) {
+		int error = errno ? errno : EIO;
+		if (error == ETIMEDOUT) {
+			set_failure(state, DARWIN_ETIMEDOUT);
+		} else {
+			set_failure(state, errno_to_darwin(error));
+		}
+		return;
+	}
+	set_success(state, 0);
+#else
+	set_enosys(state);
+#endif
+}
+
 static void handle_psynch_yieldwrlock(struct machgate_syscall_frame* state)
 {
 #ifdef SYS_sched_yield
@@ -4554,60 +4597,31 @@ static void handle_mac_execve(struct machgate_syscall_frame* state)
 	set_failure(state, result);
 }
 
-static int is_eventfd_backed_queue(int fd)
+static void handle_raw_kevent(struct machgate_syscall_frame* state,
+                              const struct timespec* timeout)
 {
-	char path[64];
-	char target[64];
-	int printed = snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-
-	if (fd < 0) {
-		errno = EBADF;
-		return 0;
-	}
-
-	if (printed < 0 || (size_t)printed >= sizeof(path)) {
-		errno = EBADF;
-		return 0;
-	}
-
-	errno = 0;
-	long result = syscall(SYS_readlinkat, AT_FDCWD, path, target,
-	                      sizeof(target) - 1);
+	int result = machgate_kqueue_event(
+		(int)state->x[0],
+		(const struct machgate_darwin_kevent*)state->x[1],
+		(int)state->x[2], (struct machgate_darwin_kevent*)state->x[3],
+		(int)state->x[4], timeout);
 	if (result < 0)
-		return 0;
-
-	target[result] = '\0';
-	if (strcmp(target, "anon_inode:[eventfd]") != 0) {
-		errno = EBADF;
-		return 0;
-	}
-
-	return 1;
+		set_failure(state, errno_to_darwin(errno ? errno : EIO));
+	else
+		set_success(state, (uint64_t)result);
 }
 
-static void handle_kevent_noop_wait(struct machgate_syscall_frame* state,
-                                    int fd,
-                                    uint64_t changelist,
-                                    int nchanges,
-                                    uint64_t eventlist,
-                                    int nevents)
+static void handle_raw_kevent64(struct machgate_syscall_frame* state)
 {
-	if (nchanges < 0 || nevents < 0) {
-		set_failure(state, DARWIN_EINVAL);
-		return;
-	}
-
-	if (!is_eventfd_backed_queue(fd)) {
-		set_failure(state, errno_to_darwin(errno ? errno : EBADF));
-		return;
-	}
-
-	if (nchanges != 0 || changelist || nevents != 0 || eventlist) {
-		set_enosys(state);
-		return;
-	}
-
-	set_success(state, 0);
+	int result = machgate_kqueue_event64(
+		(int)state->x[0],
+		(const struct machgate_darwin_kevent64*)state->x[1],
+		(int)state->x[2], (struct machgate_darwin_kevent64*)state->x[3],
+		(int)state->x[4], (const struct timespec*)state->x[6]);
+	if (result < 0)
+		set_failure(state, errno_to_darwin(errno ? errno : EIO));
+	else
+		set_success(state, (uint64_t)result);
 }
 
 static void handle_shared_region_check(struct machgate_syscall_frame* state)
@@ -5113,10 +5127,12 @@ int syscall_range_200_399_dispatch(struct machgate_syscall_frame* state)
 		return 1;
 	case DARWIN_SYS_psynch_rw_longrdlock:
 	case DARWIN_SYS_psynch_mutexwait:
-	case DARWIN_SYS_psynch_cvwait:
 	case DARWIN_SYS_psynch_rw_rdlock:
 	case DARWIN_SYS_psynch_rw_wrlock:
 		handle_psynch_wait_probe(state);
+		return 1;
+	case DARWIN_SYS_psynch_cvwait:
+		handle_psynch_cvwait(state);
 		return 1;
 	case DARWIN_SYS_psynch_rw_yieldwrlock:
 		handle_psynch_yieldwrlock(state);
@@ -5328,14 +5344,12 @@ int syscall_range_200_399_dispatch(struct machgate_syscall_frame* state)
 		return 1;
 	case DARWIN_SYS_kqueue: {
 		errno = 0;
-		long result = syscall(SYS_eventfd2, 0, EFD_CLOEXEC);
+		long result = machgate_kqueue_open();
 		finish_syscall_result(state, result);
 		return 1;
 	}
 	case DARWIN_SYS_kevent:
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_raw_kevent(state, (const struct timespec*)state->x[5]);
 		return 1;
 	case DARWIN_SYS_lchown: {
 		errno = 0;
@@ -5360,9 +5374,7 @@ int syscall_range_200_399_dispatch(struct machgate_syscall_frame* state)
 			set_enosys(state);
 			return 1;
 		}
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_raw_kevent64(state);
 		return 1;
 	case DARWIN_SYS_thread_selfid: {
 		errno = 0;
@@ -5378,18 +5390,14 @@ int syscall_range_200_399_dispatch(struct machgate_syscall_frame* state)
 			set_enosys(state);
 			return 1;
 		}
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_raw_kevent(state, NULL);
 		return 1;
 	case DARWIN_SYS_kevent_id:
 		if (state->x[5] || state->x[6] || state->x[7]) {
 			set_enosys(state);
 			return 1;
 		}
-		handle_kevent_noop_wait(state, (int)state->x[0], state->x[1],
-		                        (int)state->x[2], state->x[3],
-		                        (int)state->x[4]);
+		handle_raw_kevent(state, NULL);
 		return 1;
 	case DARWIN_SYS___mac_execve:
 		handle_mac_execve(state);
@@ -5470,6 +5478,11 @@ int syscall_range_200_399_dispatch(struct machgate_syscall_frame* state)
 	case DARWIN_SYS_close_nocancel: {
 		errno = 0;
 		long result = syscall(SYS_close, (int)state->x[0]);
+		if (result == 0)
+			{
+				machgate_socket_state_close((int)state->x[0]);
+				machgate_kqueue_fd_did_close((int)state->x[0]);
+			}
 		finish_syscall_result(state, result);
 		return 1;
 	}

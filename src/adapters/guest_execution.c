@@ -20,8 +20,6 @@
 
 #define MACHGATE_GUEST_STACK_SIZE (8u * 1024u * 1024u)
 
-typedef int (*configure_tlv_image_function)(void*, size_t, size_t);
-
 _Noreturn void machgate_enter_guest(uintptr_t entry_point,
 				    uintptr_t stack_pointer,
 				    int argument_count,
@@ -32,31 +30,22 @@ void machgate_call_guest_initializer(void* function, int argument_count,
 				     char** arguments, char** environment,
 				     char** apple, void* stack_pointer);
 
-static int apply_image_slide(uint64_t address, intptr_t slide,
-			     uintptr_t* result)
-{
-	if (slide >= 0) {
-		uintptr_t positive_slide = (uintptr_t)slide;
-		if (address > UINTPTR_MAX - positive_slide)
-			return -1;
-		*result = (uintptr_t)address + positive_slide;
-		return 0;
-	}
-
-	uintptr_t negative_slide = (uintptr_t)(-(slide + 1)) + 1;
-	if (address < negative_slide)
-		return -1;
-	*result = (uintptr_t)address - negative_slide;
-	return 0;
-}
-
 static void call_guest_initializer(void* function, int argument_count,
 				   char** arguments, char** environment,
-				   char** apple, uintptr_t stack_pointer)
+				   char** apple, uintptr_t stack_pointer,
+				   const char* kind, size_t index, size_t total)
 {
+	void (*note_context)(const char*, int, int, uintptr_t) =
+		dlsym(RTLD_DEFAULT, "machgate_shim_note_init_context");
+	void (*clear_context)(void) =
+		dlsym(RTLD_DEFAULT, "machgate_shim_clear_init_context");
+	if (note_context)
+		note_context(kind, (int)index, (int)total, (uintptr_t)function);
 	machgate_call_guest_initializer(function, argument_count, arguments,
 					 environment, apple,
 					 (void*)stack_pointer);
+	if (clear_context)
+		clear_context();
 }
 
 static int run_pointer_initializers(struct machgate_guest_image* image,
@@ -82,15 +71,15 @@ static int run_pointer_initializers(struct machgate_guest_image* image,
 	     function_index++) {
 		if (!functions[function_index])
 			continue;
-		uintptr_t function =
-			functions[function_index] + machgate_guest_image_slide(image);
+		uintptr_t function = functions[function_index];
 		if (!machgate_guest_image_contains(image, function, 1)) {
 			snprintf(error, error_size,
 				 "Mach-O initializer address is outside the image");
 			return -1;
 		}
 		call_guest_initializer((void*)function, argument_count, arguments,
-				       environment, apple, stack_pointer);
+				       environment, apple, stack_pointer,
+				       "pointer", function_index, count);
 	}
 	return 0;
 }
@@ -124,7 +113,8 @@ static int run_offset_initializers(struct machgate_guest_image* image,
 			return -1;
 		}
 		call_guest_initializer((void*)function, argument_count, arguments,
-				       environment, apple, stack_pointer);
+				       environment, apple, stack_pointer,
+				       "offset", offset_index, count);
 	}
 	return 0;
 }
@@ -169,134 +159,6 @@ int machgate_run_guest_initializers(
 	return 0;
 }
 
-int machgate_prepare_guest_runtime_image(struct machgate_guest_image* image,
-					 char* error, size_t error_size)
-{
-	const struct section_64* initial_data = NULL;
-	const struct section_64* zero_fill = NULL;
-	struct mach_header_64* header =
-		machgate_guest_image_validated_header(image);
-	uint8_t* cursor = (uint8_t*)(header + 1);
-
-	for (uint32_t command_index = 0;
-	     command_index < header->ncmds;
-	     command_index++) {
-		struct load_command* command = (void*)cursor;
-		if (command->cmd == LC_SEGMENT_64) {
-			struct segment_command_64* segment = (void*)command;
-			struct section_64* sections = (void*)(segment + 1);
-			for (uint32_t section_index = 0;
-			     section_index < segment->nsects;
-			     section_index++) {
-				struct section_64* section = &sections[section_index];
-				uint32_t section_type = section->flags & SECTION_TYPE;
-				if (section_type == S_THREAD_LOCAL_REGULAR) {
-					if (initial_data) {
-						snprintf(error, error_size,
-							 "Mach-O has multiple initialized TLV sections");
-						return -1;
-					}
-					initial_data = section;
-				}
-				if (section_type == S_THREAD_LOCAL_ZEROFILL) {
-					if (zero_fill) {
-						snprintf(error, error_size,
-							 "Mach-O has multiple zero-fill TLV sections");
-						return -1;
-					}
-					zero_fill = section;
-				}
-			}
-		}
-		cursor += command->cmdsize;
-	}
-
-	if (!initial_data && !zero_fill)
-		return 0;
-
-	uintptr_t image_base;
-	size_t image_size;
-	size_t bss_size = 0;
-	if (initial_data) {
-		if (apply_image_slide(initial_data->addr,
-				      machgate_guest_image_slide(image),
-				      &image_base) != 0 ||
-		    initial_data->size > SIZE_MAX) {
-			snprintf(error, error_size,
-				 "Mach-O initialized TLV section overflows host address limits");
-			return -1;
-		}
-		image_size = initial_data->size;
-		if (!machgate_guest_image_contains(image, image_base, image_size)) {
-			snprintf(error, error_size,
-				 "Mach-O initialized TLV section is outside the image");
-			return -1;
-		}
-		if (zero_fill) {
-			uintptr_t zero_fill_address;
-			if (apply_image_slide(zero_fill->addr,
-					      machgate_guest_image_slide(image),
-					      &zero_fill_address) != 0 ||
-			    zero_fill->size > SIZE_MAX) {
-				snprintf(error, error_size,
-					 "Mach-O zero-fill TLV section overflows host address limits");
-				return -1;
-			}
-			if (image_size > UINTPTR_MAX - image_base) {
-				snprintf(error, error_size,
-					 "Mach-O initialized TLV section overflows its address range");
-				return -1;
-			}
-			uintptr_t initialized_end = image_base + image_size;
-			if (zero_fill_address < initialized_end ||
-			    !machgate_guest_image_contains(
-				    image, zero_fill_address, zero_fill->size)) {
-				snprintf(error, error_size,
-					 "Mach-O TLV sections have an invalid layout");
-				return -1;
-			}
-			size_t alignment_padding = zero_fill_address - initialized_end;
-			if (zero_fill->size > SIZE_MAX - alignment_padding) {
-				snprintf(error, error_size,
-					 "Mach-O TLV image size overflows host size limits");
-				return -1;
-			}
-			bss_size = alignment_padding + zero_fill->size;
-		}
-	} else {
-		if (apply_image_slide(zero_fill->addr,
-				      machgate_guest_image_slide(image),
-				      &image_base) != 0 ||
-		    zero_fill->size > SIZE_MAX) {
-			snprintf(error, error_size,
-				 "Mach-O zero-fill TLV section overflows host address limits");
-			return -1;
-		}
-		image_size = 0;
-		bss_size = zero_fill->size;
-		if (!machgate_guest_image_contains(image, image_base, bss_size)) {
-			snprintf(error, error_size,
-				 "Mach-O zero-fill TLV section is outside the image");
-			return -1;
-		}
-	}
-
-	configure_tlv_image_function configure =
-		(configure_tlv_image_function)dlsym(
-			RTLD_DEFAULT, "machgate_configure_tlv_image");
-	if (!configure) {
-		snprintf(error, error_size,
-			 "native provider does not support the Mach-O TLV image");
-		return -1;
-	}
-	if (configure((void*)image_base, image_size, bss_size) != 0) {
-		snprintf(error, error_size,
-			 "native provider rejected the Mach-O TLV image");
-		return -1;
-	}
-	return 0;
-}
-
 int machgate_prepare_guest_image(const char* executable_path,
 				 struct machgate_guest_image** image,
 				 char* error, size_t error_size)
@@ -306,6 +168,10 @@ int machgate_prepare_guest_image(const char* executable_path,
 
 void machgate_release_guest_image(struct machgate_guest_image* image)
 {
+	void (*unregister_tlv_image)(const void*) =
+		dlsym(RTLD_DEFAULT, "machgate_unregister_thread_local_image");
+	if (image && unregister_tlv_image)
+		unregister_tlv_image(image);
 	machgate_unload_guest_image(image);
 }
 

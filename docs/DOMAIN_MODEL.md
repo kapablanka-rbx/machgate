@@ -26,12 +26,14 @@ MachGate behavior tests.
 | Host | The ARM64 Linux process and kernel executing MachGate. | The guest ABI. |
 | Guest Executable | The input file supplied by the user. It may be thin or contain an ARM64 fat slice. | A recursively loaded application bundle. |
 | Slice | The selected ARM64 member of a fat Guest Executable, or the complete thin file. | An unchecked file range. |
-| Guest Image | An opaque validated executable mapped into host memory, with a published read-only identity and validated adapter view. | Raw file bytes, a public mutable record, or a partially validated mapping. |
+| Guest Image | An opaque validated executable or dependency dylib mapped into host memory, with a published read-only identity and validated adapter view. | Raw file bytes, a public mutable record, or a partially validated mapping. |
 | Guest Address Range | A half-open guest-visible interval `[start, end)`. | An unchecked pointer and length pair. |
 | Image Preparation | The use case that validates, maps, links, patches, and otherwise makes a Guest Image safe to enter. | Guest execution itself. |
-| Guest Process | One prepared Guest Image together with guest arguments, environment, executable path, stack, and lifecycle state. | A host child process. |
+| Preparation Artifact | Reusable, derived output of Image Preparation for a particular Guest Executable slice and MachGate runtime revision. Persistence is an adapter concern; every process rebuilds its live provider pointers and Branch Islands. | A live Guest Process snapshot or a rewritten original executable. |
+| Guest Process | A prepared main Guest Image and its dependency images together with guest arguments, environment, executable path, stack, and lifecycle state. | A host child process. |
 | Entry Point | The validated address selected from `LC_MAIN` or a supported `LC_UNIXTHREAD`. | An arbitrary symbol. |
 | Native Provider | An explicitly selected host shared object that satisfies a supported guest import surface. | General dyld discovery. |
+| Guest Dependency | A validated ARM64 Mach-O dylib loaded through a supported install-name path and retained for the Guest Process. | An ambient host ELF library. |
 | Native Dependency | A guest load-command declaration naming an imported library. | A host library selected by coincidence. |
 | Provider Decision | The explicit `Unmapped`, `Map`, `Skip`, `Stub`, or `Partial` policy for one Native Dependency. `Partial` selects a provider but fails closed for imports outside its declared surface. | A nullable handle that collapses distinct policies. |
 | Import Binding | A validated guest pointer slot plus provider ordinal, symbol, and addend. Applying it writes a resolved address or the typed fail-closed value selected by its Provider Decision. | Loading arbitrary Mach-O dependencies. |
@@ -63,6 +65,14 @@ Its aggregate is the **Guest Image**. A Guest Image exists only after the whole
 input image has been validated and mapped successfully. Failure leaves no
 partially mapped aggregate behind.
 
+Executable Imaging owns the lifetime of the optional preparation-artifact cache.
+The application signals completion of Image Preparation through its execution
+port. Persistence, file identities, cache directories, checksums, and atomic
+publication remain in adapters. A missing, invalid, or unwritable cache cannot
+change the guest contract. Native Linkage, unwind registration, and Darwin ABI
+Translation each interpret their own derived artifacts and restore process-local
+addresses before use.
+
 ### Native Linkage
 
 Native Linkage owns supported import parsing, dependency-to-provider policy,
@@ -70,7 +80,22 @@ symbol resolution, bind-location validation, and explicit function
 redirection. It consumes a Guest Image and may modify only validated locations
 inside it.
 
-Native Linkage is a supporting context. It is not a general dynamic loader.
+Native Linkage is a supporting context. It resolves selected native providers
+and supported adjacent Guest Dependencies. It does not implement the complete
+dyld search, re-export, or runtime `dlopen` contract.
+
+Guest Dependencies use the same validated imaging and preparation boundaries
+as the main executable. Their mapping, path lookup, dependency graph, and
+process lifetime belong to adapters. Application code coordinates preparation
+and dependency-before-dependent initialization through ports. Dependency
+images require `MH_DYLIB`; the main image still requires `MH_EXECUTE`.
+
+After import binding it can publish validated mapped sections through the
+Native Provider image port. A selected provider interprets its own metadata;
+for example, the separate Foundation provider registers guest classes. This
+notification runs on every launch, including preparation-cache hits. Provider
+composition uses an explicitly owned import resolver to expose declared
+dependencies without weakening resolver-ownership checks.
 
 Flat and weak lookup first honor a Guest Definition, then search explicitly
 selected dependency providers in load-command order, and only then consult the
@@ -129,6 +154,13 @@ termination; `_exit` remains unflushed. This is not a claim of complete Darwin
 It is an anti-corruption layer, not part of the core domain and not a promise of
 GUI, framework, or general macOS compatibility.
 
+Optional Foundation, ICU and composite Apple providers live under `providers/`.
+They depend on narrow runtime ports and the native shim, while the domain and
+application have no dependency on them. The shared provider-lifetime port owns
+deferred releases; providers keep ownership of object representations. See the
+[archive export inventory](ARCHIVE_SHIM_PARITY.md) for tested contracts and
+explicitly unavailable services.
+
 ### Guest VM
 
 Guest VM owns mediation of Guest Mapping operations shared by direct guest VM
@@ -184,7 +216,8 @@ translation and the compatible imported `execve` surface.
 
 ## Contract invariants
 
-1. Only a validated ARM64 `MH_EXECUTE` slice can become a Guest Image.
+1. A main Guest Image requires a validated ARM64 `MH_EXECUTE` slice; a
+   Guest Dependency requires a validated ARM64 `MH_DYLIB` slice.
 2. Every file range, command range, mapped interval, and address calculation is
    validated before use.
 3. Image Preparation completes before any guest initializer or entry point is
@@ -196,7 +229,7 @@ translation and the compatible imported `execve` surface.
 7. Every Guest Syscall either produces a translated Syscall Outcome or Darwin
    `ENOSYS`; a raw host ABI error never crosses the boundary.
 8. Native Linkage writes only to validated bind locations and uses only an
-   explicitly selected Native Provider.
+   explicitly selected Native Provider or validated Guest Dependency.
 9. Unsupported GUI, framework, Mach IPC, and child-process behavior must not be
    disguised as successful domain behavior.
 10. Successful Process Replacement does not return; failure returns a Darwin
@@ -216,6 +249,9 @@ semantics.
 | Guest Image language | `src/domain/guest_image.h` publishes an opaque `machgate_guest_image`. Executable Imaging alone constructs and destroys it; adapters consume explicit scalar queries and a validated integration view. | Replace uses of the validated integration view with narrower context queries when a context needs less than the complete validated header. |
 | Guest Process orchestration | `src/application/guest_session.c` owns Prepare and Run Guest orchestration through `ports/guest_execution.h`; `machgate.c` is the CLI adapter. Raw initializer and TLV inspection are outside the application layer. `machgate_guest_process` enforces lifecycle stages and publishes one versioned runtime-state contract to the Compatibility Runtime. | Keep new orchestration dependencies behind ports and add lifecycle stages only when behavior requires them. |
 | Compatibility Runtime capabilities | Assertion, basic runtime, errno, guest process, host facts, locale/string, time, unwind, sysctl, filesystem metadata, file ABI, file operations, dispatch, process-local guest synchronization, fail-closed notification, CoreFoundation additions, Security additions, pthread synchronization, resource-limit imports, provider guest import resolver ownership, thread-local/TLV behavior, variadic ABI translation, task-policy rejection, and process termination are focused compiled modules. | Continue shrinking `libsystem_shim.c` while preserving the tested in-scope export surface. |
+| Thread-local image storage | `adapters/guest_thread_local.c` validates Mach-O templates and descriptors. The native thread-local image port registers one storage key per image; `shim/thread_local_compat.c` owns host keys, allocation, alignment, and teardown. | Application and domain code contain no Mach-O TLS layout or pthread key mechanics. Dynamic unload with live guest threads is not supported. |
+| Allocation ownership | `src/shim/allocation_ledger.c` owns process-local pointer records, sizes, zones, and guest C++ ownership flags. Records are partitioned into 32 independently locked tables; Linux futex and mapping details stay inside the Compatibility Runtime. | Allocation/free routing remains separate from the ledger. The domain and application layers do not depend on allocator table structure or locking. |
+| Dynamic unwind registration | `domain/dwarf_unwind.c` decodes a single DWARF frame's code interval without OS operations. `ports/native_unwind.h` exposes guest registration and removal; `adapters/dynamic_unwind.c` owns registration lifetime and Linux unwind-index translation. | Darwin registers one FDE. Host GCC section registration remains separate; guest metadata is never rewritten or scanned for a terminating record. |
 | Target-excluded runtime surface | Fake-success Mach controls, FSEvents, CFRunLoop execution, speculative ICU, and other unused framework shims have been removed from the implementation and export list. The fail-closed `_dispatch_source_type_mach_recv` availability marker remains exported but always refuses source creation, like the retained default-mode string. Process-local guest semaphores do not provide ports or Mach IPC. | Keep unsupported AppKit, IOHID, GUI, and Mach IPC imports behind fail-closed Provider Decisions instead of adding success implementations. |
 | Pthread synchronization | `pthread_sync_compat.c` owns mutex, condition-variable, and read-write-lock adapters, including guest static-initializer signatures and Darwin errno results. | Pthread identity, keys, once, attributes, lifecycle, and extensions remain in `libsystem_shim.c` and require later capability extraction. |
 | Guest VM | Syscall and interposed mapping paths share implementation machinery. The bounded sub-page mapping registry fails explicitly with `ENOMEM` when full. | Keep the model scoped to mediated operations and explicitly registered semantic differences; do not imply a complete shadow address-space ledger. |

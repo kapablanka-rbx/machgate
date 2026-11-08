@@ -883,7 +883,9 @@ _main:
     mov x2, #0
     mov x16, #516
     svc #0x80
-    b.cs fail
+    b.cc fail
+    cmp x0, #2
+    b.ne fail
 
     mov x0, #1
     adrp x1, ulock_word@PAGE
@@ -892,8 +894,8 @@ _main:
     mov x3, #1
     mov x16, #515
     svc #0x80
-    b.cc fail
-    cmp x0, #35
+    b.cs fail
+    cmp x0, #0
     b.ne fail
 
     mov x0, #1
@@ -904,8 +906,8 @@ _main:
     mov x4, #0
     mov x16, #544
     svc #0x80
-    b.cc fail
-    cmp x0, #35
+    b.cs fail
+    cmp x0, #0
     b.ne fail
 
     mov x0, #0

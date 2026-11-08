@@ -1,6 +1,10 @@
 #include "syscall_range_400_plus.h"
 
 #include "syscall_range_200_399.h"
+#include "darwin_socket.h"
+#include "darwin_ulock.h"
+#include "shim/file_abi.h"
+#include "../shim/kqueue_compat.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -229,16 +233,7 @@ struct darwin_rusage_range_400_plus {
 #define DARWIN_SIG_UNBLOCK 2
 #define DARWIN_SIG_SETMASK 3
 
-#define DARWIN_UL_COMPARE_AND_WAIT          1
-#define DARWIN_UL_UNFAIR_LOCK               2
-#define DARWIN_UL_COMPARE_AND_WAIT_SHARED   3
-#define DARWIN_UL_UNFAIR_LOCK64_SHARED      4
-#define DARWIN_UL_COMPARE_AND_WAIT64        5
-#define DARWIN_UL_COMPARE_AND_WAIT64_SHARED 6
-#define DARWIN_UL_OPCODE_MASK               0x000000ffu
-#define DARWIN_ULF_WAKE_ALL                 0x00000100u
-#define DARWIN_ULF_NO_ERRNO                 0x01000000u
-#define DARWIN_ULF_DEADLINE                 0x02000000u
+
 
 #define DARWIN_MEMORYSTATUS_CMD_GET_PRESSURE_STATUS     4
 #define DARWIN_MEMORYSTATUS_CMD_GET_PROCESS_IS_MANAGED  17
@@ -414,6 +409,7 @@ struct darwin_rusage_range_400_plus {
 #define DARWIN_F_GETLK     7
 #define DARWIN_F_SETLK     8
 #define DARWIN_F_SETLKW    9
+#define DARWIN_F_PREALLOCATE 42
 #define DARWIN_F_FULLFSYNC 51
 #define DARWIN_F_DUPFD_CLOEXEC 67
 
@@ -590,26 +586,8 @@ struct darwin_attr_context_range_400_plus {
 	size_t variable_offset;
 };
 
-struct darwin_msghdr_range_400_plus {
-	void* msg_name;
-	uint32_t msg_namelen;
-	struct iovec* msg_iov;
-	int32_t msg_iovlen;
-	void* msg_control;
-	uint32_t msg_controllen;
-	int32_t msg_flags;
-};
-
-struct darwin_msghdr_x_range_400_plus {
-	void* msg_name;
-	uint32_t msg_namelen;
-	struct iovec* msg_iov;
-	int32_t msg_iovlen;
-	void* msg_control;
-	uint32_t msg_controllen;
-	int32_t msg_flags;
-	uint64_t msg_datalen;
-};
+#define darwin_msghdr_range_400_plus darwin_msghdr
+#define darwin_msghdr_x_range_400_plus darwin_msghdr_x
 
 struct darwin_sa_endpoints_range_400_plus {
 	uint32_t sae_srcif;
@@ -856,7 +834,7 @@ static void set_ulock_error(struct machgate_syscall_frame* state,
                             uint32_t operation, int linux_errno)
 {
 	int darwin_errno = linux_errno_to_darwin(linux_errno ? linux_errno : EIO);
-	if (operation & DARWIN_ULF_NO_ERRNO)
+	if (operation & MACHGATE_ULF_NO_ERRNO)
 		set_success(state, (uint64_t)(-(int64_t)darwin_errno));
 	else
 		set_failure(state, darwin_errno);
@@ -1642,15 +1620,9 @@ static int prepare_linux_msghdr(
 		return 0;
 	}
 
-	if (darwin_msg->msg_control || darwin_msg->msg_controllen) {
-		errno = ENOSYS;
-		return 0;
-	}
-
 	memset(linux_msg, 0, sizeof(*linux_msg));
 	linux_msg->msg_iov = darwin_msg->msg_iov;
 	linux_msg->msg_iovlen = (size_t)darwin_msg->msg_iovlen;
-	linux_msg->msg_flags = darwin_msg->msg_flags;
 
 	if (darwin_msg->msg_name) {
 		if (!translate_sockaddr(darwin_msg->msg_name, darwin_msg->msg_namelen,
@@ -1678,48 +1650,31 @@ static void dispatch_sendmsg(struct machgate_syscall_frame* state)
 	}
 
 	errno = 0;
-	finish_syscall_result(state, syscall(SYS_sendmsg, (int)state->x[0],
-	                                     &linux_msg, (int)state->x[2]));
+	finish_syscall_result(state, machgate_darwin_sendmsg(
+		(int)state->x[0], darwin_msg, (int)state->x[2],
+		linux_msg.msg_name ? (const struct sockaddr*)&linux_name : NULL,
+		linux_name_len));
 }
 
 static void dispatch_recvmsg(struct machgate_syscall_frame* state)
 {
 	struct darwin_msghdr_range_400_plus* darwin_msg =
 		(struct darwin_msghdr_range_400_plus*)state->x[1];
-	struct msghdr linux_msg;
 	struct sockaddr_storage linux_name;
 	socklen_t linux_name_len = sizeof(linux_name);
 
-	if (!darwin_msg) {
-		set_failure(state, DARWIN_EFAULT);
-		return;
-	}
-
-	if (darwin_msg->msg_control || darwin_msg->msg_controllen) {
-		set_failure(state, DARWIN_ENOSYS);
-		return;
-	}
-
-	memset(&linux_msg, 0, sizeof(linux_msg));
-	linux_msg.msg_iov = darwin_msg->msg_iov;
-	linux_msg.msg_iovlen = (size_t)darwin_msg->msg_iovlen;
-	if (darwin_msg->msg_name) {
-		linux_msg.msg_name = &linux_name;
-		linux_msg.msg_namelen = linux_name_len;
-	}
-
 	errno = 0;
-	long result = syscall(SYS_recvmsg, (int)state->x[0], &linux_msg,
-	                      (int)state->x[2]);
+	long result = machgate_darwin_recvmsg(
+		(int)state->x[0], darwin_msg, (int)state->x[2],
+		(struct sockaddr*)&linux_name, &linux_name_len);
 	if (result < 0) {
 		finish_syscall_result(state, result);
 		return;
 	}
 
-	darwin_msg->msg_flags = linux_msg.msg_flags;
 	if (darwin_msg->msg_name) {
 		socklen_t darwin_len = darwin_msg->msg_namelen;
-		if (!linux_sockaddr_to_darwin(&linux_name, linux_msg.msg_namelen,
+		if (!linux_sockaddr_to_darwin(&linux_name, linux_name_len,
 		                              darwin_msg->msg_name, &darwin_len)) {
 			set_errno_failure(state);
 			return;
@@ -1741,18 +1696,13 @@ static int prepare_linux_msghdr_x(
 		return 0;
 	}
 
-	if (darwin_msg->msg_control || darwin_msg->msg_controllen) {
-		errno = ENOSYS;
-		return 0;
-	}
-
 	memset(linux_msg, 0, sizeof(*linux_msg));
-	linux_msg->msg_iov = darwin_msg->msg_iov;
-	linux_msg->msg_iovlen = (size_t)darwin_msg->msg_iovlen;
-	linux_msg->msg_flags = darwin_msg->msg_flags;
+	linux_msg->msg_iov = darwin_msg->header.msg_iov;
+	linux_msg->msg_iovlen = (size_t)darwin_msg->header.msg_iovlen;
 
-	if (darwin_msg->msg_name) {
-		if (!translate_sockaddr(darwin_msg->msg_name, darwin_msg->msg_namelen,
+	if (darwin_msg->header.msg_name) {
+		if (!translate_sockaddr(darwin_msg->header.msg_name,
+		                        darwin_msg->header.msg_namelen,
 		                        linux_name, linux_name_len))
 			return 0;
 		linux_msg->msg_name = linux_name;
@@ -1789,8 +1739,10 @@ static void dispatch_sendmsg_x(struct machgate_syscall_frame* state)
 		}
 
 		errno = 0;
-		long result = syscall(SYS_sendmsg, (int)state->x[0], &linux_msg,
-		                      (int)state->x[3]);
+		long result = machgate_darwin_sendmsg(
+			(int)state->x[0], &darwin_msg[i].header, (int)state->x[3],
+			linux_msg.msg_name ? (const struct sockaddr*)&linux_name : NULL,
+			linux_name_len);
 		if (result < 0) {
 			if (sent)
 				set_success(state, sent);
@@ -1812,7 +1764,6 @@ static void dispatch_recvmsg_x(struct machgate_syscall_frame* state)
 	unsigned int received = 0;
 
 	for (unsigned int i = 0; i < count; i++) {
-		struct msghdr linux_msg;
 		struct sockaddr_storage linux_name;
 		socklen_t linux_name_len = sizeof(linux_name);
 		int flags = (int)state->x[3];
@@ -1825,28 +1776,13 @@ static void dispatch_recvmsg_x(struct machgate_syscall_frame* state)
 			return;
 		}
 
-		if (darwin_msg[i].msg_control || darwin_msg[i].msg_controllen) {
-			if (received)
-				set_success(state, received);
-			else
-				set_failure(state, DARWIN_ENOSYS);
-			return;
-		}
-
-		memset(&linux_msg, 0, sizeof(linux_msg));
-		linux_msg.msg_iov = darwin_msg[i].msg_iov;
-		linux_msg.msg_iovlen = (size_t)darwin_msg[i].msg_iovlen;
-		if (darwin_msg[i].msg_name) {
-			linux_msg.msg_name = &linux_name;
-			linux_msg.msg_namelen = linux_name_len;
-		}
-
 		if (received)
 			flags |= MSG_DONTWAIT;
 
 		errno = 0;
-		long result = syscall(SYS_recvmsg, (int)state->x[0], &linux_msg,
-		                      flags);
+		long result = machgate_darwin_recvmsg(
+			(int)state->x[0], &darwin_msg[i].header, flags,
+			(struct sockaddr*)&linux_name, &linux_name_len);
 		if (result < 0) {
 			if (received)
 				set_success(state, received);
@@ -1855,12 +1791,11 @@ static void dispatch_recvmsg_x(struct machgate_syscall_frame* state)
 			return;
 		}
 
-		darwin_msg[i].msg_flags = linux_msg.msg_flags;
 		darwin_msg[i].msg_datalen = (uint64_t)result;
-		if (darwin_msg[i].msg_name) {
-			socklen_t darwin_len = darwin_msg[i].msg_namelen;
-			if (!linux_sockaddr_to_darwin(&linux_name, linux_msg.msg_namelen,
-			                              darwin_msg[i].msg_name,
+		if (darwin_msg[i].header.msg_name) {
+			socklen_t darwin_len = darwin_msg[i].header.msg_namelen;
+			if (!linux_sockaddr_to_darwin(&linux_name, linux_name_len,
+			                              darwin_msg[i].header.msg_name,
 			                              &darwin_len)) {
 				if (received)
 					set_success(state, received);
@@ -1868,7 +1803,7 @@ static void dispatch_recvmsg_x(struct machgate_syscall_frame* state)
 					set_errno_failure(state);
 				return;
 			}
-			darwin_msg[i].msg_namelen = darwin_len;
+			darwin_msg[i].header.msg_namelen = darwin_len;
 		}
 		received++;
 	}
@@ -1884,7 +1819,8 @@ static void dispatch_recvfrom(struct machgate_syscall_frame* state)
 
 	errno = 0;
 	long result = syscall(SYS_recvfrom, (int)state->x[0], (void*)state->x[1],
-	                      (size_t)state->x[2], (int)state->x[3],
+	                      (size_t)state->x[2],
+	                      machgate_darwin_recv_flags_to_linux((int)state->x[3]),
 	                      state->x[4] ? (struct sockaddr*)&linux_name : NULL,
 	                      state->x[4] ? &linux_name_len : NULL);
 	if (result < 0) {
@@ -1923,7 +1859,7 @@ static void dispatch_sendto(struct machgate_syscall_frame* state)
 	errno = 0;
 	long result = syscall(SYS_sendto, (int)state->x[0],
 	                      (const void*)state->x[1], (size_t)state->x[2],
-	                      (int)state->x[3],
+	                      machgate_darwin_send_flags_to_linux((int)state->x[3]),
 	                      (const struct sockaddr*)linux_addr_ptr, linux_len);
 	finish_syscall_result(state, result);
 }
@@ -1967,19 +1903,9 @@ static void dispatch_accept(struct machgate_syscall_frame* state)
 
 static void dispatch_connect(struct machgate_syscall_frame* state)
 {
-	struct sockaddr_storage linux_name;
-	socklen_t linux_name_len;
-
-	if (!translate_sockaddr((const void*)state->x[1], state->x[2],
-	                        &linux_name, &linux_name_len)) {
-		set_errno_failure(state);
-		return;
-	}
-
 	errno = 0;
-	finish_syscall_result(state, syscall(SYS_connect, (int)state->x[0],
-	                                     (const struct sockaddr*)&linux_name,
-	                                     linux_name_len));
+	finish_syscall_result(state, machgate_darwin_connect((int)state->x[0],
+		(const void*)state->x[1], state->x[2]));
 }
 
 static void dispatch_connectx(struct machgate_syscall_frame* state)
@@ -2045,9 +1971,8 @@ static void dispatch_connectx(struct machgate_syscall_frame* state)
 	}
 
 	errno = 0;
-	long result = syscall(SYS_connect, (int)state->x[0],
-	                      (const struct sockaddr*)&linux_name,
-	                      linux_name_len);
+	long result = machgate_darwin_connect_translated((int)state->x[0],
+		&linux_name, linux_name_len);
 	if (result < 0) {
 		finish_syscall_result(state, result);
 		return;
@@ -3278,6 +3203,9 @@ static long raw_fcntl(int fd, int darwin_cmd, uint64_t arg)
 	case DARWIN_F_DUPFD_CLOEXEC:
 		linux_cmd = F_DUPFD_CLOEXEC;
 		break;
+	case DARWIN_F_PREALLOCATE:
+		return machgate_darwin_preallocate(
+			fd, (const struct machgate_darwin_fstore*)arg);
 	case DARWIN_F_FULLFSYNC:
 		return syscall(SYS_fsync, fd);
 	default:
@@ -3288,7 +3216,22 @@ static long raw_fcntl(int fd, int darwin_cmd, uint64_t arg)
 	if (darwin_cmd == F_SETFL)
 		arg = (uint64_t)translate_open_flags((int)arg);
 
+	struct flock linux_flock;
+	struct machgate_darwin_flock* darwin_flock = NULL;
+	if (darwin_cmd == DARWIN_F_GETLK || darwin_cmd == DARWIN_F_SETLK ||
+	    darwin_cmd == DARWIN_F_SETLKW) {
+		darwin_flock = (struct machgate_darwin_flock*)arg;
+		if (machgate_darwin_flock_to_linux(darwin_flock, &linux_flock) != 0)
+			return -1;
+		arg = (uint64_t)&linux_flock;
+	}
+
 	long result = syscall(SYS_fcntl, fd, linux_cmd, arg);
+	if (result >= 0 && (darwin_cmd == F_DUPFD ||
+	                    darwin_cmd == DARWIN_F_DUPFD_CLOEXEC))
+		machgate_kqueue_fd_did_duplicate(fd, (int)result);
+	if (result >= 0 && darwin_cmd == DARWIN_F_GETLK)
+		machgate_linux_flock_to_darwin(&linux_flock, darwin_flock);
 	if (darwin_cmd == F_GETFL && result >= 0)
 		result = translate_open_flags_to_darwin((int)result);
 	return result;
@@ -3802,178 +3745,36 @@ static void dispatch_memorystatus_control(struct machgate_syscall_frame* state)
 	}
 }
 
-static int ulock_is_32bit_operation(uint32_t operation)
+static void finish_ulock_result(struct machgate_syscall_frame* state,
+                                uint32_t operation, int result)
 {
-	switch (operation & DARWIN_UL_OPCODE_MASK) {
-	case DARWIN_UL_COMPARE_AND_WAIT:
-	case DARWIN_UL_UNFAIR_LOCK:
-	case DARWIN_UL_COMPARE_AND_WAIT_SHARED:
-		return 1;
-	default:
-		return 0;
-	}
-}
-
-static int ulock_is_64bit_operation(uint32_t operation)
-{
-	switch (operation & DARWIN_UL_OPCODE_MASK) {
-	case DARWIN_UL_UNFAIR_LOCK64_SHARED:
-	case DARWIN_UL_COMPARE_AND_WAIT64:
-	case DARWIN_UL_COMPARE_AND_WAIT64_SHARED:
-		return 1;
-	default:
-		return 0;
-	}
-}
-
-static void microseconds_to_timespec(uint32_t timeout_us,
-                                     struct timespec* timeout)
-{
-	timeout->tv_sec = timeout_us / 1000000u;
-	timeout->tv_nsec = (long)(timeout_us % 1000000u) * 1000L;
-}
-
-static void nanoseconds_to_timespec(uint64_t timeout_ns,
-                                    struct timespec* timeout)
-{
-	timeout->tv_sec = (time_t)(timeout_ns / 1000000000ull);
-	timeout->tv_nsec = (long)(timeout_ns % 1000000000ull);
+	if (result < 0)
+		set_ulock_error(state, operation, -result);
+	else
+		set_success(state, (uint64_t)result);
 }
 
 static void dispatch_ulock_wait(struct machgate_syscall_frame* state)
 {
 	uint32_t operation = (uint32_t)state->x[0];
-	void* address = (void*)state->x[1];
-	uint64_t value = state->x[2];
-	uint32_t timeout_us = (uint32_t)state->x[3];
-	struct timespec timeout;
-	struct timespec* timeout_ptr = NULL;
-
-	if (!address) {
-		set_ulock_error(state, operation, EFAULT);
-		return;
-	}
-
-	if (ulock_is_64bit_operation(operation)) {
-		if (*(uint64_t*)address != value) {
-			set_ulock_error(state, operation, EAGAIN);
-			return;
-		}
-		set_deferred_enosys(state);
-		return;
-	}
-
-	if (!ulock_is_32bit_operation(operation)) {
-		set_ulock_error(state, operation, EINVAL);
-		return;
-	}
-
-	if (timeout_us != 0) {
-		microseconds_to_timespec(timeout_us, &timeout);
-		timeout_ptr = &timeout;
-	}
-
-	errno = 0;
-#ifdef SYS_futex
-	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT_PRIVATE,
-	                      (uint32_t)value, timeout_ptr, NULL, 0);
-	if (result < 0) {
-		set_ulock_error(state, operation, errno);
-		return;
-	}
-	set_success(state, 0);
-#else
-	set_deferred_enosys(state);
-#endif
+	int result = machgate_darwin_ulock_wait(operation, (void*)state->x[1],
+		state->x[2], (uint64_t)(uint32_t)state->x[3] * 1000);
+	finish_ulock_result(state, operation, result);
 }
 
 static void dispatch_ulock_wait2(struct machgate_syscall_frame* state)
 {
 	uint32_t operation = (uint32_t)state->x[0];
-	void* address = (void*)state->x[1];
-	uint64_t value = state->x[2];
-	uint64_t timeout_ns = state->x[3];
-	uint64_t value2 = state->x[4];
-	struct timespec timeout;
-	struct timespec* timeout_ptr = NULL;
-
-	if (operation & DARWIN_ULF_DEADLINE) {
-		set_deferred_enosys(state);
-		return;
-	}
-
-	if (value2 != 0) {
-		set_deferred_enosys(state);
-		return;
-	}
-
-	if (!address) {
-		set_ulock_error(state, operation, EFAULT);
-		return;
-	}
-
-	if (ulock_is_64bit_operation(operation)) {
-		if (*(uint64_t*)address != value) {
-			set_ulock_error(state, operation, EAGAIN);
-			return;
-		}
-		set_deferred_enosys(state);
-		return;
-	}
-
-	if (!ulock_is_32bit_operation(operation)) {
-		set_ulock_error(state, operation, EINVAL);
-		return;
-	}
-
-	if (timeout_ns != 0) {
-		nanoseconds_to_timespec(timeout_ns, &timeout);
-		timeout_ptr = &timeout;
-	}
-
-	errno = 0;
-#ifdef SYS_futex
-	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT_PRIVATE,
-	                      (uint32_t)value, timeout_ptr, NULL, 0);
-	if (result < 0) {
-		set_ulock_error(state, operation, errno);
-		return;
-	}
-	set_success(state, 0);
-#else
-	set_deferred_enosys(state);
-#endif
+	int result = machgate_darwin_ulock_wait(operation, (void*)state->x[1],
+		state->x[2], state->x[3]);
+	finish_ulock_result(state, operation, result);
 }
 
 static void dispatch_ulock_wake(struct machgate_syscall_frame* state)
 {
 	uint32_t operation = (uint32_t)state->x[0];
-	void* address = (void*)state->x[1];
-	int wake_count = (operation & DARWIN_ULF_WAKE_ALL) ? INT_MAX : 1;
-
-	if (!address) {
-		set_ulock_error(state, operation, EFAULT);
-		return;
-	}
-
-	if (!ulock_is_32bit_operation(operation) &&
-	    !ulock_is_64bit_operation(operation)) {
-		set_ulock_error(state, operation, EINVAL);
-		return;
-	}
-
-	errno = 0;
-#ifdef SYS_futex
-	long result = syscall(SYS_futex, (uint32_t*)address, FUTEX_WAKE_PRIVATE,
-	                      wake_count, NULL, NULL, 0);
-	if (result < 0) {
-		set_ulock_error(state, operation, errno);
-		return;
-	}
-	set_success(state, 0);
-#else
-	set_deferred_enosys(state);
-#endif
+	int result = machgate_darwin_ulock_wake(operation, (void*)state->x[1], state->x[2]);
+	finish_ulock_result(state, operation, result);
 }
 
 static void dispatch_shared_region_map_and_slide(struct machgate_syscall_frame* state)

@@ -1080,7 +1080,7 @@ _main:
     mov x16, #305       ; Darwin SYS_psynch_cvwait
     svc #0x80
     b.cc fail
-    cmp x0, #35
+    cmp x0, #60
     b.ne fail
 
     mov x16, #306       ; Darwin SYS_psynch_rw_rdlock

@@ -1,3 +1,6 @@
+#include "thread_local_compat.h"
+
+#include <dlfcn.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -18,6 +21,10 @@ void machgate_terminate_after_guest_return(int status)
 {
 	trace_process_termination("guest_return", status,
 		__builtin_extract_return_addr(__builtin_return_address(0)));
+	void (*run_callbacks)(void) = (void (*)(void))dlsym(
+		RTLD_DEFAULT, "machgate_run_thread_local_termination_callbacks");
+	if (run_callbacks)
+		run_callbacks();
 	fflush(NULL);
 	syscall(SYS_exit_group, status);
 	__builtin_unreachable();
@@ -31,6 +38,7 @@ void exit(int status)
 	trace_process_termination(
 		"exit", status,
 		__builtin_extract_return_addr(__builtin_return_address(0)));
+	machgate_run_thread_local_termination_callbacks();
 	fflush(NULL);
 	syscall(SYS_exit_group, status);
 	__builtin_unreachable();

@@ -1,8 +1,10 @@
 #include "instruction_adaptation.h"
 
 #include "arm64_enc.h"
+#include "loader.h"
 #include "macho_defs.h"
 #include "ports/guest_image_view.h"
+#include "adapters/startup_cache.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -19,7 +21,9 @@
 #define ARM64_MRS_SYSTEM_REGISTER_MASK 0xffffffe0u
 #define ARM64_MRS_TPIDRRO_EL0 0xd53bd060u
 #define ARM64_LDR_LITERAL_64 0x58000000u
+#define ARM64_MOVZ_64_SHIFT_16 0xd2a00000u
 #define THREAD_CONTEXT_SIZE (16u * 1024u)
+#define THREAD_CONTEXT_ADDRESS_STEP UINT64_C(0x10000)
 #define ADAPTATION_ISLAND_WORDS 4u
 #define ADAPTATION_POOL_SIZE (64u * 1024u)
 #define ADAPTATION_POOL_ALIGNMENT (1024u * 1024u)
@@ -32,13 +36,42 @@ struct adaptation_pool {
 };
 
 static _Alignas(THREAD_CONTEXT_SIZE)
-    unsigned char guest_thread_context[THREAD_CONTEXT_SIZE];
+    unsigned char fallback_thread_context[THREAD_CONTEXT_SIZE];
+static unsigned char* guest_thread_context = fallback_thread_context;
+static uint32_t thread_context_immediate;
+static int thread_context_initialized;
 static struct adaptation_pool adaptation_pools[ADAPTATION_MAX_POOLS];
 static size_t adaptation_pool_count;
 
 void* machgate_guest_thread_context(void)
 {
 	return guest_thread_context;
+}
+
+static void initialize_thread_context(void)
+{
+	if (thread_context_initialized)
+		return;
+	for (uintptr_t address = THREAD_CONTEXT_ADDRESS_STEP;
+	     address <= UINT32_MAX; address += THREAD_CONTEXT_ADDRESS_STEP) {
+		void* mapping = mmap((void*)address, THREAD_CONTEXT_SIZE,
+		                     PROT_READ | PROT_WRITE,
+		                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+		                     -1, 0);
+		if (mapping == MAP_FAILED)
+			continue;
+		if ((uintptr_t)mapping != address) {
+			munmap(mapping, THREAD_CONTEXT_SIZE);
+			continue;
+		}
+		guest_thread_context = mapping;
+		thread_context_immediate = ARM64_MOVZ_64_SHIFT_16 |
+		                           ((uint32_t)(address >> 16) << 5);
+		break;
+	}
+	memset(guest_thread_context, 0, THREAD_CONTEXT_SIZE);
+	*(uintptr_t*)guest_thread_context = (uintptr_t)guest_thread_context;
+	thread_context_initialized = 1;
 }
 
 static int section_is_executable(const struct section_64* section)
@@ -128,6 +161,11 @@ static struct adaptation_pool* find_pool(uint32_t* instruction)
 static int adapt_thread_pointer_read(uint32_t* instruction, uint32_t encoding,
 				     char* error, size_t error_size)
 {
+	uint32_t destination_register = encoding & ARM64_REGISTER_MASK;
+	if (thread_context_immediate) {
+		*instruction = thread_context_immediate | destination_register;
+		return 0;
+	}
 	struct adaptation_pool* pool = find_pool(instruction);
 	if (!pool) {
 		snprintf(error, error_size,
@@ -136,7 +174,6 @@ static int adapt_thread_pointer_read(uint32_t* instruction, uint32_t encoding,
 	}
 
 	uint32_t* island = pool->next;
-	uint32_t destination_register = encoding & ARM64_REGISTER_MASK;
 	int64_t return_distance = (int64_t)(uintptr_t)instruction -
 	                          (int64_t)(uintptr_t)island;
 	int64_t island_distance = -return_distance;
@@ -147,6 +184,18 @@ static int adapt_thread_pointer_read(uint32_t* instruction, uint32_t encoding,
 	*instruction = enc_b((int32_t)(island_distance / 4));
 	pool->next += ADAPTATION_ISLAND_WORDS;
 	return 0;
+}
+
+struct adaptation_error {
+	char* message;
+	size_t size;
+};
+
+static int adapt_cached_instruction(uint32_t* instruction, void* context)
+{
+	struct adaptation_error* error = context;
+	return adapt_thread_pointer_read(instruction, *instruction,
+					error->message, error->size);
 }
 
 static int adapt_section(const struct machgate_guest_image* image,
@@ -162,22 +211,11 @@ static int adapt_section(const struct machgate_guest_image* image,
 		return -1;
 	}
 
-	int result = 0;
-	for (uint64_t offset = 0; offset + sizeof(uint32_t) <= section->size;
-	     offset += sizeof(uint32_t)) {
-		uint32_t* instruction =
-			(void*)(uintptr_t)(section->addr + machgate_guest_image_slide(image) + offset);
-		uint32_t encoding;
-		memcpy(&encoding, instruction, sizeof(encoding));
-		if ((encoding & ARM64_MRS_SYSTEM_REGISTER_MASK) !=
-		    ARM64_MRS_TPIDRRO_EL0)
-			continue;
-		if (adapt_thread_pointer_read(instruction, encoding, error,
-		                              error_size) != 0)
-			return -1;
-		result++;
-	}
-	return result;
+	uint32_t* code = (void*)(uintptr_t)(section->addr + machgate_guest_image_slide(image));
+	struct adaptation_error context = {error, error_size};
+	return machgate_startup_cache_patch(machgate_guest_image_startup_cache(image), MACHGATE_CACHE_THREAD_POINTERS,
+		code, section->size, ARM64_MRS_SYSTEM_REGISTER_MASK,
+		ARM64_MRS_TPIDRRO_EL0, adapt_cached_instruction, &context);
 }
 
 static int protect_adaptation_pools(char* error, size_t error_size)
@@ -204,8 +242,7 @@ int machgate_adapt_guest_instructions(struct machgate_guest_image* image,
 	int result = 0;
 
 	adaptation_pool_count = 0;
-	memset(guest_thread_context, 0, sizeof(guest_thread_context));
-	*(uintptr_t*)guest_thread_context = (uintptr_t)guest_thread_context;
+	initialize_thread_context();
 
 	for (uint32_t command_index = 0;
 	     command_index < header->ncmds;

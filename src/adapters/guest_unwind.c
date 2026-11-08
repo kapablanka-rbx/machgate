@@ -1,9 +1,12 @@
 #include "adapters/guest_unwind.h"
+#include "adapters/dynamic_unwind.h"
 
 #include "ports/guest_image_view.h"
 
 #include "loader.h"
+#include "log.h"
 #include "macho_defs.h"
+#include "adapters/startup_cache.h"
 
 #include <dlfcn.h>
 #include <limits.h>
@@ -94,6 +97,21 @@ struct unwind_row {
 	uint32_t encoding;
 	uintptr_t lsda;
 	uintptr_t fde;
+};
+
+struct cached_unwind_header {
+	uint64_t image_base;
+	uint64_t metadata_size;
+	uint64_t frame_offset;
+	uint64_t frame_size;
+	uint64_t index_count;
+	uint64_t personality_offsets[4][2];
+};
+
+struct cached_unwind_index {
+	uint32_t function_offset;
+	uint32_t guest_fde;
+	uint64_t fde_offset;
 };
 
 struct byte_writer {
@@ -431,7 +449,7 @@ static int finish_record(struct byte_writer* writer, size_t record_start)
 }
 
 static int emit_cie(struct byte_writer* writer, uintptr_t personality,
-		    int has_lsda, size_t* result)
+		    int has_lsda, size_t* result, uint64_t* personality_offset)
 {
 	size_t start = writer->offset;
 	if (writer_u32(writer, 0) != 0 || writer_u32(writer, 0) != 0 ||
@@ -449,10 +467,13 @@ static int emit_cie(struct byte_writer* writer, uintptr_t personality,
 	size_t augmentation_size = (personality ? 9 : 0) + (has_lsda ? 1 : 0) + 1;
 	if (writer_uleb(writer, augmentation_size) != 0)
 		return -1;
-	if (personality &&
-	    (writer_u8(writer, DW_EH_PE_ABSPTR) != 0 ||
-	     writer_u64(writer, personality) != 0))
-		return -1;
+	if (personality) {
+		if (writer_u8(writer, DW_EH_PE_ABSPTR) != 0)
+			return -1;
+		*personality_offset = writer->offset;
+		if (writer_u64(writer, personality) != 0)
+			return -1;
+	}
 	if (has_lsda && writer_u8(writer, DW_EH_PE_ABSPTR) != 0)
 		return -1;
 	if (writer_u8(writer, DW_EH_PE_ABSPTR) != 0 ||
@@ -545,9 +566,10 @@ static int emit_fde(struct byte_writer* writer, size_t cie_offset,
 			return -1;
 		size_t stack_size =
 			((encoding & UNWIND_ARM64_FRAMELESS_STACK_SIZE_MASK) >> 12) * 16;
-		if (writer_u8(writer, DW_CFA_DEF_CFA_OFFSET) != 0 ||
+		if (writer_u8(writer, DW_CFA_DEF_CFA) != 0 ||
+		    writer_uleb(writer, 31) != 0 ||
 		    writer_uleb(writer, stack_size) != 0 ||
-		    emit_saved_register_pairs(writer, encoding, 0) != 0)
+		    emit_saved_register_pairs(writer, encoding, 1) != 0)
 			return -1;
 	} else {
 		return -1;
@@ -698,6 +720,175 @@ static int build_eh_frame_header(uint8_t* header, size_t capacity,
 	return 0;
 }
 
+static int register_unwind_metadata(struct machgate_guest_image* image,
+	uint8_t* metadata, size_t metadata_size, size_t frame_offset,
+	register_frame_function register_frame, char* error, size_t error_size)
+{
+	long page_size_result = sysconf(_SC_PAGESIZE);
+	if (page_size_result <= 0 ||
+	    mprotect(metadata, align_up(metadata_size, page_size_result), PROT_READ) != 0) {
+		snprintf(error, error_size, "could not protect guest unwind metadata");
+		return -1;
+	}
+	register_frame(metadata + frame_offset);
+	guest_unwind_registration = (struct guest_unwind_registration){
+		.map_start = machgate_guest_image_mapping_start(image),
+		.map_end = machgate_guest_image_mapping_end(image),
+		.eh_frame_header = metadata,
+	};
+	return 0;
+}
+
+static void cache_unwind_metadata(struct machgate_guest_image* image,
+	const struct byte_writer* writer, size_t frame_offset,
+	const struct unwind_row* rows, size_t row_count,
+	uint64_t personality_offsets[4][2])
+{
+	struct machgate_startup_cache* cache = machgate_guest_image_startup_cache(image);
+	if (!cache)
+		return;
+	uintptr_t image_base = (uintptr_t)machgate_guest_image_validated_header(image);
+	struct cached_unwind_header header = {
+		.image_base = image_base, .metadata_size = writer->capacity,
+		.frame_offset = frame_offset, .frame_size = writer->offset - frame_offset,
+	};
+	for (size_t index = 0; index < row_count; index++)
+		if (rows[index].fde)
+			header.index_count++;
+	size_t index_bytes = header.index_count * sizeof(struct cached_unwind_index);
+	size_t size = sizeof(header) + index_bytes + header.frame_size;
+	unsigned char* data = malloc(size);
+	if (!data)
+		return;
+	struct cached_unwind_index* indices = (void*)(data + sizeof(header));
+	unsigned char* frames = data + sizeof(header) + index_bytes;
+	memcpy(frames, writer->bytes + frame_offset, header.frame_size);
+	for (size_t personality = 0; personality < 4; personality++) {
+		for (size_t lsda = 0; lsda < 2; lsda++) {
+			uint64_t offset = personality_offsets[personality][lsda];
+			header.personality_offsets[personality][lsda] = UINT64_MAX;
+			if (offset == UINT64_MAX)
+				continue;
+			header.personality_offsets[personality][lsda] = offset - frame_offset;
+			memset(frames + offset - frame_offset, 0, sizeof(uintptr_t));
+		}
+	}
+	size_t output_index = 0;
+	for (size_t index = 0; index < row_count; index++) {
+		if (!rows[index].fde)
+			continue;
+		int guest_fde = (rows[index].encoding & UNWIND_ARM64_MODE_MASK) == UNWIND_ARM64_MODE_DWARF;
+		uintptr_t base = guest_fde ? image_base : (uintptr_t)(writer->bytes + frame_offset);
+		indices[output_index++] = (struct cached_unwind_index){
+			.function_offset = rows[index].function_offset,
+			.guest_fde = guest_fde, .fde_offset = rows[index].fde - base,
+		};
+	}
+	memcpy(data, &header, sizeof(header));
+	machgate_startup_cache_put(cache, MACHGATE_CACHE_UNWIND, data, size);
+	free(data);
+}
+
+static int cached_unwind_is_valid(const struct cached_unwind_header* header,
+	size_t size, const struct machgate_guest_image* image)
+{
+	uintptr_t image_base = (uintptr_t)machgate_guest_image_validated_header(image);
+	if (size < sizeof(*header) || header->image_base != image_base ||
+	    header->index_count > (size - sizeof(*header)) / sizeof(struct cached_unwind_index) ||
+	    header->metadata_size > 128u * 1024u * 1024u ||
+	    header->frame_offset > header->metadata_size || header->frame_size < 4 ||
+	    header->frame_size > header->metadata_size - header->frame_offset ||
+	    header->frame_offset < 12 + header->index_count * 8)
+		return 0;
+	size_t index_bytes = header->index_count * sizeof(struct cached_unwind_index);
+	if (header->frame_size != size - sizeof(*header) - index_bytes)
+		return 0;
+	const struct cached_unwind_index* indices = (const void*)(header + 1);
+	for (size_t index = 0; index < header->index_count; index++) {
+		if (indices[index].function_offset > UINTPTR_MAX - image_base ||
+		    !mapped_range_valid(image, image_base + indices[index].function_offset, 1) ||
+		    (index && indices[index].function_offset <= indices[index - 1].function_offset))
+			return 0;
+		if (indices[index].guest_fde) {
+			if (indices[index].guest_fde != 1 || indices[index].fde_offset > UINTPTR_MAX - image_base ||
+			    !mapped_range_valid(image, image_base + indices[index].fde_offset, 8))
+				return 0;
+		} else if (header->frame_size < 8 || indices[index].fde_offset > header->frame_size - 8) {
+			return 0;
+		}
+	}
+	for (size_t personality = 0; personality < 4; personality++)
+		for (size_t lsda = 0; lsda < 2; lsda++) {
+			uint64_t offset = header->personality_offsets[personality][lsda];
+			if (offset != UINT64_MAX && (!personality || header->frame_size < 8 ||
+			    offset > header->frame_size - 8))
+				return 0;
+		}
+	return 1;
+}
+
+static int restore_cached_unwind(struct machgate_guest_image* image,
+	const struct mapped_section* compact, register_frame_function register_frame,
+	char* error, size_t error_size)
+{
+	size_t size;
+	const struct cached_unwind_header* header = machgate_startup_cache_get(
+		machgate_guest_image_startup_cache(image), MACHGATE_CACHE_UNWIND, &size);
+	if (!header || !cached_unwind_is_valid(header, size, image))
+		return 0;
+	const struct compact_unwind_header* compact_header = section_bytes(compact, 0, sizeof(*compact_header));
+	if (!compact_header)
+		return 0;
+	uintptr_t personalities[4] = {0};
+	for (size_t personality = 1; personality < 4; personality++) {
+		if (header->personality_offsets[personality][0] == UINT64_MAX &&
+		    header->personality_offsets[personality][1] == UINT64_MAX)
+			continue;
+		personalities[personality] = resolve_personality(compact, compact_header, image, personality << 28);
+		if (!personalities[personality] || personalities[personality] == UINTPTR_MAX)
+			return 0;
+	}
+	uint8_t* metadata = machgate_pool_alloc(image, header->metadata_size);
+	if (!metadata)
+		return 0;
+	const struct cached_unwind_index* indices = (const void*)(header + 1);
+	const unsigned char* frames = (const void*)(indices + header->index_count);
+	memcpy(metadata + header->frame_offset, frames, header->frame_size);
+	for (size_t personality = 1; personality < 4; personality++)
+		for (size_t lsda = 0; lsda < 2; lsda++) {
+			uint64_t offset = header->personality_offsets[personality][lsda];
+			if (offset != UINT64_MAX)
+				memcpy(metadata + header->frame_offset + offset, &personalities[personality], sizeof(uintptr_t));
+		}
+	metadata[0] = 1;
+	metadata[1] = DW_EH_PE_DATAREL | DW_EH_PE_SDATA4;
+	metadata[2] = DW_EH_PE_UDATA4;
+	metadata[3] = DW_EH_PE_DATAREL | DW_EH_PE_SDATA4;
+	int32_t frame_offset = header->frame_offset;
+	uint32_t count = header->index_count;
+	memcpy(metadata + 4, &frame_offset, sizeof(frame_offset));
+	memcpy(metadata + 8, &count, sizeof(count));
+	for (size_t index = 0; index < header->index_count; index++) {
+		uintptr_t fde_base = indices[index].guest_fde ? header->image_base : (uintptr_t)(metadata + header->frame_offset);
+		int32_t function_value;
+		int32_t fde_value;
+		if (signed_offset(header->image_base + indices[index].function_offset, (uintptr_t)metadata, &function_value) != 0 ||
+		    signed_offset(fde_base + indices[index].fde_offset, (uintptr_t)metadata, &fde_value) != 0) {
+			munmap(metadata, header->metadata_size);
+			return 0;
+		}
+		memcpy(metadata + 12 + index * 8, &function_value, sizeof(function_value));
+		memcpy(metadata + 16 + index * 8, &fde_value, sizeof(fde_value));
+	}
+	if (register_unwind_metadata(image, metadata, header->metadata_size, header->frame_offset,
+				     register_frame, error, error_size) != 0)
+		return -1;
+	if (machgate_env_truthy(getenv("MACHGATE_LOG_STARTUP")) ||
+	    machgate_env_truthy(getenv("MACHGATE_VERBOSE")))
+		fprintf(stderr, "machgate: startup cache: restored unwind\n");
+	return 1;
+}
+
 int machgate_register_guest_unwind(struct machgate_guest_image* image,
 				   char* error, size_t error_size)
 {
@@ -726,6 +917,9 @@ int machgate_register_guest_unwind(struct machgate_guest_image* image,
 		register_frame(eh_frame.address);
 		return 0;
 	}
+	int cached_result = restore_cached_unwind(image, &compact, register_frame, error, error_size);
+	if (cached_result != 0)
+		return cached_result < 0 ? -1 : 0;
 
 	size_t row_capacity = compact.size / sizeof(uint32_t);
 	struct unwind_row* rows = calloc(row_capacity, sizeof(*rows));
@@ -769,6 +963,8 @@ int machgate_register_guest_unwind(struct machgate_guest_image* image,
 		.offset = header_capacity,
 	};
 	uintptr_t cie_offsets[4][2];
+	uint64_t personality_offsets[4][2];
+	memset(personality_offsets, 0xff, sizeof(personality_offsets));
 	for (size_t personality = 0; personality < 4; personality++)
 		for (size_t lsda = 0; lsda < 2; lsda++)
 			cie_offsets[personality][lsda] = UINTPTR_MAX;
@@ -825,7 +1021,8 @@ int machgate_register_guest_unwind(struct machgate_guest_image* image,
 		}
 		if (cie_offsets[personality_index][has_lsda] == UINTPTR_MAX &&
 		    emit_cie(&writer, personality, has_lsda,
-		             (size_t*)&cie_offsets[personality_index][has_lsda]) != 0) {
+		             (size_t*)&cie_offsets[personality_index][has_lsda],
+		             &personality_offsets[personality_index][has_lsda]) != 0) {
 			snprintf(error, error_size, "could not encode guest unwind CIE");
 			free(rows);
 			return -1;
@@ -847,27 +1044,20 @@ int machgate_register_guest_unwind(struct machgate_guest_image* image,
 		return -1;
 	}
 
-	register_frame(metadata + header_capacity);
-
-	long page_size_result = sysconf(_SC_PAGESIZE);
-	if (page_size_result <= 0 ||
-	    mprotect(metadata, align_up(metadata_size, page_size_result),
-	             PROT_READ) != 0) {
-		snprintf(error, error_size, "could not protect guest unwind metadata");
+	if (register_unwind_metadata(image, metadata, metadata_size, header_capacity,
+				     register_frame, error, error_size) != 0) {
 		free(rows);
 		return -1;
 	}
-	guest_unwind_registration = (struct guest_unwind_registration){
-		.map_start = machgate_guest_image_mapping_start(image),
-		.map_end = machgate_guest_image_mapping_end(image),
-		.eh_frame_header = metadata,
-	};
+	cache_unwind_metadata(image, &writer, header_capacity, rows, row_count, personality_offsets);
 	free(rows);
 	return 0;
 }
 
 int _dl_find_object(void* address, struct dl_find_object* result)
 {
+	if (machgate_find_dynamic_unwind(address, result) == 0)
+		return 0;
 	uintptr_t value = (uintptr_t)address;
 	if (guest_unwind_registration.eh_frame_header &&
 	    value >= guest_unwind_registration.map_start &&

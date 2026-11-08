@@ -1,11 +1,17 @@
 #include "native_imports.h"
+#include "adapters/startup_cache.h"
+#include "adapters/guest_rebase.h"
 
 #include "guest_symbols.h"
+#include "loader.h"
 #include "macho_defs.h"
 #include "native_provider_guest_import.h"
+#include "ports/native_unwind.h"
 #include "native_provider_map.h"
 #include "native_structor_adapter.h"
 #include "ports/guest_image_view.h"
+#include "ports/guest_libraries.h"
+#include "ports/native_provider_image.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -92,7 +98,17 @@ struct native_provider {
 	const char* install_name;
 	enum machgate_provider_decision_kind decision;
 	void* handle;
+	struct machgate_guest_image* guest_image;
 	machgate_guest_import_resolver_function guest_import_resolver;
+};
+
+static struct native_provider dynamic_providers[MACHGATE_MAX_NATIVE_PROVIDERS];
+static size_t dynamic_provider_count;
+
+struct unresolved_data_pool {
+	uint8_t* bytes;
+	size_t used;
+	size_t capacity;
 };
 
 struct import_context {
@@ -106,6 +122,11 @@ struct import_context {
 	struct native_provider providers[MACHGATE_MAX_NATIVE_PROVIDERS];
 	size_t provider_count;
 	struct machgate_structor_adapters* structor_adapters;
+	struct unresolved_data_pool unresolved_data;
+	uintptr_t* called_pointers;
+	size_t called_pointer_count;
+	size_t called_pointer_capacity;
+	int allow_unresolved_stubs;
 	long page_size;
 	char* error;
 	size_t error_size;
@@ -213,6 +234,28 @@ static int provider_owns_address(void* handle, void* address)
 	       (void*)(uintptr_t)provider_map->l_addr;
 }
 
+int machgate_resolve_native_symbol_v1(void* handle, const char* name,
+				     void** address)
+{
+	if (!name || !address)
+		return 0;
+	*address = NULL;
+	for (size_t index = 0; index < dynamic_provider_count; index++) {
+		struct native_provider* provider = &dynamic_providers[index];
+		if (!provider->handle || (handle && handle != provider->handle))
+			continue;
+		if (provider->guest_import_resolver &&
+		    provider->guest_import_resolver(name, address))
+			return 1;
+		void* result = dlsym(provider->handle, name);
+		if (provider_owns_address(provider->handle, result)) {
+			*address = result;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int add_provider(struct import_context* context,
 			const struct dylib_command* command)
 {
@@ -243,6 +286,12 @@ static int add_provider(struct import_context* context,
 		    name, &provider->decision, path, sizeof(path), context->error,
 		    context->error_size) != 0)
 		return -1;
+	if (provider->decision == MACHGATE_PROVIDER_UNMAPPED) {
+		int result = machgate_open_guest_dependency(context->image, name,
+		    &provider->guest_image, context->error, context->error_size);
+		if (result < 0)
+			return -1;
+	}
 	if (provider->decision != MACHGATE_PROVIDER_MAP &&
 	    provider->decision != MACHGATE_PROVIDER_PARTIAL)
 		return 0;
@@ -342,6 +391,11 @@ static void unresolved_stub_binder(void)
 	_exit(127);
 }
 
+static uintptr_t unresolved_return_zero(void)
+{
+	return 0;
+}
+
 static void compiler_clear_cache(void* start, void* end)
 {
 	__builtin___clear_cache(start, end);
@@ -386,6 +440,12 @@ static const char* normalized_native_name(const char* guest_name,
 
 static void* find_compiler_runtime_symbol(const char* native_name)
 {
+	if (strcmp(native_name, "__register_frame") == 0 ||
+	    strcmp(native_name, "__unw_add_dynamic_fde") == 0)
+		return machgate_guest_register_frame;
+	if (strcmp(native_name, "__deregister_frame") == 0 ||
+	    strcmp(native_name, "__unw_remove_dynamic_fde") == 0)
+		return machgate_guest_deregister_frame;
 	if (strcmp(native_name, "__clear_cache") == 0)
 		return compiler_clear_cache;
 	if (strcmp(native_name, "__floattidf") == 0)
@@ -406,11 +466,16 @@ static void* find_provider_symbol(struct native_provider* provider,
 }
 
 static void* find_dependency_symbol(struct import_context* context,
-				    const char* native_name,
+				    const char* native_name, const char* guest_name,
 				    int* mapped_native_provider)
 {
 	for (size_t index = 0; index < context->provider_count; index++) {
 		struct native_provider* provider = &context->providers[index];
+		if (provider->guest_image) {
+			void* result = machgate_find_guest_definition(provider->guest_image, guest_name);
+			if (result)
+				return result;
+		}
 		if (!provider->handle)
 			continue;
 		void* symbol = find_provider_symbol(provider, native_name);
@@ -440,6 +505,8 @@ static void* find_symbol(struct import_context* context,
 		if (index >= context->provider_count)
 			return NULL;
 		struct native_provider* provider = &context->providers[index];
+		if (provider->guest_image)
+			return machgate_find_guest_definition(provider->guest_image, state->symbol);
 		if (provider->handle) {
 			void* symbol = find_provider_symbol(provider, native_name);
 			if (symbol) {
@@ -457,7 +524,12 @@ static void* find_symbol(struct import_context* context,
 	    state->provider_ordinal == BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE ||
 	    state->provider_ordinal == BIND_SPECIAL_DYLIB_FLAT_LOOKUP ||
 	    state->provider_ordinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP) {
-		void* symbol = machgate_find_guest_definition(context->image,
+		struct machgate_guest_image* search_image =
+			state->provider_ordinal == BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE
+			? machgate_main_guest_image() : context->image;
+		if (!search_image)
+			search_image = context->image;
+		void* symbol = machgate_find_guest_definition(search_image,
 		                                                state->symbol);
 		if (symbol)
 			return symbol;
@@ -466,7 +538,7 @@ static void* find_symbol(struct import_context* context,
 	    state->provider_ordinal != BIND_SPECIAL_DYLIB_WEAK_LOOKUP)
 		return NULL;
 
-	void* symbol = find_dependency_symbol(context, native_name,
+	void* symbol = find_dependency_symbol(context, native_name, state->symbol,
 	                                      mapped_native_provider);
 	if (symbol)
 		return symbol;
@@ -521,7 +593,44 @@ enum unresolved_import_action {
 	UNRESOLVED_IMPORT_ERROR,
 	UNRESOLVED_IMPORT_ZERO,
 	UNRESOLVED_IMPORT_TRAP,
+	UNRESOLVED_IMPORT_RETURN_ZERO,
+	UNRESOLVED_IMPORT_DATA,
 };
+
+static int import_context_allows_unresolved_stubs(void)
+{
+	const char* policy = getenv("MACHGATE_UNRESOLVED_IMPORTS");
+	if (!policy || !*policy || strcmp(policy, "strict") == 0)
+		return 0;
+	if (strcmp(policy, "stub") == 0)
+		return 1;
+	fprintf(stderr,
+	        "machgate: MACHGATE_UNRESOLVED_IMPORTS must be strict or stub; using strict\n");
+	return 0;
+}
+
+static void* allocate_unresolved_data(struct import_context* context)
+{
+	const size_t alignment = 64;
+	if (!context->unresolved_data.bytes) {
+		context->unresolved_data.capacity = 64 * 1024;
+		context->unresolved_data.bytes = mmap(
+			NULL, context->unresolved_data.capacity,
+			PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (context->unresolved_data.bytes == MAP_FAILED) {
+			context->unresolved_data.bytes = NULL;
+			context->unresolved_data.capacity = 0;
+			return NULL;
+		}
+	}
+	size_t offset = (context->unresolved_data.used + alignment - 1) &
+	                ~(alignment - 1);
+	if (offset > context->unresolved_data.capacity ||
+	    alignment > context->unresolved_data.capacity - offset)
+		return NULL;
+	context->unresolved_data.used = offset + alignment;
+	return context->unresolved_data.bytes + offset;
+}
 
 static int bind_targets_lazy_symbol_pointer(
 	struct import_context* context, const struct bind_state* state)
@@ -615,6 +724,127 @@ static int symbol_has_stub_entry(struct import_context* context,
 	return 0;
 }
 
+static int record_called_pointer(struct import_context* context,
+				 uintptr_t address)
+{
+	if (context->called_pointer_count == context->called_pointer_capacity) {
+		size_t capacity = context->called_pointer_capacity
+			                  ? context->called_pointer_capacity * 2 : 32;
+		uintptr_t* result = realloc(context->called_pointers,
+		                            capacity * sizeof(*result));
+		if (!result) {
+			snprintf(context->error, context->error_size,
+			         "could not allocate native call reference table");
+			return -1;
+		}
+		context->called_pointers = result;
+		context->called_pointer_capacity = capacity;
+	}
+	context->called_pointers[context->called_pointer_count++] = address;
+	return 0;
+}
+
+enum reference_kind { REFERENCE_UNKNOWN, REFERENCE_ADDRESS, REFERENCE_POINTER };
+
+static int collect_section_call_pointers(struct import_context* context,
+					uintptr_t address, uint64_t size)
+{
+	uintptr_t references[32] = {0};
+	enum reference_kind kinds[32] = {REFERENCE_UNKNOWN};
+	for (uint64_t offset = 0; offset + sizeof(uint32_t) <= size; offset += 4) {
+		uint32_t instruction;
+		memcpy(&instruction, (void*)(address + offset), sizeof(instruction));
+		unsigned int destination = instruction & 31u;
+		unsigned int source = (instruction >> 5) & 31u;
+		if ((instruction & 0x9f000000u) == 0x90000000u) {
+			uint32_t immediate = ((instruction >> 29) & 3u) |
+			                     (((instruction >> 5) & 0x7ffffu) << 2);
+			int64_t pages = (int64_t)(immediate ^ 0x100000u) - 0x100000;
+			references[destination] = ((address + offset) & ~(uintptr_t)4095) +
+			                          pages * 4096;
+			kinds[destination] = REFERENCE_ADDRESS;
+		} else if ((instruction & 0xff800000u) == 0x91000000u) {
+			uintptr_t immediate = (instruction >> 10) & 0xfffu;
+			if (instruction & (1u << 22))
+				immediate <<= 12;
+			references[destination] = references[source] + immediate;
+			kinds[destination] = kinds[source] == REFERENCE_ADDRESS
+				                     ? REFERENCE_ADDRESS : REFERENCE_UNKNOWN;
+		} else if ((instruction & 0xffc00000u) == 0xf9400000u) {
+			references[destination] = references[source] +
+			                          (((instruction >> 10) & 0xfffu) * 8);
+			kinds[destination] = kinds[source] == REFERENCE_ADDRESS
+				                     ? REFERENCE_POINTER : REFERENCE_UNKNOWN;
+		} else if ((instruction & 0xffe0ffe0u) == 0xaa0003e0u) {
+			source = (instruction >> 16) & 31u;
+			references[destination] = references[source];
+			kinds[destination] = kinds[source];
+		} else if ((instruction & 0x1f800000u) == 0x12800000u) {
+			kinds[destination] = REFERENCE_UNKNOWN;
+		} else if (instruction != 0xd503201fu) {
+			uint32_t branch = instruction & 0xfffffc1fu;
+			if ((branch == 0xd63f0000u || branch == 0xd61f0000u) &&
+			    kinds[source] == REFERENCE_POINTER &&
+			    record_called_pointer(context, references[source]) != 0)
+				return -1;
+			memset(kinds, 0, sizeof(kinds));
+		}
+		kinds[31] = REFERENCE_UNKNOWN;
+	}
+	return 0;
+}
+
+static int collect_called_pointers(struct import_context* context)
+{
+	size_t cached_size;
+	const void* cached = machgate_startup_cache_get(
+		machgate_guest_image_startup_cache(context->image), MACHGATE_CACHE_CALL_REFERENCES, &cached_size);
+	if (cached && cached_size % sizeof(uintptr_t) == 0) {
+		uintptr_t* result = malloc(cached_size ? cached_size : 1);
+		if (result) {
+			memcpy(result, cached, cached_size);
+			context->called_pointers = result;
+			context->called_pointer_count = cached_size / sizeof(uintptr_t);
+			context->called_pointer_capacity = context->called_pointer_count;
+			return 0;
+		}
+	}
+	for (size_t index = 0; index < context->segment_count; index++) {
+		const struct import_segment* segment = &context->segments[index];
+		if (!(segment->protection & PROT_EXEC))
+			continue;
+		const struct section_64* sections = (const void*)(segment->command + 1);
+		for (uint32_t section_index = 0; section_index < segment->command->nsects;
+		     section_index++) {
+			const struct section_64* section = &sections[section_index];
+			if (!(section->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)))
+				continue;
+			uintptr_t address = section->addr + machgate_guest_image_slide(context->image);
+			if (!machgate_guest_image_contains(context->image, address, section->size))
+				continue;
+			if (collect_section_call_pointers(context, address, section->size) != 0)
+				return -1;
+		}
+	}
+	machgate_startup_cache_put(machgate_guest_image_startup_cache(context->image), MACHGATE_CACHE_CALL_REFERENCES,
+		context->called_pointers, context->called_pointer_count * sizeof(uintptr_t));
+	return 0;
+}
+
+static int bind_pointer_is_called(struct import_context* context,
+				  const struct bind_state* state)
+{
+	if (state->segment_index >= context->segment_count)
+		return 0;
+	uintptr_t address = context->segments[state->segment_index].address +
+	                    state->segment_offset;
+	for (size_t index = 0; index < context->called_pointer_count; index++) {
+		if (context->called_pointers[index] == address)
+			return 1;
+	}
+	return 0;
+}
+
 static enum unresolved_import_action unresolved_import_action(
 	struct import_context* context, const struct bind_state* state, int lazy)
 {
@@ -625,6 +855,10 @@ static enum unresolved_import_action unresolved_import_action(
 		return UNRESOLVED_IMPORT_ZERO;
 	if (state->provider_ordinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP)
 		return UNRESOLVED_IMPORT_ZERO;
+	if (context->allow_unresolved_stubs &&
+	    (direct_function_target || stubbed_function ||
+	     bind_pointer_is_called(context, state)))
+		return UNRESOLVED_IMPORT_RETURN_ZERO;
 	if (state->provider_ordinal > 0 &&
 	    (size_t)state->provider_ordinal <= context->provider_count) {
 		enum machgate_provider_decision_kind decision =
@@ -636,12 +870,27 @@ static enum unresolved_import_action unresolved_import_action(
 				       ? UNRESOLVED_IMPORT_TRAP
 				       : UNRESOLVED_IMPORT_ZERO;
 		if (decision == MACHGATE_PROVIDER_STUB)
-			return UNRESOLVED_IMPORT_TRAP;
+			return context->allow_unresolved_stubs
+				       ? UNRESOLVED_IMPORT_RETURN_ZERO
+				       : UNRESOLVED_IMPORT_TRAP;
+
 		if (decision == MACHGATE_PROVIDER_MAP && stubbed_function)
-			return UNRESOLVED_IMPORT_TRAP;
+			return context->allow_unresolved_stubs
+				       ? UNRESOLVED_IMPORT_RETURN_ZERO
+				       : UNRESOLVED_IMPORT_TRAP;
 	}
-	if (direct_function_target)
-		return UNRESOLVED_IMPORT_TRAP;
+	if (direct_function_target || stubbed_function)
+		return context->allow_unresolved_stubs
+		       ? UNRESOLVED_IMPORT_RETURN_ZERO
+		       : UNRESOLVED_IMPORT_TRAP;
+	if (state->provider_ordinal > 0 &&
+	    (size_t)state->provider_ordinal <= context->provider_count &&
+	    context->providers[state->provider_ordinal - 1].decision ==
+	    MACHGATE_PROVIDER_UNMAPPED && !lazy &&
+	    !context->allow_unresolved_stubs)
+		return UNRESOLVED_IMPORT_ERROR;
+	if (context->allow_unresolved_stubs)
+		return UNRESOLVED_IMPORT_DATA;
 	return UNRESOLVED_IMPORT_ERROR;
 }
 
@@ -685,9 +934,22 @@ static int write_pointer(struct import_context* context,
 			unresolved_import_action(context, state, lazy);
 		if (action == UNRESOLVED_IMPORT_TRAP)
 			symbol = unresolved_stub_binder;
+		else if (action == UNRESOLVED_IMPORT_RETURN_ZERO)
+			symbol = unresolved_return_zero;
 		else if (action == UNRESOLVED_IMPORT_ZERO)
 			bind_zero = 1;
-		else if (action == UNRESOLVED_IMPORT_ERROR) {
+		else if (action == UNRESOLVED_IMPORT_DATA) {
+			symbol = allocate_unresolved_data(context);
+			if (!symbol) {
+				snprintf(context->error, context->error_size,
+				         "could not allocate unresolved data for %s",
+				         state->symbol);
+				return -1;
+			}
+			fprintf(stderr,
+			        "machgate: unresolved import %s from %s uses compatibility storage\n",
+			        state->symbol, provider_description(context, state));
+		} else if (action == UNRESOLVED_IMPORT_ERROR) {
 			snprintf(context->error, context->error_size,
 			         "native symbol %s was not found for %s", state->symbol,
 			         provider_description(context, state));
@@ -984,9 +1246,22 @@ static int resolve_chained_bind(struct import_context* context,
 			unresolved_import_action(context, &state, 0);
 		if (action == UNRESOLVED_IMPORT_TRAP)
 			symbol = unresolved_stub_binder;
+		else if (action == UNRESOLVED_IMPORT_RETURN_ZERO)
+			symbol = unresolved_return_zero;
 		else if (action == UNRESOLVED_IMPORT_ZERO)
 			bind_zero = 1;
-		else if (action == UNRESOLVED_IMPORT_ERROR) {
+		else if (action == UNRESOLVED_IMPORT_DATA) {
+			symbol = allocate_unresolved_data(context);
+			if (!symbol) {
+				snprintf(context->error, context->error_size,
+				         "could not allocate unresolved data for %s",
+				         import->symbol);
+				return -1;
+			}
+			fprintf(stderr,
+			        "machgate: unresolved import %s from %s uses compatibility storage\n",
+			        import->symbol, provider_description(context, &state));
+		} else if (action == UNRESOLVED_IMPORT_ERROR) {
 			snprintf(context->error, context->error_size,
 			         "native symbol %s was not found for %s", import->symbol,
 			         provider_description(context, &state));
@@ -1179,14 +1454,51 @@ static int apply_chained_fixups(struct import_context* context)
 	return 0;
 }
 
+static void notify_provider_sections(struct import_context* context)
+{
+	for (size_t index = 0; index < context->provider_count; index++) {
+		void* handle = context->providers[index].handle;
+		if (!handle)
+			continue;
+		int already_notified = 0;
+		for (size_t earlier = 0; earlier < index; earlier++)
+			already_notified |= context->providers[earlier].handle == handle;
+		if (already_notified)
+			continue;
+		void* address = dlsym(handle, MACHGATE_SECTION_LOADED_SYMBOL);
+		if (!provider_owns_address(handle, address))
+			continue;
+		machgate_section_loaded_function notify = (machgate_section_loaded_function)address;
+		for (size_t segment_index = 0; segment_index < context->segment_count;
+		     segment_index++) {
+			const struct segment_command_64* segment =
+				context->segments[segment_index].command;
+			const struct section_64* sections = (const void*)(segment + 1);
+			for (size_t section_index = 0; section_index < segment->nsects;
+			     section_index++) {
+				const struct section_64* section = &sections[section_index];
+				uintptr_t section_address = section->addr +
+					machgate_guest_image_slide(context->image);
+				if (section->size && machgate_guest_image_contains(context->image,
+					section_address, section->size))
+					notify(section->segname, section->sectname,
+						(void*)section_address, section->size);
+			}
+		}
+	}
+}
+
 int machgate_bind_native_imports(struct machgate_guest_image* image, char* error,
 				 size_t error_size)
 {
+	if (((struct mach_header_64*)machgate_guest_image_validated_header(image))->filetype == MH_EXECUTE)
+		dynamic_provider_count = 0;
 	struct import_context context;
 	memset(&context, 0, sizeof(context));
 	context.image = image;
 	context.error = error;
 	context.error_size = error_size;
+	context.allow_unresolved_stubs = import_context_allows_unresolved_stubs();
 	context.page_size = sysconf(_SC_PAGESIZE);
 	if (context.page_size <= 0) {
 		snprintf(error, error_size, "could not determine host page size");
@@ -1194,6 +1506,10 @@ int machgate_bind_native_imports(struct machgate_guest_image* image, char* error
 	}
 	if (collect_load_commands(&context) != 0)
 		return -1;
+	if (machgate_rebase_guest_pointers(image, error, error_size) != 0)
+		return -1;
+	if (context.allow_unresolved_stubs && collect_called_pointers(&context) != 0)
+		goto failed;
 	int bind_count = 0;
 	if (context.dyld_info) {
 		int result = apply_bind_stream(
@@ -1220,9 +1536,27 @@ int machgate_bind_native_imports(struct machgate_guest_image* image, char* error
 	if (machgate_finish_native_structor_adapters(
 		    context.structor_adapters, error, error_size) != 0)
 		goto failed;
+	for (size_t index = 0; index < context.provider_count; index++) {
+		struct native_provider* provider = &context.providers[index];
+		if (!provider->handle)
+			continue;
+		int registered = 0;
+		for (size_t earlier = 0; earlier < dynamic_provider_count; earlier++)
+			registered |= dynamic_providers[earlier].handle == provider->handle;
+		if (registered)
+			continue;
+		if (dynamic_provider_count == MACHGATE_MAX_NATIVE_PROVIDERS) {
+			snprintf(error, error_size, "too many selected native provider handles");
+			goto failed;
+		}
+		dynamic_providers[dynamic_provider_count++] = *provider;
+	}
+	notify_provider_sections(&context);
+	free(context.called_pointers);
 	return bind_count;
 
 failed:
+	free(context.called_pointers);
 	machgate_discard_native_structor_adapters(context.structor_adapters);
 	return -1;
 }

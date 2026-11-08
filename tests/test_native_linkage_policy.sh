@@ -16,7 +16,16 @@ run_status()
 {
     local fixture="$1"
     local status=0
-    MACHGATE_DYLIB_MAP="$MAP_FILE" \
+    MACHGATE_DYLIB_MAP="$MAP_FILE" MACHGATE_UNRESOLVED_IMPORTS=strict \
+        "$BUILD_DIR/machgate" "$FIXTURE_DIR/$fixture" 2>/dev/null || status=$?
+    printf '%s' "$status"
+}
+
+run_compat_status()
+{
+    local fixture="$1"
+    local status=0
+    MACHGATE_DYLIB_MAP="$MAP_FILE" MACHGATE_UNRESOLVED_IMPORTS=stub \
         "$BUILD_DIR/machgate" "$FIXTURE_DIR/$fixture" 2>/dev/null || status=$?
     printf '%s' "$status"
 }
@@ -54,6 +63,12 @@ printf 'libSystem.B = %s/libsystem_shim.so\n' "$BUILD_DIR" > "$MAP_FILE"
 
 printf 'libMachGateFixture = UNMAPPED\n' > "$MAP_FILE"
 [ "$(run_status dynamic_stubbed_function)" -eq 1 ]
+[ "$(run_status dynamic_chained_stubbed_function)" -eq 1 ]
+[ "$(run_status dynamic_chained_data_missing)" -eq 1 ]
+[ "$(run_compat_status dynamic_chained_data_missing)" -eq 0 ]
+[ "$(run_compat_status dynamic_partial_used_data)" -eq 0 ]
+[ "$(run_compat_status dynamic_stubbed_function)" -eq 93 ]
+[ "$(run_compat_status dynamic_chained_stubbed_function)" -eq 93 ]
 
 [ "$(run_status dynamic_guest_definition)" -eq 67 ]
 

@@ -10,6 +10,10 @@ build-arm64-release/
 build-shim/
 build-unwind/
 build-zero-unwind/
+build-startup-cache/
+build-core-parity/
+build-foundation/
+build-icu-port/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -21,6 +25,13 @@ package/
 build-libcxx/
 
 # Test fixtures (built from source)
+tests/fixtures/darwin_dynamic_lookup
+tests/fixtures/darwin_interface_addresses
+tests/fixtures/interface_addresses_stub.dylib
+tests/fixtures/darwin_cached_syscall
+tests/fixtures/darwin_dlopen_flags
+tests/fixtures/dynamic_lookup_stub.dylib
+tests/fixtures/dynamic_chained_stubbed_function
 tests/fixtures/darwin_exit42
 tests/fixtures/darwin_zero_vmsize_debug
 tests/fixtures/darwin_tpidrro
@@ -98,10 +109,18 @@ tests/fixtures/libmachgate_test_provider.so
 tests/fixtures/libnative_structor_provider.so
 tests/fixtures/libinherited_resolver_provider.so
 tests/fixtures/process_termination_probe
+tests/fixtures/darwin_kqueue_psynch
+tests/fixtures/darwin_imported_socket
+tests/fixtures/darwin_popen_exit42
+tests/fixtures/darwin_socket_translation
+tests/fixtures/darwin_thread_local_termination
+tests/fixtures/darwin_initializer_working_directory
+tests/fixtures/darwin_ios_exit42
 tests/external/cache/
 tests/external/work/
 tests/external/logs/
 
 # Generated caches
+.machgate-cache/
 __pycache__/
 scripts/__pycache__/

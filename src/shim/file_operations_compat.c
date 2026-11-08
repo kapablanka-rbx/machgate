@@ -6,7 +6,6 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
@@ -29,6 +28,7 @@ enum darwin_fcntl_command {
 	DARWIN_FCNTL_GET_LOCK = 7,
 	DARWIN_FCNTL_SET_LOCK = 8,
 	DARWIN_FCNTL_SET_LOCK_WAIT = 9,
+	DARWIN_FCNTL_PREALLOCATE = 42,
 	DARWIN_FCNTL_READ_ADVICE = 44,
 	DARWIN_FCNTL_READ_AHEAD = 45,
 	DARWIN_FCNTL_NO_CACHE = 48,
@@ -52,33 +52,19 @@ enum darwin_rename_flag {
 	DARWIN_RENAME_EXCLUSIVE = 0x00000004u,
 };
 
-int machgate_open(const char* path, int darwin_flags, ...) __asm__("open");
-int machgate_open(const char* path, int darwin_flags, ...)
+int machgate_darwin_open_fixed(const char* path, int darwin_flags, mode_t mode)
 {
-	mode_t mode = 0;
-
-	if (machgate_darwin_open_uses_mode(darwin_flags)) {
-		va_list arguments;
-		va_start(arguments, darwin_flags);
-		mode = va_arg(arguments, mode_t);
-		va_end(arguments);
-	}
+	if (!machgate_darwin_open_uses_mode(darwin_flags))
+		mode = 0;
 	return syscall(SYS_openat, AT_FDCWD, path,
 	               machgate_linux_open_flags(darwin_flags), mode);
 }
 
-int machgate_openat(int directory, const char* path, int darwin_flags, ...)
-	__asm__("openat");
-int machgate_openat(int directory, const char* path, int darwin_flags, ...)
+int machgate_darwin_openat_fixed(int directory, const char* path,
+	                         int darwin_flags, mode_t mode)
 {
-	mode_t mode = 0;
-
-	if (machgate_darwin_open_uses_mode(darwin_flags)) {
-		va_list arguments;
-		va_start(arguments, darwin_flags);
-		mode = va_arg(arguments, mode_t);
-		va_end(arguments);
-	}
+	if (!machgate_darwin_open_uses_mode(darwin_flags))
+		mode = 0;
 	return syscall(SYS_openat, machgate_linux_dirfd(directory), path,
 	               machgate_linux_open_flags(darwin_flags), mode);
 }
@@ -181,12 +167,28 @@ static int perform_fcntl(int descriptor, int darwin_command,
 	case DARWIN_FCNTL_DUPLICATE_CLOSE_ON_EXEC:
 		linux_command = F_DUPFD_CLOEXEC;
 		break;
+	case DARWIN_FCNTL_PREALLOCATE:
+		return machgate_darwin_preallocate(
+			descriptor, (const struct machgate_darwin_fstore*)argument);
 	default:
 		errno = ENOTSUP;
 		return -1;
 	}
 
+	struct flock linux_flock;
+	struct machgate_darwin_flock* darwin_flock = NULL;
+	if (darwin_command == DARWIN_FCNTL_GET_LOCK ||
+	    darwin_command == DARWIN_FCNTL_SET_LOCK ||
+	    darwin_command == DARWIN_FCNTL_SET_LOCK_WAIT) {
+		darwin_flock = (struct machgate_darwin_flock*)argument;
+		if (machgate_darwin_flock_to_linux(darwin_flock, &linux_flock) != 0)
+			return -1;
+		argument = (unsigned long)&linux_flock;
+	}
+
 	int result = syscall(SYS_fcntl, descriptor, linux_command, argument);
+	if (result >= 0 && darwin_command == DARWIN_FCNTL_GET_LOCK)
+		machgate_linux_flock_to_darwin(&linux_flock, darwin_flock);
 	if (result >= 0 && (darwin_command == F_DUPFD ||
 	                    darwin_command == DARWIN_FCNTL_DUPLICATE_CLOSE_ON_EXEC))
 		machgate_fd_did_duplicate(descriptor, result);
