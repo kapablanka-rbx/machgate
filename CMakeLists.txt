@@ -113,6 +113,7 @@ add_library(system_shim SHARED
     src/shim/host_facts.c
     src/shim/host_statistics_compat.c
     src/shim/kqueue_compat.c
+    src/shim/keychain_compat.c
     src/adapters/linux_event_timer.c
     src/adapters/linux_socket_state.c
     src/adapters/linux_user_lock.c

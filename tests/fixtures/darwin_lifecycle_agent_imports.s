@@ -1,4 +1,7 @@
 .text
+.globl ___error
+___error:
+ ret
 .globl _sysctl
 _sysctl:
  ret

@@ -98,7 +98,10 @@ GLIBC_2.17 {
         SecCertificateCopySubjectSummary;
         SecCertificateCreateWithData;
         SecCopyErrorMessageString;
+        SecItemAdd;
         SecItemCopyMatching;
+        SecItemUpdate;
+        SecItemDelete;
         SecPolicyCopyProperties;
         SecPolicyCreateSSL;
         SecRandomCopyBytes;
@@ -113,6 +116,13 @@ GLIBC_2.17 {
         SecTrustSetVerifyDate;
         kSecClass;
         kSecClassCertificate;
+        kSecClassGenericPassword;
+        kSecAttrAccount;
+        kSecAttrService;
+        kSecAttrAccessible;
+        kSecAttrAccessibleAfterFirstUnlock;
+        kSecValueData;
+        kSecReturnData;
         kSecMatchLimit;
         kSecMatchLimitAll;
         kSecPolicyAppleSSL;

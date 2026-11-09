@@ -199,6 +199,22 @@ static void* lookup_chained(struct guest_class* entry, int class_method,
     return NULL;
 }
 
+const char* foundation_archive_guest_class_name(const void* class_object)
+{
+    if (!class_object)
+        return NULL;
+    pthread_mutex_lock(&classes_mutex);
+    const char* result = NULL;
+    for (size_t index = 0; index < class_count; ++index) {
+        if (classes[index].address == class_object) {
+            result = classes[index].name;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&classes_mutex);
+    return result;
+}
+
 void* foundation_archive_guest_imp(void* receiver, const char* selector)
 {
     if (!receiver || !selector)

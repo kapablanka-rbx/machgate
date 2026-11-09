@@ -341,23 +341,60 @@ Darwin memory clearing, thread names and CPU identification use these contracts:
 `tests/test_cpu_brand.sh` execute these contracts as both iOS and macOS guests
 with strict and compatibility import modes and cold/warm preparation caches.
 
-The lifecycle and host-collector repair checked these contracts:
+Network telemetry contract review:
 
 - XNU `bsd/netinet/udp_usrreq.c::udp_pcblist`,
   `bsd/netinet/in_pcb.h::xinpgen` and `bsd/netinet/udp_var.h`: UDP PCB-list
-  and statistics sysctls are read-only. The list begins with a 16-byte header
-  whose count is at byte 4; size-only and short-buffer queries follow the
-  existing sysctl copy convention. Linux `/proc/net/udp` supplies the current
-  count. The 88-byte Darwin UDP statistics record is accepted; unmeasured
-  counters remain zero rather than being invented from unrelated Linux data.
-- XNU `bsd/net/if_var.h::if_data`: the packed LP64 record is 104 bytes, with
-  32-bit received and sent byte counters at offsets 40 and 44. Link-level
-  `getifaddrs` entries now own independent records populated from Linux
-  per-interface statistics. Address records have no statistics payload.
-- Linux `proc_net_udp(5)` and `sysfs(5)`: the UDP table includes bound and
-  unbound IPv4 sockets, matching XNU's PCB table scope; sysfs exposes the
-  interface receive/transmit counters used for the Darwin record.
+  and statistics sysctls are read-only. The list starts with a 24-byte
+  `xinpgen`: two 32-bit fields followed by two 64-bit generation fields.
+  Nonempty results include `xinpcb` records and a concluding generation
+  header. The count at byte 4 alone is not the complete contract. Linux
+  `/proc/net/udp` lists bound endpoints and cannot enumerate every unbound
+  system socket or provide the Darwin socket/PCB fields and generations.
+- XNU `bsd/netinet/udp_var.h::udpstat` contains 22 unsigned 32-bit counters.
+  Linux UDP SNMP counters do not separately expose all Darwin header/length,
+  multicast, PCB cache/hash, and software-checksum packet/byte categories.
+  An all-zero successful record falsely reports those categories as measured.
+- XNU `bsd/net/if_var.h:155-205` selects `timeval32` under `__LP64__` and
+  packs `if_data` to 4-byte alignment. Its size is 96 bytes; byte counters
+  are at offsets 40 and 44, last-change at 72, hardware-assist at 84.
+  Linux link statistics do not supply every field, including outgoing
+  multicast counts, receive/transmit timing, and last administrative change.
 
-`tests/test_lifecycle_agent.sh` executes an open-socket PCB count, UDP stats,
-size and read-only checks, and link-level byte-counter reads in strict and
-compatibility import modes with cold/warm preparation caches.
+Until complete telemetry contracts are supported, UDP queries return `ENOENT`
+without changing the caller's buffer/length; writes remain `EPERM`.
+`getifaddrs` preserves supported translated addresses and leaves `ifa_data`
+null. Missing telemetry is distinct from a measured zero.
+`tests/test_network_metrics_compat.sh` verifies unavailable-query behavior
+and a supported hardware query. `tests/test_interface_addresses.sh` checks
+address translation, ownership, error paths and absent telemetry.
+`tests/test_lifecycle_agent.sh` exercises the guest error/buffer contracts
+in strict and compatibility import modes with cold/warm preparation caches.
+
+## Unavailable keychain and keyed archives
+
+Apple Security's [SecBase.h](https://github.com/apple-oss-distributions/Security/blob/main/base/SecBase.h)
+defines `errSecNotAvailable` as `-25291`, meaning no keychain is available.
+[SecItem.h](https://github.com/apple-oss-distributions/Security/blob/main/keychain/headers/SecItem.h)
+documents `kSecAttrAccessibleAfterFirstUnlock` as access contingent on an
+actual device unlock. MachGate has no backend implementing that protected
+persistence contract. SecItem operations therefore return `errSecNotAvailable`
+and clear optional output pointers; an in-memory dictionary is not a keychain.
+
+Swift Foundation's [NSKeyedArchiver.swift](https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSKeyedArchiver.swift)
+encodes an object graph and propagates archive errors. Storing an object's
+address as NSData does not encode that graph. MachGate's unsupported keyed
+archive operations return nil and, when requested, an NSError in
+NSCocoaErrorDomain with code 3328. Foundation's
+[NSError.swift](https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSError.swift)
+describes that code as "The requested operation is not supported."
+This is MachGate's explicit unavailable-feature policy, not an implementation
+of Foundation keyed coding.
+
+Sources retrieved 2026-11-09 are preserved under
+`build/repair-round2/storage/`. SecBase.h SHA-256 is
+`a2e2c53dfdc6ebcbfd5c81e351b636de10eb78614f79407049cbbe19eccd872e`;
+SecItem.h is `fa0c0131ffdd3a4bed0882df9f945e87efd1371d5fe3772dd4224ac2bdb391aa`.
+Regression coverage: `tests/test_keychain_agent.sh` exercises guest imports
+with cold and warm caches; `tests/test_keyed_archive_unavailable.sh` verifies
+that archive and unarchive dispatch produce no object and an explicit error.

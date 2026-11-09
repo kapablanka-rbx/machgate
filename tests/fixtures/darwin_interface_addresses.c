@@ -58,7 +58,7 @@ int main(void)
 			const uint8_t* bytes = (const uint8_t*)item->address;
 			if ((unsigned)bytes[5] + bytes[6] + 8 > bytes[0])
 				return 13;
-			if (!item->data)
+			if (item->data)
 				return 17;
 			links++;
 		}

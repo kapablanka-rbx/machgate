@@ -24,4 +24,6 @@ int foundation_archive_readable(const void* address, size_t size);
 void foundation_archive_forget_object(void* object);
 void machgate_shim_register_objc_class(void* class_object);
 
+const char* foundation_archive_guest_class_name(const void* class_object);
+
 #endif

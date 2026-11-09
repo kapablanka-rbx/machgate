@@ -23,4 +23,4 @@ for mode in stub strict; do
             "$BUILD_DIR/machgate" "$WORK_DIR/guest"
     done
 done
-echo 'Darwin UDP sysctls and interface byte counters passed'
+echo 'Darwin unavailable network metrics preserve errors, buffers and interface addresses'

@@ -3252,6 +3252,26 @@ static int dispatch_dictionary(void* receiver, const char* selector,
     return 1;
 }
 
+static int dispatch_keyed_archiver(void* receiver, const char* selector,
+    uintptr_t object, uintptr_t error_pointer, uintptr_t* result)
+{
+    (void)object;
+    const char* class_name = foundation_archive_guest_class_name(receiver);
+    if (!class_name)
+        return 0;
+    int archive = strcmp(class_name, "NSKeyedArchiver") == 0 &&
+        strcmp(selector, "archivedDataWithRootObject:requiringSecureCoding:error:") == 0;
+    int unarchive = strcmp(class_name, "NSKeyedUnarchiver") == 0 &&
+        strcmp(selector, "unarchivedObjectOfClass:fromData:error:") == 0;
+    if (!archive && !unarchive)
+        return 0;
+    *result = 0;
+    if (error_pointer)
+        *(void**)error_pointer = shim_objc_make_error("NSCocoaErrorDomain", 3328,
+            "Keyed archives are not supported by MachGate", NULL);
+    return 1;
+}
+
 int foundation_archive_dispatch(void* receiver, const char* selector,
     const uintptr_t arguments[6], const uintptr_t* stack, void* indirect_result,
     double floating_argument, uintptr_t* result, double* floating_result)
@@ -3285,6 +3305,9 @@ int foundation_archive_dispatch(void* receiver, const char* selector,
         *result = 0;
         return 1;
     }
+    if (dispatch_keyed_archiver(receiver, selector, arguments[0], arguments[2],
+            result))
+        return 1;
     *result = (uintptr_t)archive_message_impl(receiver, (void*)selector,
         arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
         indirect_result, stack);

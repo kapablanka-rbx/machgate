@@ -91,13 +91,7 @@ int main(void)
 	assert(strcmp(addresses->name, "test0") == 0);
 	assert(addresses->name != host_interfaces[0].ifa_name);
 	assert(addresses->flags == 0x8041);
-	assert(addresses->data != NULL);
-	const unsigned char* statistics = addresses->data;
-	uint32_t statistic;
-	memcpy(&statistic, statistics + 40, sizeof(statistic));
-	assert(statistic == 0);
-	memcpy(&statistic, statistics + 44, sizeof(statistic));
-	assert(statistic == 0);
+	assert(addresses->data == NULL);
 	const unsigned char* bytes = addresses->address;
 	assert(bytes[0] == 20 && bytes[1] == 18 && bytes[2] == 7 && bytes[3] == 0);
 	assert(bytes[4] == 6 && bytes[5] == 5 && bytes[6] == 6 && bytes[7] == 0);

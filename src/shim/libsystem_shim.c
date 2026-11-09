@@ -12,6 +12,7 @@
 #include "pthread_attr_compat.h"
 #include "thread_local_compat.h"
 #include "kqueue_compat.h"
+#include "keychain_compat.h"
 #include "variadic_abi_compat.h"
 #include "guest_process_runtime.h"
 #include "native_provider_guest_import.h"
@@ -1747,13 +1748,24 @@ CFArrayRef SecTrustCopyCertificateChain(SecTrustRef trust)
 	return CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
 }
 
+OSStatus SecItemAdd(CFDictionaryRef attributes, const void** result)
+{
+	return machgate_keychain_add(attributes, result);
+}
+
 OSStatus SecItemCopyMatching(CFDictionaryRef query, const void** result)
 {
-	(void)query;
+	return machgate_keychain_copy_matching(query, result);
+}
 
-	if (result)
-		*result = NULL;
-	return -25300;
+OSStatus SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributes_to_update)
+{
+	return machgate_keychain_update(query, attributes_to_update);
+}
+
+OSStatus SecItemDelete(CFDictionaryRef query)
+{
+	return machgate_keychain_delete(query);
 }
 
 CFDictionaryRef SecPolicyCopyProperties(SecPolicyRef policy)
