@@ -1,0 +1,22 @@
+.text
+.macro function_import name
+.globl _\name
+_\name:
+	ret
+.endm
+function_import __cxa_throw
+function_import __cxa_allocate_exception
+function_import __cxa_begin_catch
+function_import __cxa_end_catch
+function_import __cxa_rethrow
+function_import __cxa_current_primary_exception
+function_import __cxa_increment_exception_refcount
+function_import __cxa_decrement_exception_refcount
+function_import __cxa_rethrow_primary_exception
+function_import __gxx_personality_v0
+function_import _Unwind_Resume
+function_import write
+function_import _ZSt9terminatev
+.globl dyld_stub_binder
+dyld_stub_binder:
+	ret
