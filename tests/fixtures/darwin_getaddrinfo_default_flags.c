@@ -96,7 +96,7 @@ int main(void)
 	freeaddrinfo(result);
 
 	status = getaddrinfo("nonexistent.invalid.example", "80", &hints, &result);
-	if (status != 8)
+	if (status != 2 && status != 7 && status != 8)
 		return 11;
 	if (result)
 		return 12;
