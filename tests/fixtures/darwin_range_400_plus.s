@@ -219,7 +219,7 @@ _main:
 
     adrp x0, fsgetpath_buf@PAGE
     add x0, x0, fsgetpath_buf@PAGEOFF
-    mov x1, #64
+    mov x1, #4096
     adrp x2, fsid_buf@PAGE
     add x2, x2, fsid_buf@PAGEOFF
     adrp x3, fileid_buf400@PAGE
@@ -2278,7 +2278,7 @@ fileid_buf400:
 fsobj_id400:
 	.space 8
 fsgetpath_buf:
-    .space 64
+    .space 4096
 attrlist_file400:
 	.hword 5
 	.hword 0
