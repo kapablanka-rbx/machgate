@@ -3,6 +3,29 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
+
+int memset_s(void* destination, size_t capacity, int value, size_t length)
+{
+	if (!destination)
+		return 22;
+	if (capacity > (SIZE_MAX >> 1))
+		return 7;
+
+	int result = 0;
+	if (length > (SIZE_MAX >> 1)) {
+		result = 7;
+		length = capacity;
+	} else if (length > capacity) {
+		result = 84;
+		length = capacity;
+	}
+
+	volatile unsigned char* bytes = destination;
+	for (size_t index = 0; index < length; index++)
+		bytes[index] = (unsigned char)value;
+	return result;
+}
 
 FILE* __stdinp;
 FILE* __stdoutp;

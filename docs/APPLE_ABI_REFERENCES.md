@@ -238,6 +238,16 @@ dispatch, and actual Darwin option round trips now check the corrected values.
 Ancillary payloads, linger units, resolver flags, and extended options still
 require the further work recorded in the networking audit.
 
+The imported `getnameinfo` adapter translates Darwin IPv4/IPv6 socket
+addresses, the five standard `NI_*` flags, and resolver error codes. Its
+numeric address/service and short-buffer regressions use Apple's Libinfo
+[`netdb.h`](https://github.com/apple-oss-distributions/Libinfo/blob/main/lookup.subproj/netdb.h),
+[`getnameinfo.3`](https://github.com/apple-oss-distributions/Libinfo/blob/main/lookup.subproj/getnameinfo.3),
+and [`si_getaddrinfo.c`](https://github.com/apple-oss-distributions/Libinfo/blob/main/lookup.subproj/si_getaddrinfo.c)
+as contract references. The archive also lacked this adapter. Darwin-specific
+scope flags are rejected with `EAI_BADFLAGS`; link-layer names and the complete
+Apple resolver policy are not implemented. These tests perform no DNS lookups.
+
 The large-image thread-pointer rewrite uses AArch64 `MOVZ` with a 16-bit
 immediate shifted by 16, checked against the local LLVM
 `llvm/lib/Target/AArch64/AArch64InstrInfo.td`. An executed ARM64 regression
@@ -310,3 +320,23 @@ The whitespace and task-memory repair checked:
   Later revisions and detailed ledger statistics remain unsupported. Tests
   check sizes, boundaries, sentinel preservation, invalid requests and a
   footprint increase after faulting in an allocation.
+
+Darwin memory clearing, thread names and CPU identification use these contracts:
+
+- `Libc/string/NetBSD/memset_s.c` and `Libc/include/stdint.h`: `RSIZE_MAX`
+  is `SIZE_MAX >> 1`; null destinations take precedence, invalid counts still
+  clear the bounded destination, and errors do not modify errno. The shim uses
+  volatile byte stores so optimization cannot remove the clear.
+- `libpthread/src/pthread.c:1161-1203`, `libpthread/src/types_internal.h:141`
+  and `xnu/bsd/kern/proc_info.c:3264`: guest names have 64 bytes of storage;
+  oversized names fail through `__proc_info` with `-1` and Darwin
+  `ENAMETOOLONG`; reads truncate and null names clear the name. Names live in
+  the existing guest thread identity registry; Linux's 15-character process
+  label is a separate host representation.
+- `xnu/bsd/dev/arm64/sysctl.c:268-299`: `machdep.cpu.brand_string` is a
+  read-only, null-terminated string. MachGate reports the generic
+  `ARM architecture processor` fallback rather than an invented Apple model.
+
+`tests/test_memset_s.sh`, `tests/test_thread_name.sh` and
+`tests/test_cpu_brand.sh` execute these contracts as both iOS and macOS guests
+with strict and compatibility import modes and cold/warm preparation caches.

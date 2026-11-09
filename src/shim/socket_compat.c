@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -19,6 +20,14 @@
 #define DARWIN_EAFNOSUPPORT 47
 #define DARWIN_SOL_SOCKET 0xffff
 #define DARWIN_SO_NOSIGPIPE 0x1022
+#define DARWIN_EAI_BADFLAGS 3
+#define DARWIN_EAI_FAIL 4
+#define DARWIN_EAI_FAMILY 5
+#define DARWIN_NI_NOFQDN 0x01
+#define DARWIN_NI_NUMERICHOST 0x02
+#define DARWIN_NI_NAMEREQD 0x04
+#define DARWIN_NI_NUMERICSERV 0x08
+#define DARWIN_NI_DGRAM 0x10
 
 static long socket_result(long result)
 {
@@ -314,6 +323,64 @@ int getsockopt(int fd, int level, int option, void* value,
 			level, option, value, value_len))
 		return (int)socket_result(-1);
 	return 0;
+}
+
+static int darwin_nameinfo_error(int result)
+{
+	switch (result) {
+	case 0: return 0;
+	case EAI_AGAIN: return 2;
+	case EAI_BADFLAGS: return DARWIN_EAI_BADFLAGS;
+	case EAI_FAMILY: return DARWIN_EAI_FAMILY;
+	case EAI_MEMORY: return 6;
+	case EAI_NONAME: return 8;
+	case EAI_SERVICE: return 9;
+	case EAI_SOCKTYPE: return 10;
+	case EAI_SYSTEM:
+		errno = machgate_darwin_socket_errno_from_linux(errno);
+		return 11;
+	case EAI_OVERFLOW: return 14;
+	default: return DARWIN_EAI_FAIL;
+	}
+}
+
+int getnameinfo(const struct sockaddr* address, socklen_t address_len,
+                char* host, socklen_t host_len, char* service,
+                socklen_t service_len, int flags)
+{
+	int (*host_getnameinfo)(const struct sockaddr*, socklen_t,
+	                       char*, socklen_t, char*, socklen_t, int);
+	struct sockaddr_storage linux_address;
+	socklen_t linux_length;
+	int linux_flags = 0;
+	const int supported_flags = DARWIN_NI_NOFQDN | DARWIN_NI_NUMERICHOST |
+	                            DARWIN_NI_NAMEREQD | DARWIN_NI_NUMERICSERV |
+	                            DARWIN_NI_DGRAM;
+
+	if (flags & ~supported_flags)
+		return DARWIN_EAI_BADFLAGS;
+	if (!address || address_len < 2)
+		return DARWIN_EAI_FAIL;
+	const unsigned char* bytes = (const unsigned char*)address;
+	if (bytes[1] != 2 && bytes[1] != 30)
+		return DARWIN_EAI_FAMILY;
+	if (!machgate_darwin_sockaddr_to_linux(address, address_len,
+	                                      &linux_address, &linux_length))
+		return DARWIN_EAI_FAIL;
+	if (flags & DARWIN_NI_NOFQDN) linux_flags |= NI_NOFQDN;
+	if (flags & DARWIN_NI_NUMERICHOST) linux_flags |= NI_NUMERICHOST;
+	if (flags & DARWIN_NI_NAMEREQD) linux_flags |= NI_NAMEREQD;
+	if (flags & DARWIN_NI_NUMERICSERV) linux_flags |= NI_NUMERICSERV;
+	if (flags & DARWIN_NI_DGRAM) linux_flags |= NI_DGRAM;
+	host_getnameinfo = (int (*)(const struct sockaddr*, socklen_t,
+	                          char*, socklen_t, char*, socklen_t, int))
+		dlsym(RTLD_NEXT, "getnameinfo");
+	if (!host_getnameinfo)
+		return DARWIN_EAI_FAIL;
+	int result = host_getnameinfo((const struct sockaddr*)&linux_address,
+	                             linux_length, host, host_len, service,
+	                             service_len, linux_flags);
+	return darwin_nameinfo_error(result);
 }
 
 int inet_pton(int family, const char* source, void* destination)

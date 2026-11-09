@@ -55,6 +55,7 @@ enum darwin_sysctl_value_kind {
 	DARWIN_SYSCTL_ARGUMENT_LIMIT,
 	DARWIN_SYSCTL_BYTE_ORDER,
 	DARWIN_SYSCTL_CPU_TYPE,
+	DARWIN_SYSCTL_CPU_BRAND,
 	DARWIN_SYSCTL_HOSTNAME,
 	DARWIN_SYSCTL_MACHINE,
 	DARWIN_SYSCTL_MEMORY_SIZE,
@@ -101,6 +102,7 @@ static const struct darwin_sysctl_entry darwin_sysctl_entries[] = {
 	{ "hw.optional.arm64", 0, 0, DARWIN_SYSCTL_OPTIONAL_ARM64, 0 },
 	{ "machdep.cpu.core_count", 0, 0, DARWIN_SYSCTL_ACTIVE_CPU_COUNT, 0 },
 	{ "machdep.cpu.thread_count", 0, 0, DARWIN_SYSCTL_ACTIVE_CPU_COUNT, 0 },
+	{ "machdep.cpu.brand_string", 0, 0, DARWIN_SYSCTL_CPU_BRAND, 0 },
 };
 
 static const char darwin_machine[] = "arm64";
@@ -255,6 +257,8 @@ static int read_entry(const struct darwin_sysctl_entry* entry, void* output,
 		return copy_integer(1234, output, output_size);
 	case DARWIN_SYSCTL_CPU_TYPE:
 		return copy_integer(DARWIN_CPU_TYPE_ARM64, output, output_size);
+	case DARWIN_SYSCTL_CPU_BRAND:
+		return copy_string("ARM architecture processor", output, output_size);
 	case DARWIN_SYSCTL_HOSTNAME:
 		return copy_hostname(output, output_size);
 	case DARWIN_SYSCTL_MACHINE:
@@ -342,6 +346,11 @@ int sysctlbyname(const char* name, void* output, size_t* output_size,
 	const struct darwin_sysctl_entry* entry = find_named_entry(name);
 	if (!entry) {
 		errno = ENOENT;
+		return -1;
+	}
+	if (entry->value_kind == DARWIN_SYSCTL_CPU_BRAND &&
+	    (replacement || replacement_size)) {
+		errno = EPERM;
 		return -1;
 	}
 	return read_entry(entry, output, output_size);

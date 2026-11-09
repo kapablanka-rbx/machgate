@@ -4,6 +4,7 @@
 
 #include "guest_symbols.h"
 #include "loader.h"
+#include "log.h"
 #include "macho_defs.h"
 #include "native_provider_guest_import.h"
 #include "ports/native_unwind.h"
@@ -462,6 +463,19 @@ static void* find_provider_symbol(struct native_provider* provider,
 	if (provider->guest_import_resolver &&
 	    provider->guest_import_resolver(native_name, &symbol))
 		return symbol;
+	static const struct {
+		const char* guest_name;
+		const char* native_name;
+	} binary64_conversions[] = {
+		{"_ZNSt3__15stoldERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPm",
+		 "_ZNSt3__14stodERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPm"},
+		{"_ZNSt3__15stoldERKNS_12basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEEEPm",
+		 "_ZNSt3__14stodERKNS_12basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEEEPm"},
+	};
+	for (size_t index = 0; index < sizeof(binary64_conversions) / sizeof(binary64_conversions[0]); index++) {
+		if (strcmp(native_name, binary64_conversions[index].guest_name) == 0)
+			return dlsym(provider->handle, binary64_conversions[index].native_name);
+	}
 	return dlsym(provider->handle, native_name);
 }
 
@@ -946,7 +960,7 @@ static int write_pointer(struct import_context* context,
 				         state->symbol);
 				return -1;
 			}
-			fprintf(stderr,
+			machgate_log_startup(
 			        "machgate: unresolved import %s from %s uses compatibility storage\n",
 			        state->symbol, provider_description(context, state));
 		} else if (action == UNRESOLVED_IMPORT_ERROR) {
@@ -1258,7 +1272,7 @@ static int resolve_chained_bind(struct import_context* context,
 				         import->symbol);
 				return -1;
 			}
-			fprintf(stderr,
+			machgate_log_startup(
 			        "machgate: unresolved import %s from %s uses compatibility storage\n",
 			        import->symbol, provider_description(context, &state));
 		} else if (action == UNRESOLVED_IMPORT_ERROR) {

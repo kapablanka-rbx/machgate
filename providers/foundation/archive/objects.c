@@ -36,12 +36,12 @@ static void* archive_copy_block(void* block)
     return copy ? copy(block) : block;
 }
 
-static void archive_invoke_block(void* block)
+static void archive_invoke_block(void* block, void* argument)
 {
-    struct block_layout { void* isa; int flags, reserved; void (*invoke)(void*); };
+    struct block_layout { void* isa; int flags, reserved; void (*invoke)(void*, void*); };
     const struct block_layout* value = block;
     if (value && value->invoke)
-        value->invoke(block);
+        value->invoke(block, argument);
 }
 
 static int archive_host_open(const char* path, int flags, unsigned mode)
@@ -96,6 +96,8 @@ enum shim_objc_kind {
 	SHIM_OBJC_CLASS_GENERIC,
 	SHIM_OBJC_CLASS_NSBUNDLE,
 	SHIM_OBJC_INSTANCE_NSBUNDLE,
+	SHIM_OBJC_NOTIFICATION_CENTER,
+	SHIM_OBJC_NOTIFICATION_OBSERVER,
 };
 
 struct shim_objc_header {
@@ -173,6 +175,8 @@ struct shim_objc_property {
 
 struct shim_objc_notification {
 	struct shim_objc_header header;
+	void* name;
+	void* object;
 	void* block;
 	struct shim_objc_notification* next;
 };
@@ -280,10 +284,6 @@ static struct shim_objc_header shim_cookie_storage_singleton = {
 
 static struct shim_objc_header shim_filemanager_singleton = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSFILEMANAGER,
-};
-
-static struct shim_objc_header shim_nserror_singleton = {
-	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSERROR,
 };
 
 static struct shim_objc_header shim_characterset_singleton = {
@@ -1201,7 +1201,7 @@ struct shim_objc_header OBJC_CLASS_$_NSError = {
 };
 
 struct shim_objc_notification_center OBJC_CLASS_$_NSNotificationCenter = {
-	{ SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_GENERIC },
+	{ SHIM_OBJC_MAGIC, SHIM_OBJC_NOTIFICATION_CENTER },
 	PTHREAD_MUTEX_INITIALIZER,
 	NULL,
 	0,
@@ -1216,12 +1216,64 @@ const void* const NSHTTPCookieManagerCookiesChangedNotification =
 	&shim_nshttp_cookies_changed_notification;
 
 static struct shim_objc_notification_center shim_notification_center_singleton = {
-	{ SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_GENERIC },
+	{ SHIM_OBJC_MAGIC, SHIM_OBJC_NOTIFICATION_CENTER },
 	PTHREAD_MUTEX_INITIALIZER,
 	NULL,
 	0,
 	0,
 };
+
+static void shim_notification_release_block(void* block)
+{
+	void (*release)(void*) = foundation_shim_symbol("_Block_release");
+	if (release)
+		release(block);
+}
+
+static void shim_notification_post(struct shim_objc_notification_center* center,
+                                  void* name, void* object, void* user_info)
+{
+	const char* name_text = shim_objc_string_utf8(name);
+	if (!name_text)
+		return;
+	pthread_mutex_lock(&center->mutex);
+	void** blocks = calloc(center->observer_count ? center->observer_count : 1,
+	                       sizeof(*blocks));
+	if (!blocks) {
+		pthread_mutex_unlock(&center->mutex);
+		return;
+	}
+	size_t count = 0;
+	for (struct shim_objc_notification* observer = center->observers;
+	     observer; observer = observer->next) {
+		const char* expected = shim_objc_string_utf8(observer->name);
+		if (observer->name && (!expected || strcmp(expected, name_text) != 0))
+			continue;
+		if (observer->object && observer->object != object)
+			continue;
+		blocks[count++] = archive_copy_block(observer->block);
+	}
+	pthread_mutex_unlock(&center->mutex);
+	struct shim_objc_generic_object* notification = shim_objc_make_generic();
+	if (notification) {
+		shim_objc_generic_set_property(notification, "name", foundation_retain(name));
+		shim_objc_generic_set_property(notification, "object", foundation_retain(object));
+		shim_objc_generic_set_property(notification, "userInfo", foundation_retain(user_info));
+	}
+	for (size_t index = 0; index < count; index++) {
+		if (notification)
+			archive_invoke_block(blocks[index], notification);
+		shim_notification_release_block(blocks[index]);
+	}
+	free(blocks);
+}
+
+static void shim_cookie_storage_notify(void)
+{
+	shim_notification_post(&shim_notification_center_singleton,
+	                       (void*)NSHTTPCookieManagerCookiesChangedNotification,
+	                       &shim_cookie_storage_singleton, NULL);
+}
 
 static int shim_cookie_path_matches(const char* cookie_path, const char* url_path)
 {
@@ -1759,13 +1811,15 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 		return &shim_notification_center_singleton;
 	} else if (strcmp(selector, "addObserverForName:object:queue:usingBlock:") == 0) {
 		struct shim_objc_notification_center* center = receiver;
-		if (shim_objc_is_object(center, SHIM_OBJC_INSTANCE_GENERIC)) {
+		if (shim_objc_is_object(center, SHIM_OBJC_NOTIFICATION_CENTER)) {
 			struct shim_objc_notification* observer =
 				malloc(sizeof(*observer));
 			if (!observer)
 				return NULL;
 			observer->header.magic = SHIM_OBJC_MAGIC;
-			observer->header.kind = SHIM_OBJC_INSTANCE_GENERIC;
+			observer->header.kind = SHIM_OBJC_NOTIFICATION_OBSERVER;
+			observer->name = foundation_retain((void*)a2);
+			observer->object = foundation_retain((void*)a3);
 			observer->block = archive_copy_block((void*)a5);
 			pthread_mutex_lock(&center->mutex);
 			observer->next = center->observers;
@@ -1776,14 +1830,20 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 		}
 	} else if (strcmp(selector, "removeObserver:") == 0) {
 		struct shim_objc_notification_center* center = receiver;
-		if (shim_objc_is_object(center, SHIM_OBJC_INSTANCE_GENERIC)) {
+		if (shim_objc_is_object(center, SHIM_OBJC_NOTIFICATION_CENTER)) {
 			pthread_mutex_lock(&center->mutex);
 			struct shim_objc_notification** link = &center->observers;
 			while (*link) {
 				if (*link == (void*)a2) {
-					*link = (*link)->next;
+					struct shim_objc_notification* removed = *link;
+					*link = removed->next;
 					center->observer_count--;
-					break;
+					pthread_mutex_unlock(&center->mutex);
+					shim_notification_release_block(removed->block);
+					foundation_release(removed->name);
+					foundation_release(removed->object);
+					free(removed);
+					return NULL;
 				}
 				link = &(*link)->next;
 			}
@@ -1793,15 +1853,10 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 	} else if (strcmp(selector, "postNotificationName:object:") == 0 ||
 	           strcmp(selector, "postNotificationName:object:userInfo:") == 0) {
 		struct shim_objc_notification_center* center = receiver;
-		if (shim_objc_is_object(center, SHIM_OBJC_INSTANCE_GENERIC)) {
-			pthread_mutex_lock(&center->mutex);
-			struct shim_objc_notification* observer = center->observers;
-			while (observer) {
-				if (observer->block)
-					archive_invoke_block(observer->block);
-				observer = observer->next;
-			}
-			pthread_mutex_unlock(&center->mutex);
+		if (shim_objc_is_object(center, SHIM_OBJC_NOTIFICATION_CENTER)) {
+			void* user_info = strcmp(selector, "postNotificationName:object:userInfo:") == 0
+				? (void*)a4 : NULL;
+			shim_notification_post(center, (void*)a2, (void*)a3, user_info);
 			return NULL;
 		}
 	} else if (strcmp(selector, "operatingSystemVersion") == 0) {
@@ -1937,6 +1992,7 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 					shim_cookie_jar_store(&stored);
 				}
 				pthread_mutex_unlock(&shim_cookie_jar_mutex);
+				shim_cookie_storage_notify();
 			}
 			return NULL;
 		}
@@ -1948,6 +2004,7 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 				pthread_mutex_lock(&shim_cookie_jar_mutex);
 				shim_cookie_jar_remove(&cookie->cookie);
 				pthread_mutex_unlock(&shim_cookie_jar_mutex);
+				shim_cookie_storage_notify();
 			}
 			return NULL;
 		}
@@ -2147,8 +2204,12 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 				return NULL;
 			input = fopen(path_text, "rb");
 			if (!input) {
+				int result = errno;
+				long long error_code = result == ENOENT ? 260 :
+					result == EACCES ? 257 : 256;
 				if (error_out)
-					*error_out = &shim_nserror_singleton;
+					*error_out = shim_objc_make_error(
+						"NSCocoaErrorDomain", error_code, strerror(result), NULL);
 				return NULL;
 			}
 			if (error_out)
@@ -2699,6 +2760,7 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 				pthread_mutex_lock(&shim_cookie_jar_mutex);
 				shim_cookie_jar_store(&cookie->cookie);
 				pthread_mutex_unlock(&shim_cookie_jar_mutex);
+				shim_cookie_storage_notify();
 			}
 			return NULL;
 		}

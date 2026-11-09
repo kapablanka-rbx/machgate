@@ -32,6 +32,7 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/eventfd.h>
@@ -3458,6 +3459,7 @@ struct pthread_id_slot {
 	pthread_t thread;
 	uint32_t tid;
 	uint64_t identity;
+	char name[64];
 };
 
 struct shim_thread_start_context {
@@ -4634,24 +4636,51 @@ int pthread_self_is_exiting_np(void)
 
 int pthread_setname_np(pthread_t thread, const char *name)
 {
-	static int (*real_pthread_setname_np)(pthread_t, const char*) = NULL;
-	char truncated_name[16];
 	const char* darwin_name = (const char*)thread;
-
 	(void)name;
+	size_t length = darwin_name ? strlen(darwin_name) : 0;
+	if (length >= sizeof(pthread_id_slots[0].name)) {
+		errno = 63;
+		return -1;
+	}
 
-	if (!real_pthread_setname_np)
-		real_pthread_setname_np = dlsym(RTLD_NEXT, "pthread_setname_np");
-	if (!real_pthread_setname_np)
-		return 0;
-	if (!darwin_name)
-		return EINVAL;
+	char host_name[16] = {0};
+	if (length)
+		memcpy(host_name, darwin_name, length < 15 ? length : 15);
+	int result = syscall(SYS_prctl, PR_SET_NAME, host_name, 0, 0, 0);
+	if (result < 0) {
+		errno = machgate_darwin_errno_from_linux(errno);
+		return -1;
+	}
 
-	snprintf(truncated_name, sizeof(truncated_name), "%s", darwin_name);
-	if (shim_trace_enabled())
-		fprintf(stderr, "libsystem_shim: pthread_setname_np('%s')\n",
-		        truncated_name);
-	return real_pthread_setname_np(pthread_self(), truncated_name);
+	lock_pthread_id_slots();
+	struct pthread_id_slot* slot = alloc_pthread_id_slot_unlocked(pthread_self());
+	if (slot) {
+		if (length)
+			memcpy(slot->name, darwin_name, length);
+		slot->name[length] = 0;
+	}
+	unlock_pthread_id_slots();
+	if (!slot) {
+		errno = 12;
+		return -1;
+	}
+	return 0;
+}
+
+int pthread_getname_np(pthread_t thread, char* name, size_t capacity)
+{
+	lock_pthread_id_slots();
+	struct pthread_id_slot* slot = find_pthread_id_slot_unlocked(thread);
+	if (slot && capacity) {
+		size_t length = strlen(slot->name);
+		if (length >= capacity)
+			length = capacity - 1;
+		memcpy(name, slot->name, length);
+		name[length] = 0;
+	}
+	unlock_pthread_id_slots();
+	return slot ? 0 : 3;
 }
 
 #define DARWIN_SS_ONSTACK 1
