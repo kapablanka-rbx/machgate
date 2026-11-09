@@ -2061,6 +2061,10 @@ void CFRelease(const void* object)
 #define DARWIN_AI_PASSIVE 0x1
 #define DARWIN_AI_CANONNAME 0x2
 #define DARWIN_AI_NUMERICHOST 0x4
+#define DARWIN_AI_ALL 0x100
+#define DARWIN_AI_V4MAPPED_CFG 0x200
+#define DARWIN_AI_ADDRCONFIG 0x400
+#define DARWIN_AI_V4MAPPED 0x800
 #define DARWIN_AI_NUMERICSERV 0x1000
 
 struct darwin_addrinfo {
@@ -2183,6 +2187,12 @@ static int darwin_ai_flags_to_linux(int flags)
 		result |= AI_CANONNAME;
 	if (flags & DARWIN_AI_NUMERICHOST)
 		result |= AI_NUMERICHOST;
+	if (flags & DARWIN_AI_ALL)
+		result |= AI_ALL;
+	if (flags & DARWIN_AI_ADDRCONFIG)
+		result |= AI_ADDRCONFIG;
+	if (flags & (DARWIN_AI_V4MAPPED | DARWIN_AI_V4MAPPED_CFG))
+		result |= AI_V4MAPPED;
 #ifdef AI_NUMERICSERV
 	if (flags & DARWIN_AI_NUMERICSERV)
 		result |= AI_NUMERICSERV;
@@ -2283,6 +2293,36 @@ static struct darwin_addrinfo* copy_linux_addrinfo_to_darwin(
 	return head;
 }
 
+static void reorder_addrinfo_ipv6_first(struct darwin_addrinfo** info)
+{
+	struct darwin_addrinfo* v6_head = NULL;
+	struct darwin_addrinfo** v6_tail = &v6_head;
+	struct darwin_addrinfo* other_head = NULL;
+	struct darwin_addrinfo** other_tail = &other_head;
+	struct darwin_addrinfo* current = *info;
+	struct darwin_addrinfo* next;
+
+	while (current) {
+		next = current->next;
+		current->next = NULL;
+		if (current->family == DARWIN_AF_INET6) {
+			*v6_tail = current;
+			v6_tail = &current->next;
+		} else {
+			*other_tail = current;
+			other_tail = &current->next;
+		}
+		current = next;
+	}
+
+	if (v6_head) {
+		*v6_tail = other_head;
+		*info = v6_head;
+	} else {
+		*info = other_head;
+	}
+}
+
 int getaddrinfo(const char* node, const char* service,
                 const struct addrinfo* hints, struct addrinfo** result)
 {
@@ -2297,6 +2337,7 @@ int getaddrinfo(const char* node, const char* service,
 	struct addrinfo* linux_result = NULL;
 	struct darwin_addrinfo* darwin_result;
 	int linux_error;
+	int darwin_default_flags;
 
 	if (!result)
 		return DARWIN_EAI_FAIL;
@@ -2305,6 +2346,7 @@ int getaddrinfo(const char* node, const char* service,
 
 	*result = NULL;
 	memset(&linux_hints, 0, sizeof(linux_hints));
+	darwin_default_flags = !darwin_hints || darwin_hints->flags == 0;
 	if (darwin_hints) {
 		linux_hints.ai_flags = darwin_ai_flags_to_linux(darwin_hints->flags);
 		linux_hints.ai_family =
@@ -2317,8 +2359,27 @@ int getaddrinfo(const char* node, const char* service,
 	linux_error = real_getaddrinfo(node, service,
 	                               darwin_hints ? &linux_hints : NULL,
 	                               &linux_result);
-	if (linux_error != 0)
+	if (linux_error != 0 && darwin_default_flags) {
+		struct addrinfo default_hints = linux_hints;
+#ifdef AI_V4MAPPED
+		default_hints.ai_flags |= AI_V4MAPPED;
+#endif
+#ifdef AI_ADDRCONFIG
+		default_hints.ai_flags |= AI_ADDRCONFIG;
+#endif
+		if (default_hints.ai_flags != linux_hints.ai_flags) {
+			linux_error = real_getaddrinfo(node, service, &default_hints,
+			                               &linux_result);
+		}
+	}
+	if (linux_error != 0) {
+#ifdef EAI_ADDRFAMILY
+		if (linux_error == EAI_ADDRFAMILY && darwin_hints &&
+		    darwin_hints->family == 30)
+			return DARWIN_EAI_NONAME;
+#endif
 		return darwin_gai_error_from_linux(linux_error);
+	}
 
 	darwin_result = copy_linux_addrinfo_to_darwin(linux_result);
 	real_freeaddrinfo(linux_result);
@@ -2327,6 +2388,9 @@ int getaddrinfo(const char* node, const char* service,
 			return DARWIN_EAI_MEMORY;
 		return DARWIN_EAI_NONAME;
 	}
+
+	if (!darwin_hints || darwin_hints->family == 0)
+		reorder_addrinfo_ipv6_first(&darwin_result);
 
 	*result = (struct addrinfo*)darwin_result;
 	if (shim_trace_enabled())
