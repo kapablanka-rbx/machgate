@@ -122,6 +122,8 @@ struct shim_cookie {
 	char path[1024];
 	int secure;
 	int http_only;
+	time_t expires_at;
+	int has_expiry;
 };
 
 struct shim_objc_cookie {
@@ -518,6 +520,10 @@ static void shim_parse_url_host(const char* url, char* host, size_t host_size)
 	const char* scheme_end = strstr(url, "://");
 	const char* host_start = scheme_end ? scheme_end + 3 : url;
 	const char* host_end = strchr(host_start, '/');
+	const char* port_start = strchr(host_start, ':');
+
+	if (port_start && (!host_end || port_start < host_end))
+		host_end = port_start;
 
 	if (!host_end)
 		host_end = host_start + strlen(host_start);
@@ -1217,19 +1223,76 @@ static struct shim_objc_notification_center shim_notification_center_singleton =
 	0,
 };
 
-static void* shim_cookie_jar_matching_array(const char* url)
+static int shim_cookie_path_matches(const char* cookie_path, const char* url_path)
+{
+	size_t cookie_length = strlen(cookie_path);
+	size_t url_length = strlen(url_path);
+
+	if (cookie_length == 0)
+		return 1;
+	if (strncmp(url_path, cookie_path, cookie_length) != 0)
+		return 0;
+	if (url_length == cookie_length)
+		return 1;
+	if (cookie_path[cookie_length - 1] == '/')
+		return 1;
+	return url_path[cookie_length] == '/';
+}
+
+static int shim_cookie_matches_url(const struct shim_cookie* cookie,
+                                   const char* url)
 {
 	char host[256];
+	const char* scheme_end;
+	const char* path_start;
+	const char* query_start;
+	char url_path[1024];
+	size_t path_length;
+	time_t now;
+
+	shim_parse_url_host(url, host, sizeof(host));
+	if (!shim_domain_matches_host(cookie->domain, host))
+		return 0;
+
+	if (cookie->secure && strncmp(url, "https", 5) != 0)
+		return 0;
+
+	scheme_end = strstr(url, "://");
+	path_start = strchr(scheme_end ? scheme_end + 3 : url, '/');
+	query_start = strchr(url, '?');
+	if (!path_start)
+		path_start = "";
+	if (!query_start || query_start < path_start)
+		query_start = url + strlen(url);
+	path_length = (size_t)(query_start - path_start);
+	if (path_length >= sizeof(url_path))
+		path_length = sizeof(url_path) - 1;
+	memcpy(url_path, path_start, path_length);
+	url_path[path_length] = '\0';
+
+	if (!shim_cookie_path_matches(cookie->path, url_path))
+		return 0;
+
+	if (cookie->has_expiry) {
+		now = time(NULL);
+		if (now >= cookie->expires_at)
+			return 0;
+	}
+	return 1;
+}
+
+static void* shim_cookie_jar_matching_array(const char* url)
+{
 	struct shim_objc_cookie** cookies;
 	uint32_t match_count = 0;
 
-	shim_parse_url_host(url ? url : "", host, sizeof(host));
 	cookies = malloc(sizeof(*cookies) * (shim_cookie_jar_count ? shim_cookie_jar_count : 1));
 	if (!cookies)
 		return NULL;
 
 	for (uint32_t index = 0; index < shim_cookie_jar_count; index++) {
-		if (!shim_domain_matches_host(shim_cookie_jar[index].domain, host))
+		if (!shim_cookie_matches_url(&shim_cookie_jar[index],
+		                             url ? url : ""))
 			continue;
 		void* cookie = shim_objc_make_cookie(&shim_cookie_jar[index]);
 		if (!cookie)
@@ -1271,6 +1334,51 @@ static void* shim_cookie_jar_all_array(void)
 		((struct shim_objc_string**)result->elements)[index] = cookie;
 	}
 	return result;
+}
+
+static int shim_parse_http_month(const char* name)
+{
+	static const char* const months[] = {
+		"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+		"Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+	};
+
+	for (int index = 0; index < 12; index++) {
+		if (strncasecmp(name, months[index], 3) == 0)
+			return index;
+	}
+	return -1;
+}
+
+static time_t shim_parse_http_date(const char* text)
+{
+	int day = 0;
+	int year = 0;
+	int hour = 0;
+	int minute = 0;
+	int second = 0;
+	char month_text[8];
+	struct tm parsed;
+
+	if (sscanf(text, "%*3s %d %3s %d %d:%d:%d", &day, month_text,
+	           &year, &hour, &minute, &second) >= 6)
+		;
+	else if (sscanf(text, "%*3s, %d %3s %d %d:%d:%d", &day, month_text,
+	                &year, &hour, &minute, &second) >= 6)
+		;
+	else
+		return 0;
+	int month = shim_parse_http_month(month_text);
+	if (month < 0)
+		return 0;
+	memset(&parsed, 0, sizeof(parsed));
+	parsed.tm_mday = day;
+	parsed.tm_mon = month;
+	parsed.tm_year = year - 1900;
+	parsed.tm_hour = hour;
+	parsed.tm_min = minute;
+	parsed.tm_sec = second;
+	return timegm(&parsed);
 }
 
 static void shim_parse_set_cookie_header(const char* header, struct shim_cookie* cookie)
@@ -1336,6 +1444,35 @@ static void shim_parse_set_cookie_header(const char* header, struct shim_cookie*
 			cookie->secure = 1;
 		} else if (strncasecmp(attribute, "httponly", 8) == 0) {
 			cookie->http_only = 1;
+		} else if (strncasecmp(attribute, "expires=", 8) == 0) {
+			char date_text[64];
+			size_t date_length = 0;
+			const char* date_value = attribute + 8;
+			while (date_value[date_length] && date_value[date_length] != ';' &&
+			       date_length < sizeof(date_text) - 1) {
+				date_text[date_length] = date_value[date_length];
+				date_length++;
+			}
+			date_text[date_length] = '\0';
+			time_t expires_at = shim_parse_http_date(date_text);
+			if (expires_at != 0) {
+				cookie->expires_at = expires_at;
+				cookie->has_expiry = 1;
+			}
+		} else if (strncasecmp(attribute, "max-age=", 8) == 0) {
+			char age_text[16];
+			size_t age_length = 0;
+			const char* age_value = attribute + 8;
+			long age_seconds;
+			while (age_value[age_length] && age_value[age_length] != ';' &&
+			       age_length < sizeof(age_text) - 1) {
+				age_text[age_length] = age_value[age_length];
+				age_length++;
+			}
+			age_text[age_length] = '\0';
+			age_seconds = strtol(age_text, NULL, 10);
+			cookie->expires_at = time(NULL) + age_seconds;
+			cookie->has_expiry = 1;
 		}
 		attribute = strchr(attribute, ';');
 	}
