@@ -2364,9 +2364,6 @@ int getaddrinfo(const char* node, const char* service,
 #ifdef AI_V4MAPPED
 		default_hints.ai_flags |= AI_V4MAPPED;
 #endif
-#ifdef AI_ADDRCONFIG
-		default_hints.ai_flags |= AI_ADDRCONFIG;
-#endif
 		if (default_hints.ai_flags != linux_hints.ai_flags) {
 			linux_error = real_getaddrinfo(node, service, &default_hints,
 			                               &linux_result);
