@@ -8,17 +8,53 @@
 #include <netinet/in.h>
 #include <netpacket/packet.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define DARWIN_AF_LINK 18
 #define DARWIN_IFF_MULTICAST 0x8000
 
+struct darwin_if_data {
+	unsigned char ifi_type;
+	unsigned char ifi_typelen;
+	unsigned char ifi_physical;
+	unsigned char ifi_addrlen;
+	unsigned char ifi_hdrlen;
+	unsigned char ifi_recvquota;
+	unsigned char ifi_xmitquota;
+	unsigned char ifi_unused1;
+	uint32_t mtu;
+	uint32_t metric;
+	uint32_t baudrate;
+	uint32_t input_packets;
+	uint32_t input_errors;
+	uint32_t output_packets;
+	uint32_t output_errors;
+	uint32_t collisions;
+	uint32_t input_bytes;
+	uint32_t output_bytes;
+	uint32_t input_multicast_packets;
+	uint32_t output_multicast_packets;
+	uint32_t input_drops;
+	uint32_t unsupported_protocol;
+	uint32_t receive_timing;
+	uint32_t transmit_timing;
+	uint8_t last_change[16];
+	uint32_t unused;
+	uint32_t hardware_assist;
+	uint32_t reserved[2];
+};
+
+_Static_assert(sizeof(struct darwin_if_data) == 104,
+	"Darwin LP64 if_data must be 104 bytes");
+
 struct interface_addresses {
 	struct machgate_darwin_ifaddrs interface;
 	unsigned char address[256];
 	unsigned char netmask[256];
 	unsigned char destination[256];
+	struct darwin_if_data data;
 	char name[];
 };
 
@@ -106,6 +142,35 @@ static int translate_address(const struct sockaddr* host_address,
 	return 1;
 }
 
+static uint32_t read_interface_counter(const char* name, const char* counter)
+{
+	char path[256];
+	unsigned long long result = 0;
+
+	int path_length = snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/%s",
+	                           name, counter);
+	if (path_length < 0 || (size_t)path_length >= sizeof(path))
+		return 0;
+	FILE* file = fopen(path, "r");
+	if (!file)
+		return 0;
+	if (fscanf(file, "%llu", &result) != 1)
+		result = 0;
+	fclose(file);
+	return (uint32_t)result;
+}
+
+static void read_interface_statistics(const char* name, struct darwin_if_data* result)
+{
+	result->input_packets = read_interface_counter(name, "rx_packets");
+	result->input_errors = read_interface_counter(name, "rx_errors");
+	result->output_packets = read_interface_counter(name, "tx_packets");
+	result->output_errors = read_interface_counter(name, "tx_errors");
+	result->input_bytes = read_interface_counter(name, "rx_bytes");
+	result->output_bytes = read_interface_counter(name, "tx_bytes");
+	result->input_drops = read_interface_counter(name, "rx_dropped");
+}
+
 static struct machgate_darwin_ifaddrs* copy_interface(const struct ifaddrs* host)
 {
 	const char* name = host->ifa_name ? host->ifa_name : "";
@@ -115,6 +180,13 @@ static struct machgate_darwin_ifaddrs* copy_interface(const struct ifaddrs* host
 	strcpy(result->name, name);
 	result->interface.name = result->name;
 	result->interface.flags = interface_flags(host->ifa_flags);
+	if (host->ifa_addr && host->ifa_addr->sa_family == AF_PACKET) {
+		const struct sockaddr_ll* link = (const struct sockaddr_ll*)host->ifa_addr;
+		result->data.ifi_type = interface_type(link->sll_hatype);
+		result->data.ifi_addrlen = link->sll_halen;
+		result->interface.data = &result->data;
+		read_interface_statistics(name, &result->data);
+	}
 	const struct sockaddr* destination = NULL;
 	if (host->ifa_flags & (IFF_POINTOPOINT | IFF_BROADCAST))
 		destination = host->ifa_dstaddr;

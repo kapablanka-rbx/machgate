@@ -21,6 +21,16 @@ enum darwin_sysctl_kern_proc_selector {
 	DARWIN_SYSCTL_KERN_PROC_PID = 1,
 };
 
+enum darwin_sysctl_network {
+	DARWIN_SYSCTL_NET = 4,
+	DARWIN_SYSCTL_PF_INET = 2,
+	DARWIN_SYSCTL_IPPROTO_UDP = 17,
+	DARWIN_SYSCTL_UDP_STATS = 2,
+	DARWIN_SYSCTL_UDP_PCBLIST = 5,
+	DARWIN_SYSCTL_XINPGEN_SIZE = 16,
+	DARWIN_SYSCTL_UDPSTAT_SIZE = 88,
+};
+
 enum {
 	DARWIN_KINFO_PROC_SIZE = 0x288,
 	DARWIN_PROCESS_TRACED = 0x00000800,
@@ -311,6 +321,53 @@ int sysctlnametomib(const char* name, int* mib, size_t* mib_length)
 	return 0;
 }
 
+static uint32_t count_udp_sockets(void)
+{
+	uint32_t result = 0;
+	FILE* sockets = fopen("/proc/net/udp", "r");
+	char line[512];
+
+	if (!sockets)
+		return 0;
+	while (fgets(line, sizeof(line), sockets)) {
+		unsigned int local_address;
+		unsigned int local_port;
+		if (sscanf(line, " %*u: %x:%x", &local_address, &local_port) == 2)
+			result++;
+	}
+	fclose(sockets);
+	return result;
+}
+
+static int read_udp_pcblist(void* output, size_t* output_size)
+{
+	uint32_t header[4] = {DARWIN_SYSCTL_XINPGEN_SIZE, count_udp_sockets(), 0, 0};
+
+	return copy_result(header, sizeof(header), output, output_size);
+}
+
+static int read_udp_stats(void* output, size_t* output_size)
+{
+	uint32_t statistics[DARWIN_SYSCTL_UDPSTAT_SIZE / sizeof(uint32_t)] = {0};
+
+	return copy_result(statistics, sizeof(statistics), output, output_size);
+}
+
+static int read_network(const int* name, unsigned int name_length, void* output,
+	                    size_t* output_size)
+{
+	if (name_length != 4 || name[2] != DARWIN_SYSCTL_IPPROTO_UDP) {
+		errno = ENOENT;
+		return -1;
+	}
+	if (name[3] == DARWIN_SYSCTL_UDP_PCBLIST)
+		return read_udp_pcblist(output, output_size);
+	if (name[3] == DARWIN_SYSCTL_UDP_STATS)
+		return read_udp_stats(output, output_size);
+	errno = ENOENT;
+	return -1;
+}
+
 int sysctl(const int* name, unsigned int name_length, void* output,
 	   size_t* output_size, const void* replacement, size_t replacement_size)
 {
@@ -322,6 +379,13 @@ int sysctl(const int* name, unsigned int name_length, void* output,
 	    name[1] == DARWIN_SYSCTL_KERN_PROC)
 		return read_current_process(name, name_length, output, output_size,
 		                            replacement, replacement_size);
+	if (name[0] == DARWIN_SYSCTL_NET && name[1] == DARWIN_SYSCTL_PF_INET) {
+		if (replacement || replacement_size) {
+			errno = EPERM;
+			return -1;
+		}
+		return read_network(name, name_length, output, output_size);
+	}
 
 	const struct darwin_sysctl_entry* entry = find_mib_entry(name[0], name[1]);
 	if (!entry) {

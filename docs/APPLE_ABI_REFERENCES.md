@@ -340,3 +340,24 @@ Darwin memory clearing, thread names and CPU identification use these contracts:
 `tests/test_memset_s.sh`, `tests/test_thread_name.sh` and
 `tests/test_cpu_brand.sh` execute these contracts as both iOS and macOS guests
 with strict and compatibility import modes and cold/warm preparation caches.
+
+The lifecycle and host-collector repair checked these contracts:
+
+- XNU `bsd/netinet/udp_usrreq.c::udp_pcblist`,
+  `bsd/netinet/in_pcb.h::xinpgen` and `bsd/netinet/udp_var.h`: UDP PCB-list
+  and statistics sysctls are read-only. The list begins with a 16-byte header
+  whose count is at byte 4; size-only and short-buffer queries follow the
+  existing sysctl copy convention. Linux `/proc/net/udp` supplies the current
+  count. The 88-byte Darwin UDP statistics record is accepted; unmeasured
+  counters remain zero rather than being invented from unrelated Linux data.
+- XNU `bsd/net/if_var.h::if_data`: the packed LP64 record is 104 bytes, with
+  32-bit received and sent byte counters at offsets 40 and 44. Link-level
+  `getifaddrs` entries now own independent records populated from Linux
+  per-interface statistics. Address records have no statistics payload.
+- Linux `proc_net_udp(5)` and `sysfs(5)`: the UDP table includes bound and
+  unbound IPv4 sockets, matching XNU's PCB table scope; sysfs exposes the
+  interface receive/transmit counters used for the Darwin record.
+
+`tests/test_lifecycle_agent.sh` executes an open-socket PCB count, UDP stats,
+size and read-only checks, and link-level byte-counter reads in strict and
+compatibility import modes with cold/warm preparation caches.
