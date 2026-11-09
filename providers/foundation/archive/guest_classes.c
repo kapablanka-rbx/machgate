@@ -30,12 +30,25 @@ struct guest_class {
     size_t class_method_count;
 };
 
+struct guest_category {
+    const void* layout;
+    void* class_object;
+    struct guest_method* instance_methods;
+    size_t instance_method_count;
+    struct guest_method* class_methods;
+    size_t class_method_count;
+};
+
+#define MAX_GUEST_CATEGORIES 4096
+
 struct readable_range { uintptr_t start, end; };
 static struct readable_range* ranges;
 static size_t range_count;
 static pthread_mutex_t ranges_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct guest_class classes[MAX_GUEST_CLASSES];
 static size_t class_count;
+static struct guest_category categories[MAX_GUEST_CATEGORIES];
+static size_t category_count;
 static pthread_mutex_t classes_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void refresh_ranges(void)
@@ -99,12 +112,8 @@ static const unsigned char* class_data(void* address)
     return foundation_archive_readable(data, 40) ? data : NULL;
 }
 
-static struct guest_method* parse_methods(void* class_object, size_t* count)
+static struct guest_method* parse_method_list(const uint32_t* list, size_t* count)
 {
-    const unsigned char* data = class_data(class_object);
-    if (!data)
-        return NULL;
-    const uint32_t* list = *(const uint32_t* const*)(data + 32);
     if (!foundation_archive_readable(list, 8))
         return NULL;
     size_t entry_size = list[0] & 0xffff;
@@ -140,6 +149,14 @@ static struct guest_method* parse_methods(void* class_object, size_t* count)
     return result;
 }
 
+static struct guest_method* parse_methods(void* class_object, size_t* count)
+{
+    const unsigned char* data = class_data(class_object);
+    if (!data)
+        return NULL;
+    return parse_method_list(*(const uint32_t* const*)(data + 32), count);
+}
+
 static struct guest_class* register_class(void* class_object)
 {
     struct guest_class* result = find_class(class_object);
@@ -159,6 +176,45 @@ static struct guest_class* register_class(void* class_object)
     result->instance_methods = parse_methods(class_object, &result->instance_method_count);
     result->class_methods = parse_methods(result->address->isa, &result->class_method_count);
     return result;
+}
+
+struct guest_category_layout {
+    const char* name;
+    void* class_object;
+    const uint32_t* instance_methods;
+    const uint32_t* class_methods;
+};
+
+void machgate_shim_register_objc_category(void* category_object)
+{
+    if (!foundation_archive_readable(category_object,
+            sizeof(struct guest_category_layout)))
+        return;
+    const struct guest_category_layout* category = category_object;
+    if (!category->class_object ||
+        !foundation_archive_readable(category->class_object,
+            sizeof(struct guest_class_layout)))
+        return;
+
+    pthread_mutex_lock(&classes_mutex);
+    for (size_t index = 0; index < category_count; ++index) {
+        if (categories[index].layout == category_object) {
+            pthread_mutex_unlock(&classes_mutex);
+            return;
+        }
+    }
+    if (category_count == MAX_GUEST_CATEGORIES) {
+        pthread_mutex_unlock(&classes_mutex);
+        return;
+    }
+    struct guest_category* result = &categories[category_count++];
+    result->layout = category_object;
+    result->class_object = category->class_object;
+    result->instance_methods = parse_method_list(category->instance_methods,
+        &result->instance_method_count);
+    result->class_methods = parse_method_list(category->class_methods,
+        &result->class_method_count);
+    pthread_mutex_unlock(&classes_mutex);
 }
 
 void machgate_shim_register_objc_class(void* class_object)
@@ -199,6 +255,45 @@ static void* lookup_chained(struct guest_class* entry, int class_method,
     return NULL;
 }
 
+static int class_matches_category_target(struct guest_class_layout* receiver_isa,
+    struct guest_class_layout* category_class)
+{
+    struct guest_class_layout* current = receiver_isa;
+    for (int depth = 0; depth < 32 && current; ++depth) {
+        if (current == category_class)
+            return 1;
+        const unsigned char* data = class_data(current);
+        if (!data)
+            return 0;
+        current = current->superclass;
+    }
+    return 0;
+}
+
+static const char* category_class_name(const struct guest_category* category)
+{
+    const unsigned char* data = class_data(category->class_object);
+    if (!data)
+        return foundation_archive_shim_class_name(category->class_object);
+    const char* name = *(const char* const*)(data + 24);
+    return foundation_archive_readable(name, 1) ? name : NULL;
+}
+
+static void* lookup_category_methods(const struct guest_category* category,
+    int class_method, const char* selector)
+{
+    const struct guest_method* methods = class_method
+        ? category->class_methods : category->instance_methods;
+    size_t count = class_method ? category->class_method_count
+        : category->instance_method_count;
+    for (size_t index = 0; index < count; ++index) {
+        if (methods[index].selector &&
+            strcmp(methods[index].selector, selector) == 0)
+            return methods[index].implementation;
+    }
+    return NULL;
+}
+
 const char* foundation_archive_guest_class_name(const void* class_object)
 {
     if (!class_object)
@@ -215,6 +310,41 @@ const char* foundation_archive_guest_class_name(const void* class_object)
     return result;
 }
 
+void* foundation_archive_category_imp_for_class(const char* class_name,
+    int class_method, const char* selector)
+{
+    if (!class_name || !selector)
+        return NULL;
+    pthread_mutex_lock(&classes_mutex);
+    void* result = NULL;
+    for (size_t index = 0; index < category_count && !result; ++index) {
+        const char* owner = category_class_name(&categories[index]);
+        if (owner && strcmp(owner, class_name) == 0)
+            result = lookup_category_methods(&categories[index], class_method,
+                selector);
+    }
+    pthread_mutex_unlock(&classes_mutex);
+    return result;
+}
+
+static void* lookup_category_imp(struct guest_class_layout* receiver_isa,
+    int class_method, const char* selector)
+{
+    if (!receiver_isa)
+        return NULL;
+    for (size_t index = 0; index < category_count; ++index) {
+        struct guest_category* category = &categories[index];
+        if (!class_matches_category_target(receiver_isa,
+                category->class_object))
+            continue;
+        void* result = lookup_category_methods(category, class_method,
+            selector);
+        if (result)
+            return result;
+    }
+    return NULL;
+}
+
 void* foundation_archive_guest_imp(void* receiver, const char* selector)
 {
     if (!receiver || !selector)
@@ -223,6 +353,14 @@ void* foundation_archive_guest_imp(void* receiver, const char* selector)
     int class_method = 0;
     struct guest_class* entry = receiver_class(receiver, &class_method);
     void* result = lookup_chained(entry, class_method, selector);
+    if (!result) {
+        struct guest_class_layout* receiver_isa = NULL;
+        if (entry && class_method)
+            receiver_isa = entry->address;
+        else if (foundation_archive_readable(receiver, sizeof(void*)))
+            receiver_isa = *(void**)receiver;
+        result = lookup_category_imp(receiver_isa, class_method, selector);
+    }
     pthread_mutex_unlock(&classes_mutex);
     return result;
 }

@@ -19,7 +19,7 @@ LINKER="$(command -v ld64.lld || command -v ld64.lld-18)"
 "$LINKER" -arch arm64 -platform_version macos 11.0.0 11.0.0 -e _main \
     -o "$WORK_DIR/guest" "$WORK_DIR/guest.o" "$WORK_DIR/libSystem.dylib"
 
-expected_output='unavailable keychain rejects protected-storage operations'
+expected_output='keychain generic-password add/copy/update/delete behavior passed'
 for CACHE in 0 1 1; do
     set +e
     actual_output="$(
@@ -41,4 +41,4 @@ for CACHE in 0 1 1; do
     fi
 done
 
-printf '%s\n' 'Keychain: unavailable protected storage fails explicitly and clears outputs'
+printf '%s\n' 'Keychain: in-memory generic-password CRUD, UTF-8 accounts, long and embedded-NUL data passed'

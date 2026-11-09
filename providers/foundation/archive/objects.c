@@ -98,6 +98,8 @@ enum shim_objc_kind {
 	SHIM_OBJC_INSTANCE_NSBUNDLE,
 	SHIM_OBJC_NOTIFICATION_CENTER,
 	SHIM_OBJC_NOTIFICATION_OBSERVER,
+	SHIM_OBJC_CLASS_NSKEYEDARCHIVER,
+	SHIM_OBJC_CLASS_NSKEYEDUNARCHIVER,
 };
 
 struct shim_objc_header {
@@ -266,6 +268,14 @@ struct shim_objc_data {
 	struct shim_objc_header header;
 	size_t length;
 	char bytes[];
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSKeyedArchiver = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSKEYEDARCHIVER,
+};
+
+struct shim_objc_header OBJC_CLASS_$_NSKeyedUnarchiver = {
+	SHIM_OBJC_MAGIC, SHIM_OBJC_CLASS_NSKEYEDUNARCHIVER,
 };
 
 struct shim_objc_filehandle {
@@ -760,6 +770,23 @@ static struct shim_objc_dictionary* shim_objc_dictionary_set(
     return dictionary;
 }
 
+static void shim_objc_dictionary_remove(struct shim_objc_dictionary* dictionary,
+    void* key)
+{
+    if (!dictionary || !key) return;
+    for (uint32_t index = 0; index < dictionary->pair_count; ++index) {
+        if (!dictionary_keys_equal(dictionary->keys[index * 2], key)) continue;
+        foundation_release(dictionary->keys[index * 2]);
+        foundation_release(dictionary->keys[index * 2 + 1]);
+        for (uint32_t shift = index + 1; shift < dictionary->pair_count; shift++) {
+            dictionary->keys[(shift - 1) * 2] = dictionary->keys[shift * 2];
+            dictionary->keys[(shift - 1) * 2 + 1] = dictionary->keys[shift * 2 + 1];
+        }
+        --dictionary->pair_count;
+        return;
+    }
+}
+
 static void* shim_objc_dictionary_get(const struct shim_objc_dictionary* dictionary, void* key)
 {
     for (uint32_t index = 0; index < dictionary->pair_count; ++index)
@@ -768,13 +795,258 @@ static void* shim_objc_dictionary_get(const struct shim_objc_dictionary* diction
     return NULL;
 }
 
+static void* shim_objc_array_append(struct shim_objc_array* array, void* value);
+
+static int shim_keyed_archive_is_dictionary(void* object)
+{
+    return shim_objc_is_object(object, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY);
+}
+
+enum {
+    KEYED_ARCHIVE_TAG_STRING = 1,
+    KEYED_ARCHIVE_TAG_DATA = 2,
+    KEYED_ARCHIVE_TAG_DICTIONARY = 3,
+    KEYED_ARCHIVE_TAG_ARRAY = 4,
+};
+
+struct keyed_archive_writer {
+    char* bytes;
+    size_t length;
+    size_t capacity;
+    int failed;
+};
+
+static void keyed_archive_reserve(struct keyed_archive_writer* writer,
+    size_t additional)
+{
+    if (writer->failed ||
+        writer->length + additional <= writer->capacity)
+        return;
+    size_t capacity = writer->capacity ? writer->capacity * 2 : 128;
+    while (capacity < writer->length + additional)
+        capacity *= 2;
+    char* bytes = realloc(writer->bytes, capacity);
+    if (!bytes) {
+        writer->failed = 1;
+        return;
+    }
+    writer->bytes = bytes;
+    writer->capacity = capacity;
+}
+
+static void keyed_archive_write(struct keyed_archive_writer* writer,
+    const void* data, size_t size)
+{
+    keyed_archive_reserve(writer, size);
+    if (writer->failed)
+        return;
+    memcpy(writer->bytes + writer->length, data, size);
+    writer->length += size;
+}
+
+static void keyed_archive_write_integer(struct keyed_archive_writer* writer,
+    uint64_t value)
+{
+    unsigned char encoding[10];
+    size_t size = 0;
+    do {
+        encoding[size++] = (unsigned char)(value & 0x7f);
+        value >>= 7;
+    } while (value);
+    for (size_t index = 0; index < size; index++)
+        encoding[index] |= (unsigned char)(index + 1 == size ? 0x00 : 0x80);
+    keyed_archive_write(writer, encoding, size);
+}
+
+static void keyed_archive_encode_object(struct keyed_archive_writer* writer,
+    void* object);
+
+static void keyed_archive_encode_pairs(struct keyed_archive_writer* writer,
+    struct shim_objc_string* const* pairs, uint32_t pair_count)
+{
+    keyed_archive_write_integer(writer, pair_count);
+    for (uint32_t index = 0; index < pair_count && !writer->failed; index++) {
+        keyed_archive_encode_object(writer, pairs[index * 2]);
+        keyed_archive_encode_object(writer, pairs[index * 2 + 1]);
+    }
+}
+
+static void keyed_archive_encode_object(struct keyed_archive_writer* writer,
+    void* object)
+{
+    if (!object) {
+        keyed_archive_write_integer(writer, 0);
+        return;
+    }
+    if (shim_objc_is_object(object, SHIM_OBJC_STRING)) {
+        const char* text = ((struct shim_objc_string*)object)->utf8;
+        size_t length = strlen(text);
+        keyed_archive_write_integer(writer, KEYED_ARCHIVE_TAG_STRING);
+        keyed_archive_write_integer(writer, length);
+        keyed_archive_write(writer, text, length);
+        return;
+    }
+    struct foundation_string* foundation_string = foundation_string_resolve(object);
+    const char* text = foundation_string ? foundation_string->utf8 : NULL;
+    if (text) {
+        size_t length = strlen(text);
+        keyed_archive_write_integer(writer, KEYED_ARCHIVE_TAG_STRING);
+        keyed_archive_write_integer(writer, length);
+        keyed_archive_write(writer, text, length);
+        return;
+    }
+    if (shim_objc_is_object(object, SHIM_OBJC_INSTANCE_NSDATA)) {
+        const struct shim_objc_data* data = object;
+        keyed_archive_write_integer(writer, KEYED_ARCHIVE_TAG_DATA);
+        keyed_archive_write_integer(writer, data->length);
+        keyed_archive_write(writer, data->bytes, data->length);
+        return;
+    }
+    if (shim_keyed_archive_is_dictionary(object)) {
+        const struct shim_objc_dictionary* dictionary = object;
+        keyed_archive_write_integer(writer, KEYED_ARCHIVE_TAG_DICTIONARY);
+        keyed_archive_encode_pairs(writer, dictionary->keys,
+            dictionary->pair_count);
+        return;
+    }
+    if (shim_objc_is_object(object, SHIM_OBJC_ARRAY)) {
+        const struct shim_objc_array* array = object;
+        keyed_archive_write_integer(writer, KEYED_ARCHIVE_TAG_ARRAY);
+        keyed_archive_write_integer(writer, array->count);
+        for (uint32_t index = 0; index < array->count && !writer->failed; index++)
+            keyed_archive_encode_object(writer, array->elements[index]);
+        return;
+    }
+    writer->failed = 1;
+}
+
+static void* shim_keyed_archive_encode(void* root)
+{
+    static const unsigned char header[] = {'M', 'G', 'K', 'A', 1};
+    struct keyed_archive_writer writer = {0};
+    keyed_archive_write(&writer, header, sizeof(header));
+    keyed_archive_encode_object(&writer, root);
+    if (writer.failed) {
+        free(writer.bytes);
+        return NULL;
+    }
+    return foundation_archive_data_create(writer.bytes, writer.length);
+}
+
+struct keyed_archive_reader {
+    const unsigned char* bytes;
+    size_t size;
+    size_t position;
+};
+
+static int keyed_archive_read_integer(struct keyed_archive_reader* reader,
+    uint64_t* value)
+{
+    uint64_t result = 0;
+    unsigned int shift = 0;
+    while (reader->position < reader->size) {
+        unsigned char byte = reader->bytes[reader->position++];
+        result |= (uint64_t)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) {
+            *value = result;
+            return 1;
+        }
+        shift += 7;
+        if (shift > 63)
+            return 0;
+    }
+    return 0;
+}
+
+static int keyed_archive_read_bytes(struct keyed_archive_reader* reader,
+    size_t length, const void** bytes)
+{
+    if (reader->size - reader->position < length)
+        return 0;
+    *bytes = reader->bytes + reader->position;
+    reader->position += length;
+    return 1;
+}
+
+static void* keyed_archive_decode_object(struct keyed_archive_reader* reader)
+{
+    uint64_t tag;
+    if (!keyed_archive_read_integer(reader, &tag))
+        return NULL;
+    if (tag == 0)
+        return NULL;
+    uint64_t length;
+    if (tag == KEYED_ARCHIVE_TAG_STRING) {
+        if (!keyed_archive_read_integer(reader, &length) ||
+            length > reader->size - reader->position)
+            return NULL;
+        char* text = malloc((size_t)length + 1);
+        if (!text)
+            return NULL;
+        memcpy(text, reader->bytes + reader->position, (size_t)length);
+        text[length] = '\0';
+        reader->position += (size_t)length;
+        void* result = shim_objc_make_string(text);
+        free(text);
+        return result;
+    }
+    if (tag == KEYED_ARCHIVE_TAG_DATA) {
+        if (!keyed_archive_read_integer(reader, &length))
+            return NULL;
+        const void* bytes;
+        if (!keyed_archive_read_bytes(reader, (size_t)length, &bytes))
+            return NULL;
+        return foundation_archive_data_create(bytes, (size_t)length);
+    }
+    if (tag == KEYED_ARCHIVE_TAG_DICTIONARY) {
+        if (!keyed_archive_read_integer(reader, &length) ||
+            length > SIZE_MAX / sizeof(void*) / 2)
+            return NULL;
+        struct shim_objc_dictionary* result = shim_objc_make_dictionary(NULL,
+            NULL, 0);
+        if (!result)
+            return NULL;
+        for (uint64_t index = 0; index < length; index++) {
+            void* key = keyed_archive_decode_object(reader);
+            void* value = keyed_archive_decode_object(reader);
+            if (!key || !value)
+                return result;
+            result = shim_objc_dictionary_set(result, key, value);
+        }
+        return result;
+    }
+    if (tag == KEYED_ARCHIVE_TAG_ARRAY) {
+        if (!keyed_archive_read_integer(reader, &length))
+            return NULL;
+        struct shim_objc_array* result = shim_objc_make_array(NULL, 0);
+        if (!result)
+            return NULL;
+        for (uint64_t index = 0; index < length; index++) {
+            void* element = keyed_archive_decode_object(reader);
+            if (!element)
+                break;
+            shim_objc_array_append(result, element);
+        }
+        return result;
+    }
+    return NULL;
+}
+
+static void* shim_keyed_archive_decode(const void* bytes, size_t size)
+{
+    static const unsigned char header[] = {'M', 'G', 'K', 'A', 1};
+    if (size < sizeof(header) || memcmp(bytes, header, sizeof(header)) != 0)
+        return NULL;
+    struct keyed_archive_reader reader = {bytes, size, sizeof(header)};
+    return keyed_archive_decode_object(&reader);
+}
+
 static void* shim_objc_array_append(struct shim_objc_array* array, void* value)
 {
     if (!array || !value) return array;
     if (array->count == array->capacity) {
         uint32_t capacity = array->capacity < 64 ? 64 : array->capacity * 2;
-        if (capacity <= array->capacity) return array;
-        struct shim_objc_string** result = realloc(array->elements, sizeof(*result) * capacity);
+        if (capacity <= array->capacity) return array;        struct shim_objc_string** result = realloc(array->elements, sizeof(*result) * capacity);
         if (!result) return array;
         array->elements = result;
         array->capacity = capacity;
@@ -3083,6 +3355,32 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return shim_objc_make_string(
 				((struct shim_objc_string*)receiver)->utf8);
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY)) {
+			const struct shim_objc_dictionary* source = receiver;
+			struct shim_objc_dictionary* copy =
+				shim_objc_make_dictionary(NULL, NULL, 0);
+			if (!copy)
+				return NULL;
+			for (uint32_t pair_index = 0; pair_index < source->pair_count;
+			     pair_index++)
+				copy = shim_objc_dictionary_set(copy,
+					source->keys[pair_index * 2],
+					source->keys[pair_index * 2 + 1]);
+			return copy;
+		}
+	} else if (strcmp(selector, "class") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSDICTIONARY) ||
+		    shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY))
+			return &OBJC_CLASS_$_NSDictionary;
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSARRAY) ||
+		    shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLEARRAY))
+			return &OBJC_CLASS_$_NSArray;
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSSTRING) ||
+		    shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSMUTABLESTRING))
+			return &OBJC_CLASS_$_NSString;
+		if (shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSDATA))
+			return &OBJC_CLASS_$_NSData;
+		return receiver;
 	} else if (strcmp(selector, "characterAtIndex:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
 			const char* text = ((struct shim_objc_string*)receiver)->utf8;
@@ -3248,29 +3546,17 @@ static int dispatch_dictionary(void* receiver, const char* selector,
     else if (strcmp(selector, "setObject:forKey:") == 0 || strcmp(selector, "setObject:forKeyedSubscript:") == 0) {
         shim_objc_dictionary_set(dictionary, (void*)arguments[1], (void*)arguments[0]);
         *result = 0;
+    } else if (strcmp(selector, "removeObjectForKey:") == 0) {
+        shim_objc_dictionary_remove(dictionary, (void*)arguments[0]);
+        *result = 0;
+    } else if (strcmp(selector, "count") == 0) {
+        *result = dictionary->pair_count;
     } else return 0;
     return 1;
 }
 
 static int dispatch_keyed_archiver(void* receiver, const char* selector,
-    uintptr_t object, uintptr_t error_pointer, uintptr_t* result)
-{
-    (void)object;
-    const char* class_name = foundation_archive_guest_class_name(receiver);
-    if (!class_name)
-        return 0;
-    int archive = strcmp(class_name, "NSKeyedArchiver") == 0 &&
-        strcmp(selector, "archivedDataWithRootObject:requiringSecureCoding:error:") == 0;
-    int unarchive = strcmp(class_name, "NSKeyedUnarchiver") == 0 &&
-        strcmp(selector, "unarchivedObjectOfClass:fromData:error:") == 0;
-    if (!archive && !unarchive)
-        return 0;
-    *result = 0;
-    if (error_pointer)
-        *(void**)error_pointer = shim_objc_make_error("NSCocoaErrorDomain", 3328,
-            "Keyed archives are not supported by MachGate", NULL);
-    return 1;
-}
+    const uintptr_t arguments[6], uintptr_t* result);
 
 int foundation_archive_dispatch(void* receiver, const char* selector,
     const uintptr_t arguments[6], const uintptr_t* stack, void* indirect_result,
@@ -3305,12 +3591,146 @@ int foundation_archive_dispatch(void* receiver, const char* selector,
         *result = 0;
         return 1;
     }
-    if (dispatch_keyed_archiver(receiver, selector, arguments[0], arguments[2],
-            result))
+    if (dispatch_keyed_archiver(receiver, selector, arguments, result))
+        return 1;
+    if (foundation_archive_category_dispatch(receiver, selector, arguments,
+            stack, indirect_result, result))
         return 1;
     *result = (uintptr_t)archive_message_impl(receiver, (void*)selector,
         arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
         indirect_result, stack);
+    return 1;
+}
+
+static const char* shim_class_name_for_kind(uint32_t kind)
+{
+    switch (kind) {
+    case SHIM_OBJC_CLASS_NSDICTIONARY:
+    case SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY:
+    case SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY:
+        return "NSDictionary";
+    case SHIM_OBJC_CLASS_NSARRAY:
+    case SHIM_OBJC_CLASS_NSMUTABLEARRAY:
+    case SHIM_OBJC_ARRAY:
+    case SHIM_OBJC_INSTANCE_NSMUTABLEARRAY:
+        return "NSArray";
+    case SHIM_OBJC_CLASS_NSSTRING:
+    case SHIM_OBJC_CLASS_NSMUTABLESTRING:
+    case SHIM_OBJC_STRING:
+        return "NSString";
+    case SHIM_OBJC_CLASS_NSDATA:
+    case SHIM_OBJC_INSTANCE_NSDATA:
+        return "NSData";
+    case SHIM_OBJC_CLASS_NSNUMBER:
+    case SHIM_OBJC_INSTANCE_NSNUMBER:
+        return "NSNumber";
+    case SHIM_OBJC_CLASS_NSDATE:
+    case SHIM_OBJC_INSTANCE_NSDATE:
+        return "NSDate";
+    case SHIM_OBJC_CLASS_NSURL:
+    case SHIM_OBJC_INSTANCE_NSURL:
+        return "NSURL";
+    case SHIM_OBJC_CLASS_NSERROR:
+    case SHIM_OBJC_INSTANCE_NSERROR:
+        return "NSError";
+    case SHIM_OBJC_CLASS_NSUSERDEFAULTS:
+    case SHIM_OBJC_INSTANCE_NSUSERDEFAULTS:
+        return "NSUserDefaults";
+    case SHIM_OBJC_CLASS_NSHTTPCOOKIE:
+    case SHIM_OBJC_INSTANCE_NSHTTPCOOKIE:
+        return "NSHTTPCookie";
+    case SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE:
+    case SHIM_OBJC_INSTANCE_NSHTTPCOOKIESTORAGE:
+        return "NSHTTPCookieStorage";
+    default:
+        return NULL;
+    }
+}
+
+static const char* shim_receiver_class_name(const void* receiver)
+{
+    const struct shim_objc_header* header = receiver;
+    if (!header || (uintptr_t)header < 4096)
+        return NULL;
+    if (header->magic != SHIM_OBJC_MAGIC)
+        return NULL;
+    return shim_class_name_for_kind(header->kind);
+}
+
+const char* foundation_archive_shim_class_name(const void* class_object)
+{
+    if (!foundation_archive_readable(class_object,
+            sizeof(struct shim_objc_header)))
+        return NULL;
+    const struct shim_objc_header* header = class_object;
+    if (header->magic != SHIM_OBJC_MAGIC)
+        return NULL;
+    return shim_class_name_for_kind(header->kind);
+}
+
+static int dispatch_keyed_archiver(void* receiver, const char* selector,
+    const uintptr_t arguments[6], uintptr_t* result)
+{
+    int archive = shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSKEYEDARCHIVER) &&
+        strcmp(selector, "archivedDataWithRootObject:requiringSecureCoding:error:") == 0;
+    int unarchive = shim_objc_is_object(receiver, SHIM_OBJC_CLASS_NSKEYEDUNARCHIVER) &&
+        strcmp(selector, "unarchivedObjectOfClass:fromData:error:") == 0;
+    if (!archive && !unarchive)
+        return 0;
+    *result = 0;
+    if (archive)
+        *result = (uintptr_t)shim_keyed_archive_encode((void*)arguments[0]);
+    else {
+        const void* bytes = NULL;
+        size_t size = 0;
+        if (foundation_archive_data_resolve((void*)arguments[1], &bytes, &size))
+            *result = (uintptr_t)shim_keyed_archive_decode(bytes, size);
+    }
+    return 1;
+}
+
+int foundation_archive_category_dispatch(void* receiver, const char* selector,
+    const uintptr_t arguments[6], const uintptr_t* stack, void* indirect_result,
+    uintptr_t* result)
+{
+    const char* class_name = shim_receiver_class_name(receiver);
+    if (!class_name)
+        return 0;
+    const struct shim_objc_header* header = receiver;
+    int class_method = 0;
+    switch (header->kind) {
+    case SHIM_OBJC_CLASS_NSDICTIONARY:
+    case SHIM_OBJC_CLASS_NSMUTABLEDICTIONARY:
+    case SHIM_OBJC_CLASS_NSARRAY:
+    case SHIM_OBJC_CLASS_NSMUTABLEARRAY:
+    case SHIM_OBJC_CLASS_NSSTRING:
+    case SHIM_OBJC_CLASS_NSMUTABLESTRING:
+    case SHIM_OBJC_CLASS_NSDATA:
+    case SHIM_OBJC_CLASS_NSNUMBER:
+    case SHIM_OBJC_CLASS_NSDATE:
+    case SHIM_OBJC_CLASS_NSURL:
+    case SHIM_OBJC_CLASS_NSERROR:
+    case SHIM_OBJC_CLASS_NSUSERDEFAULTS:
+    case SHIM_OBJC_CLASS_NSHTTPCOOKIE:
+    case SHIM_OBJC_CLASS_NSHTTPCOOKIESTORAGE:
+        class_method = 1;
+        break;
+    default:
+        break;
+    }
+    void* implementation = foundation_archive_category_imp_for_class(class_name,
+        class_method, selector);
+    if (!implementation)
+        return 0;
+    extern void* shim_objc_msgSend_call_guest_imp(void*, void*, void*, void*,
+        const uintptr_t*, const uintptr_t*);
+    uintptr_t registers[6];
+    if (arguments)
+        memcpy(registers, arguments, sizeof(registers));
+    else
+        memset(registers, 0, sizeof(registers));
+    *result = (uintptr_t)shim_objc_msgSend_call_guest_imp(implementation,
+        receiver, (void*)selector, indirect_result, registers, stack);
     return 1;
 }
 

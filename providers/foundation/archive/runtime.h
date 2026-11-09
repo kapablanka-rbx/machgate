@@ -23,7 +23,13 @@ int foundation_archive_guest_dispatch(void* receiver, const char* selector,
 int foundation_archive_readable(const void* address, size_t size);
 void foundation_archive_forget_object(void* object);
 void machgate_shim_register_objc_class(void* class_object);
-
+void machgate_shim_register_objc_category(void* category_object);
+void* foundation_archive_category_imp_for_class(const char* class_name,
+    int class_method, const char* selector);
+const char* foundation_archive_shim_class_name(const void* class_object);
 const char* foundation_archive_guest_class_name(const void* class_object);
+int foundation_archive_category_dispatch(void* receiver, const char* selector,
+    const uintptr_t arguments[6], const uintptr_t* stack, void* indirect_result,
+    uintptr_t* result);
 
 #endif

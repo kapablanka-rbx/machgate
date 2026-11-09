@@ -4,7 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* No keychain backend is available; operations return errSecNotAvailable. */
+/* Process-local generic-password keychain: strings are copied, values are
+ * matched by account/service and returned as CFData or provider NSData. */
 int32_t machgate_keychain_add(const void* attributes, const void** result);
 int32_t machgate_keychain_copy_matching(const void* query, const void** result);
 int32_t machgate_keychain_update(const void* query,

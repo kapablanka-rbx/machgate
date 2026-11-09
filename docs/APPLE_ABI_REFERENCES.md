@@ -371,30 +371,42 @@ address translation, ownership, error paths and absent telemetry.
 `tests/test_lifecycle_agent.sh` exercises the guest error/buffer contracts
 in strict and compatibility import modes with cold/warm preparation caches.
 
-## Unavailable keychain and keyed archives
+## Process-local keychain and keyed archives
 
-Apple Security's [SecBase.h](https://github.com/apple-oss-distributions/Security/blob/main/base/SecBase.h)
-defines `errSecNotAvailable` as `-25291`, meaning no keychain is available.
-[SecItem.h](https://github.com/apple-oss-distributions/Security/blob/main/keychain/headers/SecItem.h)
-documents `kSecAttrAccessibleAfterFirstUnlock` as access contingent on an
-actual device unlock. MachGate has no backend implementing that protected
-persistence contract. SecItem operations therefore return `errSecNotAvailable`
-and clear optional output pointers; an in-memory dictionary is not a keychain.
+Apple Security's [SecItem.h](https://github.com/apple-oss-distributions/Security/blob/main/keychain/headers/SecItem.h)
+defines the generic-password item model: `kSecClass` selects the item class,
+`kSecAttrAccount` and `kSecAttrService` identify the entry, `kSecValueData`
+carries the secret and `kSecReturnData` requests the bytes on copy.
+[SecBase.h](https://github.com/apple-oss-distributions/Security/blob/main/base/SecBase.h)
+defines `errSecDuplicateItem` as `-25299` and `errSecItemNotFound` as `-25300`.
+MachGate implements these semantics against a process-local store: strings are
+copied, add of an existing account/service returns `errSecDuplicateItem`, copy
+of a missing entry returns `errSecItemNotFound` with the output pointer
+cleared, and no data persists beyond the guest process. There is no device
+unlock, so `kSecAttrAccessibleAfterFirstUnlock` is recorded but not enforced.
+Values held as Foundation objects are read through the provider's
+`machgate_keychain_dictionary_lookup_v1` so shim NSDictionary queries and
+CFDictionary queries both resolve attributes.
 
 Swift Foundation's [NSKeyedArchiver.swift](https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSKeyedArchiver.swift)
-encodes an object graph and propagates archive errors. Storing an object's
-address as NSData does not encode that graph. MachGate's unsupported keyed
-archive operations return nil and, when requested, an NSError in
-NSCocoaErrorDomain with code 3328. Foundation's
-[NSError.swift](https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSError.swift)
-describes that code as "The requested operation is not supported."
-This is MachGate's explicit unavailable-feature policy, not an implementation
-of Foundation keyed coding.
+encodes an object graph. MachGate implements a tagged archive ("MGKA" version 1)
+covering NSString, NSData, NSArray and NSDictionary graphs with variable-length
+integer lengths, produced by `archivedDataWithRootObject:requiringSecureCoding:error:`
+and consumed by `unarchivedObjectOfClass:fromData:error:`. Invalid payloads
+decode to nil. The format is a MachGate contract, not Apple's plist keyed
+archive; `docs/APPLE_ABI_REFERENCES.md` records that divergence here.
+
+Guest Objective-C categories in `__objc_catlist` are registered through the
+provider section notification and merged into method lookup before the generic
+stub fallback, so engine categories such as
+`NSDictionary (KeychainSecureStorage)` reach their guest implementations.
 
 Sources retrieved 2026-11-09 are preserved under
 `build/repair-round2/storage/`. SecBase.h SHA-256 is
 `a2e2c53dfdc6ebcbfd5c81e351b636de10eb78614f79407049cbbe19eccd872e`;
 SecItem.h is `fa0c0131ffdd3a4bed0882df9f945e87efd1371d5fe3772dd4224ac2bdb391aa`.
-Regression coverage: `tests/test_keychain_agent.sh` exercises guest imports
-with cold and warm caches; `tests/test_keyed_archive_unavailable.sh` verifies
-that archive and unarchive dispatch produce no object and an explicit error.
+Regression coverage: `tests/test_keychain_agent.sh` exercises the CF-level
+SecItem contract with cold and warm caches; `tests/test_keychain_category_agent.sh`
+runs a guest Objective-C category through SecItem and the keyed-archive
+round-trip; `tests/test_keyed_archive_round_trip.sh` verifies the archive
+encoding natively and rejects invalid payloads.

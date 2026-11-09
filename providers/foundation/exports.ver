@@ -8,6 +8,8 @@
         __NSDictionary0__;
         machgate_shim_register_objc_class;
         machgate_guest_section_loaded_v1;
+        machgate_keychain_dictionary_lookup_v1;
+        foundation_archive_data_create;
         shim_objc_*;
     local: *;
 };

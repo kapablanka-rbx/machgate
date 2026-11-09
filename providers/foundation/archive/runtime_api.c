@@ -4,6 +4,40 @@
 #include <pthread.h>
 #include <stdlib.h>
 
+int machgate_keychain_dictionary_lookup_v1(const void* dictionary,
+	const void* key, const char** string_value, const void** data_bytes,
+	size_t* data_length)
+{
+	if (string_value)
+		*string_value = NULL;
+	if (data_bytes)
+		*data_bytes = NULL;
+	if (data_length)
+		*data_length = 0;
+
+	uintptr_t arguments[6] = {(uintptr_t)key};
+	uintptr_t value = 0;
+	double floating_result;
+	if (!foundation_archive_dispatch((void*)dictionary, "objectForKey:",
+	    arguments, NULL, NULL, 0, &value, &floating_result) || !value)
+		return 0;
+
+	const char* text = foundation_archive_string_utf8((void*)value);
+	if (!text) {
+		struct foundation_string* string =
+			foundation_string_resolve((void*)value);
+		text = string ? string->utf8 : NULL;
+	}
+	if (text && string_value) {
+		*string_value = text;
+		return 1;
+	}
+	if (!text && foundation_archive_data_resolve((void*)value, data_bytes,
+	    data_length))
+		return 1;
+	return text != NULL;
+}
+
 struct weak_reference {
     void** location;
     struct weak_reference* next;
