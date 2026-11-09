@@ -4,13 +4,55 @@
 #include "ports/user_lock.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <linux/futex.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+static int trace_descriptor = -2;
+
+static int trace_fd(void)
+{
+	if (trace_descriptor == -2) {
+		const char* path = getenv("MACHGATE_ULOCK_TRACE_FILE");
+		trace_descriptor = path && *path ? open(path, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
+	}
+	return trace_descriptor;
+}
+
+static void trace_wait(void* address, uint64_t expected, unsigned width,
+                       int shared, uint64_t timeout_ns)
+{
+	char line[160];
+	int length = snprintf(line, sizeof(line),
+	                       "W tid=%ld addr=%p exp=%llu w=%u sh=%d to=%llu\n",
+	                       (long)syscall(SYS_gettid), address,
+	                       (unsigned long long)expected, width, shared,
+	                       (unsigned long long)timeout_ns);
+	int fd = trace_fd();
+	if (fd >= 0)
+		syscall(SYS_write, fd, line, (size_t)length);
+}
+
+static void trace_wake(void* address, int shared, int wake_all, long woken,
+                       int failure)
+{
+	char line[160];
+	int length = snprintf(line, sizeof(line),
+	                       "K tid=%ld addr=%p sh=%d all=%d woken=%ld err=%d\n",
+	                       (long)syscall(SYS_gettid), address, shared, wake_all,
+	                       woken, failure);
+	int fd = trace_fd();
+	if (fd >= 0)
+		syscall(SYS_write, fd, line, (size_t)length);
+}
 
 struct private_waiter {
 	void* address;
@@ -123,6 +165,7 @@ static long compare_narrow_word_with_wide_value(void* address)
 int machgate_wait_on_word(void* address, uint64_t expected, unsigned width,
                          int shared, uint64_t timeout_ns, int absolute)
 {
+	trace_wait(address, expected, width, shared, timeout_ns);
 	int saved_errno = errno;
 	struct private_waiter waiter = { .address = address };
 	struct private_waiter_bucket* bucket = shared ? NULL : register_private_waiter(&waiter);
@@ -152,6 +195,7 @@ int machgate_wake_word(void* address, int shared, int wake_all)
 		FUTEX_WAKE | (shared ? 0 : FUTEX_PRIVATE_FLAG),
 		wake_all ? INT_MAX : 1, NULL, NULL, 0);
 	int failure = errno;
+	trace_wake(address, shared, wake_all, result, failure);
 	errno = saved_errno;
 	if (result < 0)
 		return -failure;
