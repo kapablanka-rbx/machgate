@@ -229,6 +229,7 @@ __error
 __exp10
 __exp10f
 __fpclassifyd
+__fpclassifyf
 __getdirentries64
 __maskrune
 __mb_cur_max
@@ -320,7 +321,6 @@ dup3
 dyld_stub_binder
 execve
 exit
-exp2
 fclonefileat
 fcntl
 fcopyfile
@@ -389,7 +389,6 @@ kevent64
 kqueue
 lchflags
 listen
-log2
 lstat
 lstat_darwin
 mach_absolute_time
