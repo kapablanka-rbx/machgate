@@ -1081,6 +1081,41 @@ CFIndex CFStringGetBytes(CFStringRef string, struct cf_range range,
 	return copied;
 }
 
+void CFStringGetCharacters(CFStringRef string, struct cf_range range,
+                           uint16_t* buffer)
+{
+	if (!string || !buffer)
+		return;
+
+	const char* source = (const char*)string;
+	CFIndex source_length = (CFIndex)strlen(source);
+	if (range.location < 0 || range.location > source_length)
+		return;
+
+	CFIndex available = source_length - range.location;
+	CFIndex count = range.length < available ? range.length : available;
+	for (CFIndex i = 0; i < count; i++)
+		buffer[i] = (uint16_t)(unsigned char)source[range.location + i];
+}
+
+const uint16_t* CFStringGetCharactersPtr(CFStringRef string)
+{
+	/* MachGate CFStrings are UTF-8 byte arrays; no internal UTF-16 buffer. */
+	(void)string;
+	return NULL;
+}
+
+uint8_t CFStringGetFileSystemRepresentation(CFStringRef string,
+                                            char* buffer,
+                                            CFIndex max_buffer_length)
+{
+	if (!string || !buffer || max_buffer_length <= 0)
+		return 0;
+
+	snprintf(buffer, (size_t)max_buffer_length, "%s", (const char*)string);
+	return 1;
+}
+
 CFStringRef CFStringCreateWithBytes(CFAllocatorRef allocator,
                                     const uint8_t* bytes,
                                     CFIndex number_of_bytes,

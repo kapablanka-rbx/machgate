@@ -2213,6 +2213,27 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return ((struct shim_objc_string*)receiver)->utf8;
 		return (void*)shim_objc_string_utf8(receiver);
+	} else if (strcmp(selector, "fileSystemRepresentation") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
+			return ((struct shim_objc_string*)receiver)->utf8;
+		return (void*)shim_objc_string_utf8(receiver);
+	} else if (strcmp(selector, "getCharacters:range:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING)) {
+			const char* text = ((struct shim_objc_string*)receiver)->utf8;
+			uint16_t* buffer = (uint16_t*)(uintptr_t)a2;
+			/* ARM64: NSRange fields arrive in separate registers. */
+			size_t location = (size_t)a3;
+			size_t count = (size_t)a4;
+			size_t text_len = strlen(text);
+			if (buffer && location <= text_len) {
+				size_t available = text_len - location;
+				if (count > available)
+					count = available;
+				for (size_t i = 0; i < count; i++)
+					buffer[i] = (uint16_t)(unsigned char)text[location + i];
+			}
+			return NULL;
+		}
 	} else if (strcmp(selector, "length") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_STRING))
 			return (void*)(uintptr_t)strlen(((struct shim_objc_string*)receiver)->utf8);

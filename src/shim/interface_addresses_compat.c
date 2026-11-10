@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <ifaddrs.h>
+#include <linux/if_link.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <netinet/in.h>
@@ -14,11 +15,28 @@
 #define DARWIN_AF_LINK 18
 #define DARWIN_IFF_MULTICAST 0x8000
 
+/*
+ * Darwin struct if_data (LP64 layout): 8 u_char fields, then u_int32_t
+ * counters, then a timeval32 (8 bytes), then 3 trailing u_int32_t.
+ * Total 96 bytes.  We only need to populate ifi_ibytes (offset 40) and
+ * ifi_obytes (offset 44) for the guest network-stats scraper.
+ */
+enum {
+	DARWIN_IF_DATA_SIZE = 96,
+	DARWIN_IF_DATA_IPACKETS_OFFSET = 20,
+	DARWIN_IF_DATA_IERRORS_OFFSET  = 24,
+	DARWIN_IF_DATA_OPACKETS_OFFSET = 28,
+	DARWIN_IF_DATA_OERRORS_OFFSET  = 32,
+	DARWIN_IF_DATA_IBYTES_OFFSET   = 40,
+	DARWIN_IF_DATA_OBYTES_OFFSET   = 44,
+};
+
 struct interface_addresses {
 	struct machgate_darwin_ifaddrs interface;
 	unsigned char address[256];
 	unsigned char netmask[256];
 	unsigned char destination[256];
+	unsigned char if_data[DARWIN_IF_DATA_SIZE];
 	char name[];
 };
 
@@ -106,6 +124,27 @@ static int translate_address(const struct sockaddr* host_address,
 	return 1;
 }
 
+static void populate_if_data(unsigned char* if_data, const void* host_data)
+{
+	memset(if_data, 0, DARWIN_IF_DATA_SIZE);
+	if (!host_data)
+		return;
+	const struct rtnl_link_stats* stats = host_data;
+	uint32_t val;
+	val = (uint32_t)stats->rx_packets;
+	memcpy(if_data + DARWIN_IF_DATA_IPACKETS_OFFSET, &val, sizeof(val));
+	val = (uint32_t)stats->rx_errors;
+	memcpy(if_data + DARWIN_IF_DATA_IERRORS_OFFSET, &val, sizeof(val));
+	val = (uint32_t)stats->tx_packets;
+	memcpy(if_data + DARWIN_IF_DATA_OPACKETS_OFFSET, &val, sizeof(val));
+	val = (uint32_t)stats->tx_errors;
+	memcpy(if_data + DARWIN_IF_DATA_OERRORS_OFFSET, &val, sizeof(val));
+	val = (uint32_t)stats->rx_bytes;
+	memcpy(if_data + DARWIN_IF_DATA_IBYTES_OFFSET, &val, sizeof(val));
+	val = (uint32_t)stats->tx_bytes;
+	memcpy(if_data + DARWIN_IF_DATA_OBYTES_OFFSET, &val, sizeof(val));
+}
+
 static struct machgate_darwin_ifaddrs* copy_interface(const struct ifaddrs* host)
 {
 	const char* name = host->ifa_name ? host->ifa_name : "";
@@ -128,6 +167,15 @@ static struct machgate_darwin_ifaddrs* copy_interface(const struct ifaddrs* host
 		free(result);
 		errno = saved_errno;
 		return NULL;
+	}
+	/*
+	 * For AF_PACKET (link-layer) entries, populate a Darwin if_data
+	 * structure with interface statistics from the Linux
+	 * rtnl_link_stats provided in ifa_data.
+	 */
+	if (host->ifa_addr && host->ifa_addr->sa_family == AF_PACKET) {
+		populate_if_data(result->if_data, host->ifa_data);
+		result->interface.data = result->if_data;
 	}
 	return &result->interface;
 }

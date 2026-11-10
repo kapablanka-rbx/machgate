@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -319,6 +320,159 @@ int sysctlnametomib(const char* name, int* mib, size_t* mib_length)
 	return 0;
 }
 
+/*
+ * Darwin udpstat layout — 14 u_int32_t fields followed by 2 u_int64_t
+ * fields.  We only populate the subset that the guest actually reads
+ * (udps_fullsock at index 6).  The structure is zeroed before filling
+ * so untranslated counters safely read as zero.
+ */
+enum {
+	DARWIN_UDPSTAT_SIZE = 14 * 4 + 2 * 8,
+	DARWIN_UDPSTAT_FULLSOCK_OFFSET = 6 * 4,
+};
+
+/*
+ * Count UDP sockets visible to the process by parsing /proc/net/udp.
+ * Returns 0 on success, -1 on error.
+ */
+static int read_udp_pcblist(void* output, size_t* output_size)
+{
+	/*
+	 * The Darwin xinpgen header is: { uint32_t xig_len; uint32_t
+	 * xig_count; ... }.  The guest only reads the first 8 bytes
+	 * (xig_len and xig_count), so we return exactly 8 bytes.
+	 */
+	const size_t header_size = 8;
+
+	if (!output_size) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (!output) {
+		*output_size = header_size;
+		return 0;
+	}
+	if (*output_size < header_size) {
+		*output_size = header_size;
+		errno = ENOMEM;
+		return -1;
+	}
+
+	FILE* fp = fopen("/proc/net/udp", "r");
+	if (!fp) {
+		/* Also try udp6 — but if neither exists, return zero. */
+		errno = ENOENT;
+		return -1;
+	}
+
+	char line[512];
+	uint32_t count = 0;
+
+	/* Skip the header line. */
+	if (fgets(line, sizeof(line), fp)) {
+		while (fgets(line, sizeof(line), fp))
+			count++;
+	}
+	fclose(fp);
+
+	/* Also count IPv6 UDP sockets. */
+	fp = fopen("/proc/net/udp6", "r");
+	if (fp) {
+		if (fgets(line, sizeof(line), fp)) {
+			while (fgets(line, sizeof(line), fp))
+				count++;
+		}
+		fclose(fp);
+	}
+
+	uint32_t header[2];
+	header[0] = header_size; /* xig_len */
+	header[1] = count;       /* xig_count */
+	memcpy(output, header, header_size);
+	*output_size = header_size;
+	return 0;
+}
+
+/*
+ * Translate Linux UDP statistics from /proc/net/snmp into a Darwin
+ * udpstat structure.  The only field the guest currently consumes is
+ * udps_fullsock which maps to Linux RcvbufErrors.
+ */
+static int read_udp_stats(void* output, size_t* output_size)
+{
+	if (!output_size) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (!output) {
+		*output_size = DARWIN_UDPSTAT_SIZE;
+		return 0;
+	}
+	if (*output_size < DARWIN_UDPSTAT_SIZE) {
+		*output_size = DARWIN_UDPSTAT_SIZE;
+		errno = ENOMEM;
+		return -1;
+	}
+
+	uint32_t rcvbuf_errors = 0;
+
+	FILE* fp = fopen("/proc/net/snmp", "r");
+	if (fp) {
+		char line[512];
+		int found_header = 0;
+		while (fgets(line, sizeof(line), fp)) {
+			if (strncmp(line, "Udp:", 4) != 0)
+				continue;
+			if (!found_header) {
+				found_header = 1;
+				continue;
+			}
+			/*
+			 * Value line format:
+			 * Udp: InDatagrams NoPorts InErrors OutDatagrams
+			 *      RcvbufErrors SndbufErrors InCsumErrors
+			 *      IgnoredMulti MemErrors
+			 */
+			unsigned long in_dgrams, no_ports, in_errors, out_dgrams;
+			unsigned long rcvbuf, sndbuf;
+			if (sscanf(line, "Udp: %lu %lu %lu %lu %lu %lu",
+			           &in_dgrams, &no_ports, &in_errors,
+			           &out_dgrams, &rcvbuf, &sndbuf) >= 5)
+				rcvbuf_errors = (uint32_t)rcvbuf;
+			break;
+		}
+		fclose(fp);
+	}
+
+	memset(output, 0, DARWIN_UDPSTAT_SIZE);
+	memcpy((char*)output + DARWIN_UDPSTAT_FULLSOCK_OFFSET, &rcvbuf_errors,
+	       sizeof(rcvbuf_errors));
+	*output_size = DARWIN_UDPSTAT_SIZE;
+	return 0;
+}
+
+static int read_net_inet_udp(const int* name, unsigned int name_length,
+                             void* output, size_t* output_size)
+{
+	if (name_length < 4) {
+		errno = ENOENT;
+		return -1;
+	}
+	if (name[2] != DARWIN_SYSCTL_IPPROTO_UDP) {
+		errno = ENOENT;
+		return -1;
+	}
+	switch (name[3]) {
+	case DARWIN_SYSCTL_UDP_PCBLIST:
+		return read_udp_pcblist(output, output_size);
+	case DARWIN_SYSCTL_UDP_STATS:
+		return read_udp_stats(output, output_size);
+	default:
+		errno = ENOENT;
+		return -1;
+	}
+}
+
 int sysctl(const int* name, unsigned int name_length, void* output,
 	   size_t* output_size, const void* replacement, size_t replacement_size)
 {
@@ -335,8 +489,8 @@ int sysctl(const int* name, unsigned int name_length, void* output,
 			errno = EPERM;
 			return -1;
 		}
-		errno = ENOENT;
-		return -1;
+		return read_net_inet_udp(name, name_length, output,
+		                         output_size);
 	}
 
 	const struct darwin_sysctl_entry* entry = find_mib_entry(name[0], name[1]);

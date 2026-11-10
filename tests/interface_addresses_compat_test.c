@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <ifaddrs.h>
+#include <linux/if_link.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <netinet/in.h>
@@ -72,9 +73,14 @@ int main(void)
 		if (i < 4)
 			host_interfaces[i].ifa_next = &host_interfaces[i + 1];
 	}
+	struct rtnl_link_stats link_stats = {0};
+	link_stats.rx_bytes = 12345;
+	link_stats.tx_bytes = 67890;
+	link_stats.rx_packets = 100;
+	link_stats.tx_packets = 200;
 	host_interfaces[0].ifa_addr = (struct sockaddr*)&link;
 	host_interfaces[0].ifa_flags |= IFF_MASTER | IFF_SLAVE;
-	host_interfaces[0].ifa_data = &link;
+	host_interfaces[0].ifa_data = &link_stats;
 	host_interfaces[1].ifa_addr = (struct sockaddr*)&ipv4;
 	host_interfaces[1].ifa_netmask = (struct sockaddr*)&mask4;
 	host_interfaces[1].ifa_broadaddr = (struct sockaddr*)&broadcast;
@@ -91,7 +97,17 @@ int main(void)
 	assert(strcmp(addresses->name, "test0") == 0);
 	assert(addresses->name != host_interfaces[0].ifa_name);
 	assert(addresses->flags == 0x8041);
-	assert(addresses->data == NULL);
+	/* AF_PACKET entries carry a Darwin if_data with translated stats. */
+	assert(addresses->data != NULL);
+	uint32_t ibytes, obytes, ipackets, opackets;
+	memcpy(&ipackets, (unsigned char*)addresses->data + 20, sizeof(ipackets));
+	memcpy(&opackets, (unsigned char*)addresses->data + 28, sizeof(opackets));
+	memcpy(&ibytes, (unsigned char*)addresses->data + 40, sizeof(ibytes));
+	memcpy(&obytes, (unsigned char*)addresses->data + 44, sizeof(obytes));
+	assert(ipackets == 100);
+	assert(opackets == 200);
+	assert(ibytes == 12345);
+	assert(obytes == 67890);
 	const unsigned char* bytes = addresses->address;
 	assert(bytes[0] == 20 && bytes[1] == 18 && bytes[2] == 7 && bytes[3] == 0);
 	assert(bytes[4] == 6 && bytes[5] == 5 && bytes[6] == 6 && bytes[7] == 0);

@@ -451,6 +451,70 @@ static void test_raw_send_and_recv(void)
 	close(sockets[1]);
 }
 
+static void test_connect_v4mapped_v6only(void)
+{
+	int descriptor;
+	int v6only;
+	struct sockaddr_storage linux_addr;
+	struct sockaddr_in6* addr6 = (struct sockaddr_in6*)&linux_addr;
+	socklen_t addr_len = sizeof(*addr6);
+
+	descriptor = socket(AF_INET6, SOCK_STREAM, 0);
+	require_condition(descriptor >= 0, "IPv6 TCP socket failed");
+
+	v6only = 1;
+	require_condition(setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY,
+	                             &v6only, sizeof(v6only)) == 0,
+	                  "IPV6_V6ONLY setsockopt failed");
+
+	memset(&linux_addr, 0, sizeof(linux_addr));
+	addr6->sin6_family = AF_INET6;
+	addr6->sin6_port = htons(1);
+	/* ::ffff:127.0.0.1 */
+	memset(&addr6->sin6_addr.s6_addr[0], 0, 10);
+	addr6->sin6_addr.s6_addr[10] = 0xff;
+	addr6->sin6_addr.s6_addr[11] = 0xff;
+	addr6->sin6_addr.s6_addr[12] = 127;
+	addr6->sin6_addr.s6_addr[13] = 0;
+	addr6->sin6_addr.s6_addr[14] = 0;
+	addr6->sin6_addr.s6_addr[15] = 1;
+
+	require_condition(machgate_darwin_connect_translated(
+	                      descriptor, &linux_addr, addr_len) == -1 &&
+	                  errno == EINVAL,
+	                  "connect to v4-mapped addr with V6ONLY should return EINVAL");
+	close(descriptor);
+
+	/* Without V6ONLY the address must not be rejected by the shim. */
+	descriptor = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	require_condition(descriptor >= 0, "second IPv6 TCP socket failed");
+	v6only = 0;
+	require_condition(setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY,
+	                             &v6only, sizeof(v6only)) == 0,
+	                  "clearing IPV6_V6ONLY failed");
+	/* connect is expected to fail (no listener), but NOT with EINVAL. */
+	require_condition(machgate_darwin_connect_translated(
+	                      descriptor, &linux_addr, addr_len) == -1 &&
+	                  errno != EINVAL,
+	                  "connect to v4-mapped addr without V6ONLY returned EINVAL");
+	close(descriptor);
+
+	/* Pure IPv6 address must not be blocked even with V6ONLY. */
+	descriptor = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	require_condition(descriptor >= 0, "third IPv6 TCP socket failed");
+	v6only = 1;
+	require_condition(setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY,
+	                             &v6only, sizeof(v6only)) == 0,
+	                  "second IPV6_V6ONLY setsockopt failed");
+	memset(&addr6->sin6_addr, 0, 16);
+	addr6->sin6_addr.s6_addr[15] = 1; /* ::1 */
+	require_condition(machgate_darwin_connect_translated(
+	                      descriptor, &linux_addr, addr_len) == -1 &&
+	                  errno != EINVAL,
+	                  "connect to ::1 with V6ONLY should not return EINVAL");
+	close(descriptor);
+}
+
 int main(void)
 {
 	signal(SIGPIPE, SIG_IGN);
@@ -459,6 +523,7 @@ int main(void)
 	test_socket_options();
 	test_cmsg_repacking();
 	test_raw_send_and_recv();
+	test_connect_v4mapped_v6only();
 	puts("darwin-socket-translation-ok");
 	return 0;
 }

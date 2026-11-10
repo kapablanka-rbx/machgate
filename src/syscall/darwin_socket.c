@@ -73,6 +73,29 @@ static int connect_destination_port_is_zero(const struct sockaddr_storage* addre
 	return 0;
 }
 
+static int connect_ipv6_v4mapped_v6only(int fd,
+                                        const struct sockaddr_storage* address)
+{
+	const struct sockaddr_in6* addr6;
+	const uint8_t* bytes;
+	int v6only = 0;
+	socklen_t optlen = sizeof(v6only);
+	static const uint8_t v4mapped_prefix[12] = {
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff
+	};
+
+	if (address->ss_family != AF_INET6)
+		return 0;
+	addr6 = (const struct sockaddr_in6*)address;
+	bytes = (const uint8_t*)&addr6->sin6_addr;
+	if (memcmp(bytes, v4mapped_prefix, 12) != 0)
+		return 0;
+	if (syscall(SYS_getsockopt, fd, IPPROTO_IPV6, IPV6_V6ONLY,
+	            &v6only, &optlen) < 0)
+		return 0;
+	return v6only != 0;
+}
+
 DARWIN_SOCKET_PUBLIC long machgate_darwin_connect(int fd, const void* address,
                                                  size_t address_length)
 {
@@ -87,6 +110,10 @@ DARWIN_SOCKET_PUBLIC long machgate_darwin_connect(int fd, const void* address,
 DARWIN_SOCKET_PUBLIC long machgate_darwin_connect_translated(int fd,
                          const struct sockaddr_storage* address, socklen_t length)
 {
+	if (connect_ipv6_v4mapped_v6only(fd, address)) {
+		errno = EINVAL;
+		return -1;
+	}
 	if (connect_destination_port_is_zero(address)) {
 		int socket_type;
 		int socket_domain;
