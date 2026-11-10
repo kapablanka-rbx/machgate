@@ -89,6 +89,7 @@ GLIBC_2.17 {
         __tolower;
         __toupper;
         __fpclassifyd;
+        __fpclassifyf;
         getaddrinfo;
         getnameinfo;
         __CFConstantStringClassReference;

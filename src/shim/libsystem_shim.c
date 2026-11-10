@@ -142,16 +142,6 @@ struct darwin_rusage {
 	int64_t ru_nivcsw;
 };
 
-double log2(double value)
-{
-	return log(value) / log(2.0);
-}
-
-double exp2(double value)
-{
-	return exp(value * log(2.0));
-}
-
 /* ===== Mach ports / task info (stubs) ===== */
 
 /* mach_task_self_ is a global variable in libSystem, not a function */
@@ -377,6 +367,13 @@ enum {
 };
 
 int __fpclassifyd(double value)
+{
+	return __builtin_fpclassify(DARWIN_FP_NAN, DARWIN_FP_INFINITE,
+	                            DARWIN_FP_NORMAL, DARWIN_FP_SUBNORMAL,
+	                            DARWIN_FP_ZERO, value);
+}
+
+int __fpclassifyf(float value)
 {
 	return __builtin_fpclassify(DARWIN_FP_NAN, DARWIN_FP_INFINITE,
 	                            DARWIN_FP_NORMAL, DARWIN_FP_SUBNORMAL,

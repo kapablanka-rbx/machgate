@@ -1802,13 +1802,28 @@ static void shim_parse_set_cookie_header(const char* header, struct shim_cookie*
 	}
 }
 
+static int shim_comma_starts_new_cookie(const char* after_comma)
+{
+	while (*after_comma == ' ')
+		after_comma++;
+	if (*after_comma == '\0')
+		return 0;
+	/* Date continuations start with a digit (day-of-month) or a short
+	   weekday name followed by a comma (already consumed).  A new cookie
+	   always starts with a token containing '=' before any ';'. */
+	if (*after_comma >= '0' && *after_comma <= '9')
+		return 0;
+	const char* cursor = after_comma;
+	while (*cursor && *cursor != '=' && *cursor != ';' && *cursor != ',')
+		cursor++;
+	return *cursor == '=' && cursor != after_comma;
+}
+
 static void* shim_parse_response_header_cookies(void* header_fields, void* url)
 {
 	const struct shim_objc_dictionary* fields = header_fields;
 	const char* set_cookie_value = NULL;
 	const char* url_text = shim_objc_url_string(url);
-	struct shim_cookie cookie;
-	char host[256];
 
 	if (!fields || !shim_objc_is_object(fields, SHIM_OBJC_INSTANCE_NSMUTABLEDICTIONARY))
 		return NULL;
@@ -1823,24 +1838,58 @@ static void* shim_parse_response_header_cookies(void* header_fields, void* url)
 	if (!set_cookie_value)
 		return NULL;
 
-	shim_parse_set_cookie_header(set_cookie_value, &cookie);
-	if (cookie.domain[0] == '\0') {
-		shim_parse_url_host(url_text ? url_text : "", host, sizeof(host));
-		shim_copy_cstring(cookie.domain, sizeof(cookie.domain), host);
+	/* Split comma-separated cookies, taking care not to split inside date
+	   values such as "Wed, 21 Oct 2015 07:28:00 GMT". */
+	struct shim_cookie cookies[64];
+	uint32_t cookie_count = 0;
+	const char* segment = set_cookie_value;
+
+	while (*segment && cookie_count < 64) {
+		const char* comma = strchr(segment, ',');
+		while (comma && !shim_comma_starts_new_cookie(comma + 1))
+			comma = strchr(comma + 1, ',');
+
+		char cookie_text[4096];
+		size_t length = comma ? (size_t)(comma - segment) : strlen(segment);
+		if (length >= sizeof(cookie_text))
+			length = sizeof(cookie_text) - 1;
+		memcpy(cookie_text, segment, length);
+		cookie_text[length] = '\0';
+
+		char* trimmed = cookie_text;
+		while (*trimmed == ' ')
+			trimmed++;
+
+		if (*trimmed) {
+			shim_parse_set_cookie_header(trimmed, &cookies[cookie_count]);
+			if (cookies[cookie_count].domain[0] == '\0') {
+				char host[256];
+				shim_parse_url_host(url_text ? url_text : "", host, sizeof(host));
+				shim_copy_cstring(cookies[cookie_count].domain,
+				                  sizeof(cookies[cookie_count].domain), host);
+			}
+			cookie_count++;
+		}
+		segment = comma ? comma + 1 : segment + length;
 	}
 
+	if (cookie_count == 0)
+		return NULL;
+
 	struct shim_objc_array* result =
-		shim_objc_make_array(NULL, 1);
+		shim_objc_make_array(NULL, cookie_count);
 	if (!result)
 		return NULL;
 	result->header.magic = SHIM_OBJC_MAGIC;
 	result->header.kind = SHIM_OBJC_ARRAY;
-	result->count = 1;
-	result->capacity = 64;
-	result->elements[0] = shim_objc_make_cookie(&cookie);
-	if (!result->elements[0]) {
-		free(result);
-		return NULL;
+	result->count = cookie_count;
+	for (uint32_t index = 0; index < cookie_count; index++) {
+		result->elements[index] = shim_objc_make_cookie(&cookies[index]);
+		if (!result->elements[index]) {
+			free(result->elements);
+			free(result);
+			return NULL;
+		}
 	}
 	return result;
 }
