@@ -18,9 +18,13 @@ LINKER="$(command -v ld64.lld || command -v ld64.lld-18)"
     -o "$WORK_DIR/guest" "$WORK_DIR/guest.o" "$WORK_DIR/libSystem.dylib"
 for mode in stub strict; do
     for cache in 0 1 1; do
-        MACHGATE_UNRESOLVED_IMPORTS="$mode" MACHGATE_STARTUP_CACHE="$cache" \
+        if ! MACHGATE_UNRESOLVED_IMPORTS="$mode" MACHGATE_STARTUP_CACHE="$cache" \
             MACHGATE_SYSTEM_SHIM_LIB="$BUILD_DIR/libsystem_shim.so" \
-            "$BUILD_DIR/machgate" "$WORK_DIR/guest"
+            "$BUILD_DIR/machgate" "$WORK_DIR/guest"; then
+            rc=$?
+            echo "lifecycle agent failed: mode=$mode cache=$cache exit=$rc" >&2
+            exit $rc
+        fi
     done
 done
 echo 'Darwin unavailable network metrics preserve errors, buffers and interface addresses'
