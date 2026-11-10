@@ -1674,12 +1674,14 @@ int syscall_range_000_099_dispatch(struct machgate_syscall_frame* state)
 		                                     (mode_t)state->x[2]));
 		return 1;
 	case 6: {
+		int fd = (int)state->x[0];
+		machgate_socket_wake_pollers(fd);
 		errno = 0;
-		long result = syscall(SYS_close, (int)state->x[0]);
+		long result = syscall(SYS_close, fd);
 		if (result == 0)
 			{
-				machgate_socket_state_close((int)state->x[0]);
-				machgate_kqueue_fd_did_close((int)state->x[0]);
+				machgate_socket_state_close(fd);
+				machgate_kqueue_fd_did_close(fd);
 			}
 		finish_syscall_result(state, result);
 		return 1;

@@ -1,9 +1,11 @@
 #include "ports/socket_state.h"
 
 #include <errno.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -150,4 +152,52 @@ int machgate_socket_state_accept(int listener, int accepted)
 	if (machgate_socket_send_flags(listener, 0) & MSG_NOSIGNAL)
 		return machgate_socket_nosigpipe_set(accepted, 1);
 	return 0;
+}
+
+/*
+ * Darwin's close() wakes threads blocked in poll/recvfrom on the same fd.
+ * Linux's close() does not. Call this before close() on socket fds to
+ * emulate the Darwin contract.
+ */
+void machgate_socket_wake_pollers(int descriptor)
+{
+	int saved_errno = errno;
+	int sock_type = 0;
+	socklen_t type_len = sizeof(sock_type);
+
+	if (syscall(SYS_getsockopt, descriptor, SOL_SOCKET, SO_TYPE,
+	            &sock_type, &type_len) < 0) {
+		errno = saved_errno;
+		return;
+	}
+	if (syscall(SYS_shutdown, descriptor, SHUT_RDWR) == 0)
+		goto out;
+
+	/* shutdown fails with ENOTCONN on unconnected UDP sockets.
+	   Connect to loopback first so shutdown can succeed and wake
+	   blocked pollers with an error rather than a real packet. */
+	if (sock_type == SOCK_DGRAM) {
+		struct sockaddr_storage bound;
+		socklen_t bound_len = sizeof(bound);
+
+		if (syscall(SYS_getsockname, descriptor, &bound, &bound_len) < 0)
+			goto out;
+
+		if (bound.ss_family == AF_INET) {
+			struct sockaddr_in loopback = {0};
+			loopback.sin_family = AF_INET;
+			loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			syscall(SYS_connect, descriptor, &loopback,
+			        sizeof(loopback));
+		} else if (bound.ss_family == AF_INET6) {
+			struct sockaddr_in6 loopback = {0};
+			loopback.sin6_family = AF_INET6;
+			loopback.sin6_addr = in6addr_loopback;
+			syscall(SYS_connect, descriptor, &loopback,
+			        sizeof(loopback));
+		}
+		syscall(SYS_shutdown, descriptor, SHUT_RDWR);
+	}
+out:
+	errno = saved_errno;
 }

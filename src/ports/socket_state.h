@@ -13,5 +13,6 @@ int machgate_socket_send_flags(int descriptor, int flags);
 int machgate_socket_state_accept(int listener, int accepted);
 void machgate_socket_state_close(int descriptor);
 void machgate_socket_state_duplicate(int source, int destination);
+void machgate_socket_wake_pollers(int descriptor);
 
 #endif

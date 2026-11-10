@@ -2,6 +2,7 @@
 
 #include "fd_lifecycle.h"
 #include "file_abi.h"
+#include "../ports/socket_state.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -306,6 +307,7 @@ int machgate_dup3(int source, int destination, int darwin_flags)
 int machgate_close(int descriptor) __asm__("close");
 int machgate_close(int descriptor)
 {
+	machgate_socket_wake_pollers(descriptor);
 	int result = syscall(SYS_close, descriptor);
 
 	if (result == 0)
