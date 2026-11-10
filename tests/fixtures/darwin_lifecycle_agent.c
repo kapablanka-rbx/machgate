@@ -33,16 +33,15 @@ static int read_udp_sysctl(int selector, void* output, size_t* size)
 
 static int check_udp_pcblist(void)
 {
-	size_t size = 0;
-	if (read_udp_sysctl(5, 0, &size) != -1 || *__error() != 2 || size != 0)
+	/* With a UDP socket open, pcblist should return a header with count >= 1. */
+	uint32_t header[4] = {0};
+	size_t size = sizeof(header);
+	if (read_udp_sysctl(5, header, &size) != 0)
 		return 10;
-	uint32_t header[4] = {0xa5a5a5a5, 0xa5a5a5a5, 0xa5a5a5a5, 0xa5a5a5a5};
-	size = sizeof(header);
-	if (read_udp_sysctl(5, header, &size) != -1 || *__error() != 2 || size != sizeof(header))
+	/* header[1] is xig_count — should be at least 1 since we opened a socket. */
+	if (header[1] < 1)
 		return 11;
-	for (size_t index = 0; index < 4; index++)
-		if (header[index] != 0xa5a5a5a5)
-			return 12;
+	/* newlen (input data) must still be rejected. */
 	int name[] = {4, 2, 17, 5};
 	if (sysctl(name, 4, header, &size, header, sizeof(header)) != -1 || *__error() != 1)
 		return 15;
@@ -51,18 +50,12 @@ static int check_udp_pcblist(void)
 
 static int check_udp_stats(void)
 {
-	uint32_t stats[22];
-	size_t size = 0;
-	if (read_udp_sysctl(2, 0, &size) != -1 || *__error() != 2 || size != 0)
+	/* Stats should now return a zeroed udpstat structure. */
+	uint32_t stats[22] = {0};
+	size_t size = sizeof(stats);
+	if (read_udp_sysctl(2, stats, &size) != 0)
 		return 20;
-	for (size_t index = 0; index < 22; index++)
-		stats[index] = 0xa5a5a5a5;
-	size = sizeof(stats);
-	if (read_udp_sysctl(2, stats, &size) != -1 || *__error() != 2 || size != sizeof(stats))
-		return 21;
-	for (size_t index = 0; index < 22; index++)
-		if (stats[index] != 0xa5a5a5a5)
-			return 22;
+	/* udps_fullsock is at offset 10 — may be 0 or nonzero depending on host. */
 	return 0;
 }
 
@@ -75,7 +68,8 @@ static int check_interface_data(void)
 	for (struct darwin_ifaddrs* item = addresses; item; item = item->next) {
 		if (!item->address || item->address->family != 18 || (item->flags & 8))
 			continue;
-		if (item->data)
+		/* AF_LINK entries now carry a populated if_data pointer. */
+		if (!item->data)
 			return 31;
 		found = 1;
 	}
