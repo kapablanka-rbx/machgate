@@ -88,6 +88,8 @@ extern void* _Block_copy(const void*);
 extern id NSSearchPathForDirectoriesInDomains(unsigned, unsigned, unsigned);
 extern unsigned NSStartSearchPathEnumeration(unsigned, unsigned);
 extern unsigned NSGetNextSearchPathEnumeration(unsigned, char*);
+extern id NSTemporaryDirectory(void);
+extern id NSHomeDirectory(void);
 static int equal(const char* left, const char* right) {
     if (!left || !right) return 0;
     while (*left && *left == *right) { ++left; ++right; }
@@ -161,5 +163,22 @@ int main(void) {
     objc_destroyWeak(&weakCaptured);
     objc_destroyWeak(&copied);
     objc_storeStrong(&strong, nil);
+    id tmpDir = NSTemporaryDirectory();
+    if (!tmpDir || ![tmpDir UTF8String] || ![tmpDir UTF8String][0]) return 50;
+    id homeDir = NSHomeDirectory();
+    if (!homeDir || ![homeDir UTF8String] || ![homeDir UTF8String][0]) return 51;
+    Class nsfm = objc_getClass("NSFileManager");
+    if (!nsfm) return 52;
+    id fm = [nsfm defaultManager];
+    if (!fm) return 52;
+    id testDirName = [NSString stringWithUTF8String:"machgate_test_dir"];
+    id testDir = [tmpDir stringByAppendingPathComponent:testDirName];
+    if (![fm createDirectoryAtPath:testDir withIntermediateDirectories:(id)1 attributes:nil error:nil]) return 53;
+    id fileName = [NSString stringWithUTF8String:"hello.txt"];
+    if (![fm createFileAtPath:[testDir stringByAppendingPathComponent:fileName] contents:nil attributes:nil]) return 54;
+    id contents = [fm contentsOfDirectoryAtPath:testDir error:nil];
+    if (!contents || [contents count] != 1) return 55;
+    if (![fm removeItemAtPath:testDir error:nil]) return 56;
+    if ([fm fileExistsAtPath:testDir]) return 57;
     return 0;
 }

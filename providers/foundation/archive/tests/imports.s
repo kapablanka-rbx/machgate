@@ -53,6 +53,12 @@ _NSStartSearchPathEnumeration:
 .globl _NSGetNextSearchPathEnumeration
 _NSGetNextSearchPathEnumeration:
  ret
+.globl _NSTemporaryDirectory
+_NSTemporaryDirectory:
+ ret
+.globl _NSHomeDirectory
+_NSHomeDirectory:
+ ret
 
 .data
 .globl _OBJC_CLASS_$_NSObject

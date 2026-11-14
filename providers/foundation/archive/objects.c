@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <ftw.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -295,6 +297,13 @@ static struct shim_objc_header shim_cookie_storage_singleton = {
 static struct shim_objc_header shim_filemanager_singleton = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSFILEMANAGER,
 };
+
+static int nftw_remove_entry(const char* path, const struct stat* st,
+                             int type, struct FTW* ftw)
+{
+	(void)st; (void)type; (void)ftw;
+	return remove(path);
+}
 
 static struct shim_objc_header shim_characterset_singleton = {
 	SHIM_OBJC_MAGIC, SHIM_OBJC_INSTANCE_NSCHARACTERSET,
@@ -2462,6 +2471,33 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 				return NULL;
 			return (void*)(uintptr_t)(access(path_text, F_OK) == 0);
 		}
+	} else if (strcmp(selector, "contentsOfDirectoryAtPath:error:") == 0) {
+		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSFILEMANAGER)) {
+			const char* path_text = shim_objc_string_utf8((void*)a2);
+			if (!path_text)
+				return NULL;
+			DIR* dir = opendir(path_text);
+			if (!dir) {
+				if (a3)
+					*(void**)a3 = shim_objc_make_error(
+						"NSCocoaErrorDomain",
+						errno == ENOENT ? 260 : 256,
+						strerror(errno), NULL);
+				return NULL;
+			}
+			struct shim_objc_string* entries[4096];
+			size_t count = 0;
+			struct dirent* ent;
+			while ((ent = readdir(dir)) != NULL && count < 4096) {
+				if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+					continue;
+				entries[count++] = shim_objc_make_string(ent->d_name);
+			}
+			closedir(dir);
+			if (a3)
+				*(void**)a3 = NULL;
+			return shim_objc_make_array(entries, count);
+		}
 	} else if (strcmp(selector, "removeItemAtPath:error:") == 0 ||
 	           strcmp(selector, "removeItemAtURL:error:") == 0) {
 		if (shim_objc_is_object(receiver, SHIM_OBJC_INSTANCE_NSFILEMANAGER)) {
@@ -2472,6 +2508,13 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 				return NULL;
 			if (a3)
 				*(void**)a3 = NULL;
+			struct stat st;
+			if (stat(path_text, &st) != 0)
+				return NULL;
+			if (S_ISDIR(st.st_mode))
+				return (void*)(uintptr_t)(
+					nftw(path_text, nftw_remove_entry, 64,
+					     FTW_DEPTH | FTW_PHYS) == 0);
 			return (void*)(uintptr_t)(unlink(path_text) == 0);
 		}
 	} else if (strcmp(selector, "fileHandleForWritingAtPath:") == 0) {
@@ -3848,4 +3891,25 @@ void* NSSearchPathForDirectoriesInDomains(unsigned directory, unsigned domains, 
     void* result = shim_objc_make_single_element_array(path);
     free(path);
     return result;
+}
+
+void* NSTemporaryDirectory(void)
+{
+    const char* tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    size_t len = strlen(tmpdir);
+    if (len > 0 && tmpdir[len - 1] == '/')
+        return shim_objc_make_string(tmpdir);
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s/", tmpdir);
+    return shim_objc_make_string(buf);
+}
+
+void* NSHomeDirectory(void)
+{
+    const char* home = getenv("HOME");
+    if (!home || !home[0])
+        home = "/tmp";
+    return shim_objc_make_string(home);
 }
