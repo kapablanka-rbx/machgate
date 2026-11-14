@@ -3,6 +3,7 @@
 .global objc_msgSend
 .type objc_msgSend, %function
 objc_msgSend:
+    cbz x0, .Lnil
     mov x16, #0
     b .Lentry
 .size objc_msgSend, .-objc_msgSend
@@ -54,4 +55,8 @@ objc_msgSendSuper2:
     add sp, sp, #256
     br x16
 .size objc_msgSendSuper2, .-objc_msgSendSuper2
+.Lnil:
+    mov x0, #0
+    fmov d0, xzr
+    ret
 .section .note.GNU-stack,"",%progbits
