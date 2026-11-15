@@ -449,6 +449,7 @@ static const char* normalized_native_name(const char* guest_name,
 		"$DARWIN_EXTSN",
 		"$INODE64",
 		"$NOCANCEL",
+		"$V2",
 	};
 	const char* result = guest_name[0] == '_' ? guest_name + 1 : guest_name;
 	size_t result_length = strlen(result);
