@@ -2158,6 +2158,14 @@ static void* archive_message_impl(void* receiver, void* sel, uintptr_t a2, uintp
 			pthread_mutex_unlock(&center->mutex);
 			return observer;
 		}
+	} else if (strcmp(selector, "addObserver:selector:name:object:") == 0) {
+		struct shim_objc_notification_center* center = receiver;
+		if (shim_objc_is_object(center, SHIM_OBJC_NOTIFICATION_CENTER))
+			return NULL;
+	} else if (strcmp(selector, "removeObserver:name:object:") == 0) {
+		struct shim_objc_notification_center* center = receiver;
+		if (shim_objc_is_object(center, SHIM_OBJC_NOTIFICATION_CENTER))
+			return NULL;
 	} else if (strcmp(selector, "removeObserver:") == 0) {
 		struct shim_objc_notification_center* center = receiver;
 		if (shim_objc_is_object(center, SHIM_OBJC_NOTIFICATION_CENTER)) {
