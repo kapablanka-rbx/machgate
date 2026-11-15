@@ -231,8 +231,12 @@ static int dispatch_to_thread(void* block, void* context,
 
 	if (!item)
 		return 0;
-	*item = (struct async_dispatch){
-		block ? _Block_copy(block) : NULL, context, function};
+	void* copied = block ? _Block_copy(block) : NULL;
+	if (block && !copied) {
+		free(item);
+		return 0;
+	}
+	*item = (struct async_dispatch){copied, context, function};
 	pthread_t thread;
 	if (create_thread(&thread, NULL, invoke_async, item) == 0) {
 		pthread_detach(thread);
