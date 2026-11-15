@@ -102,6 +102,9 @@ void* objc_msgSend(void* receiver, void* selector, ...)
 		return (void*)0;
 	if (strcmp(name, "countByEnumeratingWithState:objects:count:") == 0)
 		return (void*)0;
+	if (strcmp(name, "devicesWithMediaType:") == 0 ||
+	    strcmp(name, "defaultDeviceWithMediaType:") == 0)
+		return NULL;
 
 	if (detect_skip_calls_enabled()) {
 		objc_skip_call_detected = 1;
