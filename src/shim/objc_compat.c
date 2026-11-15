@@ -107,6 +107,14 @@ void* objc_msgSend(void* receiver, void* selector, ...)
 		return NULL;
 	if (strcmp(name, "isMainThread") == 0)
 		return (void*)0;
+	if (strcmp(name, "defaultCenter") == 0)
+		return receiver;
+	if (strcmp(name, "addObserver:selector:name:object:") == 0 ||
+	    strcmp(name, "removeObserver:") == 0 ||
+	    strcmp(name, "removeObserver:name:object:") == 0 ||
+	    strcmp(name, "postNotificationName:object:") == 0 ||
+	    strcmp(name, "postNotificationName:object:userInfo:") == 0)
+		return NULL;
 
 	if (detect_skip_calls_enabled()) {
 		objc_skip_call_detected = 1;
