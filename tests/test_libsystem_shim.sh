@@ -914,6 +914,10 @@ lib.dispatch_sync.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 lib.dispatch_async.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 lib.dispatch_sync(dispatch_queue, ctypes.byref(dispatch_block))
 lib.dispatch_async(dispatch_queue, ctypes.byref(dispatch_block))
+for _ in range(200):
+    if block_invocations.value >= 2:
+        break
+    time.sleep(0.005)
 assert block_invocations.value == 2
 
 DISPATCH_FUNCTION = ctypes.CFUNCTYPE(None, ctypes.c_void_p)

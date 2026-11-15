@@ -27,6 +27,10 @@ assert function('dispatch_get_context', pointer, pointer)(queue) == 37
 function('dispatch_set_finalizer_f', None, pointer, callback_type)(queue, callback)
 for name in ('dispatch_async_f', 'dispatch_sync_f'):
     function(name, None, pointer, pointer, callback_type)(queue, 11, callback)
+for _ in range(200):
+    if len(calls) >= 2:
+        break
+    time.sleep(0.005)
 assert calls == [11, 11]
 
 class Block(c.Structure):
@@ -44,6 +48,10 @@ notify(group, queue, c.byref(block))
 leave(group)
 assert len(calls) == 2
 leave(group)
+for _ in range(200):
+    if len(calls) >= 4:
+        break
+    time.sleep(0.005)
 assert len(calls) == 4
 release = function('dispatch_release', None, pointer)
 release(group)
