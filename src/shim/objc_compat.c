@@ -78,12 +78,14 @@ void* objc_msgSend(void* receiver, void* selector, ...)
 		return (void*)0;
 	if (strcmp(name, "length") == 0)
 		return (void*)0;
+	if (strcmp(name, "countByEnumeratingWithState:objects:count:") == 0)
+		return (void*)0;
 
 	if (objc_trace_enabled())
 		fprintf(stderr, "objc_compat: unhandled selector '%s' on %p\n",
 			name, receiver);
 
-	return receiver;
+	return NULL;
 }
 
 struct class_entry { const char* name; void* symbol; };
