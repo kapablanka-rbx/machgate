@@ -190,6 +190,9 @@ void* dispatch_queue_create(const char* label, void* attributes)
 	return result;
 }
 
+extern void* _Block_copy(const void*);
+extern void _Block_release(const void*);
+
 static void invoke_block(void* block_pointer)
 {
 	struct machgate_block_literal* block = block_pointer;
@@ -198,10 +201,54 @@ static void invoke_block(void* block_pointer)
 		block->invoke(block);
 }
 
+struct async_dispatch {
+	void* block;
+	void* context;
+	void (*function)(void*);
+};
+
+static void* invoke_async(void* argument)
+{
+	struct async_dispatch* item = argument;
+
+	if (item->block) {
+		invoke_block(item->block);
+		_Block_release(item->block);
+	} else if (item->function) {
+		item->function(item->context);
+	}
+	free(item);
+	return NULL;
+}
+
+static int dispatch_to_thread(void* block, void* context,
+                              void (*function)(void*))
+{
+	int (*create_thread)(pthread_t*, const pthread_attr_t*,
+	                     void*(*)(void*), void*) =
+		dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.17");
+	struct async_dispatch* item = create_thread ? malloc(sizeof(*item)) : NULL;
+
+	if (!item)
+		return 0;
+	*item = (struct async_dispatch){
+		block ? _Block_copy(block) : NULL, context, function};
+	pthread_t thread;
+	if (create_thread(&thread, NULL, invoke_async, item) == 0) {
+		pthread_detach(thread);
+		return 1;
+	}
+	if (item->block)
+		_Block_release(item->block);
+	free(item);
+	return 0;
+}
+
 void dispatch_async(void* queue, void* block)
 {
 	(void)queue;
-	invoke_block(block);
+	if (!dispatch_to_thread(block, NULL, NULL))
+		invoke_block(block);
 }
 
 void dispatch_sync(void* queue, void* block)
@@ -352,9 +399,6 @@ void dispatch_release(void* object)
 	free(object);
 }
 
-extern void* _Block_copy(const void*);
-extern void _Block_release(const void*);
-
 struct dispatch_metadata {
 	void* object;
 	void* context;
@@ -473,13 +517,15 @@ const char* dispatch_queue_get_label(void* queue)
 void dispatch_async_f(void* queue, void* context, void (*function)(void*))
 {
 	(void)queue;
-	if (function)
+	if (function && !dispatch_to_thread(NULL, context, function))
 		function(context);
 }
 
 void dispatch_sync_f(void* queue, void* context, void (*function)(void*))
 {
-	dispatch_async_f(queue, context, function);
+	(void)queue;
+	if (function)
+		function(context);
 }
 
 void* dispatch_group_create(void)
