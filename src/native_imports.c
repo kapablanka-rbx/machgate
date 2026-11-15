@@ -881,7 +881,7 @@ static enum unresolved_import_action unresolved_import_action(
 			return direct_function_target || stubbed_function ||
 			       bind_pointer_is_called(context, state)
 				       ? UNRESOLVED_IMPORT_RETURN_ZERO
-				       : UNRESOLVED_IMPORT_ZERO;
+				       : UNRESOLVED_IMPORT_DATA;
 		if (decision == MACHGATE_PROVIDER_PARTIAL)
 			return direct_function_target || stubbed_function
 				       ? UNRESOLVED_IMPORT_TRAP

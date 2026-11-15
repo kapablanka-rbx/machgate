@@ -86,9 +86,42 @@ void* objc_msgSend(void* receiver, void* selector, ...)
 	return receiver;
 }
 
+struct class_entry { const char* name; void* symbol; };
+static const struct class_entry known_classes[] = {
+	{"MachGateGenericObject", &OBJC_CLASS_$_MachGateGenericObject},
+	{"NSObject", &OBJC_CLASS_$_NSObject},
+	{"NSProcessInfo", &OBJC_CLASS_$_NSProcessInfo},
+	{"NSString", &OBJC_CLASS_$_NSString},
+	{"NSBundle", &OBJC_CLASS_$_NSBundle},
+	{"NSAutoreleasePool", &OBJC_CLASS_$_NSAutoreleasePool},
+	{"NSNotificationCenter", &OBJC_CLASS_$_NSNotificationCenter},
+	{"NSAssertionHandler", &OBJC_CLASS_$_NSAssertionHandler},
+	{"NSDistributedNotificationCenter", &OBJC_CLASS_$_NSDistributedNotificationCenter},
+	{"NSHTTPCookie", &OBJC_CLASS_$_NSHTTPCookie},
+	{"NSHTTPCookieStorage", &OBJC_CLASS_$_NSHTTPCookieStorage},
+	{"NSNumber", &OBJC_CLASS_$_NSNumber},
+	{"NSOperationQueue", &OBJC_CLASS_$_NSOperationQueue},
+	{"NSTask", &OBJC_CLASS_$_NSTask},
+	{"NSThread", &OBJC_CLASS_$_NSThread},
+	{"NSArray", &OBJC_CLASS_$_NSArray},
+	{"NSDictionary", &OBJC_CLASS_$_NSDictionary},
+	{"NSMutableArray", &OBJC_CLASS_$_NSMutableArray},
+	{"NSMutableDictionary", &OBJC_CLASS_$_NSMutableDictionary},
+	{"NSMutableOrderedSet", &OBJC_CLASS_$_NSMutableOrderedSet},
+	{"NSRunLoop", &OBJC_CLASS_$_NSRunLoop},
+	{"NSSet", &OBJC_CLASS_$_NSSet},
+	{"NSURL", &OBJC_CLASS_$_NSURL},
+};
+
 void* objc_getClass(const char* name)
 {
-	return name ? &generic_class : NULL;
+	if (!name)
+		return NULL;
+	for (size_t i = 0; i < sizeof(known_classes) / sizeof(known_classes[0]); i++) {
+		if (strcmp(name, known_classes[i].name) == 0)
+			return known_classes[i].symbol;
+	}
+	return NULL;
 }
 
 void* objc_lookUpClass(const char* name)

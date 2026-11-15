@@ -313,6 +313,21 @@ echo "  Built dynamic_flat_provider_precedence"
 rm -f darwin_imported_socket.o
 echo "  Built darwin_imported_socket"
 
+# --- udp_self_send_test: bind INADDR_ANY, getsockname, sendto loopback ---
+"$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
+    -o udp_self_send_imports.o udp_self_send_imports.s
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -dylib -install_name /usr/lib/libSystem.B.dylib \
+    -o udp_self_send_imports.dylib udp_self_send_imports.o
+"$CLANGXX" -target arm64-apple-macos11 -x c -O0 -fno-builtin \
+    -fno-stack-protector -nostdlib -c udp_self_send_test.c \
+    -o udp_self_send_test.o
+"$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \
+    -o udp_self_send_test -e _main udp_self_send_test.o \
+    udp_self_send_imports.dylib
+rm -f udp_self_send_test.o udp_self_send_imports.o udp_self_send_imports.dylib
+echo "  Built udp_self_send_test"
+
 "$LLVM_MC" -triple arm64-apple-macos11 -filetype=obj \
     -o interface_addresses_stub.o interface_addresses_stub.s
 "$LD64_LLD" -arch arm64 -platform_version macos 11.0.0 11.0.0 \

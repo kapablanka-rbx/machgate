@@ -4,12 +4,19 @@
 _main:
     adrp x9, _machgate_optional_data@GOTPAGE
     ldr x9, [x9, _machgate_optional_data@GOTPAGEOFF]
-    cbnz x9, failure
+    cbz x9, failure_null
+    ldr x10, [x9]
+    cbnz x10, failure_nonzero
     mov x0, #0
     mov x16, #1
     svc #0x80
 
-failure:
+failure_null:
+    mov x0, #91
+    mov x16, #1
+    svc #0x80
+
+failure_nonzero:
     mov x0, #92
     mov x16, #1
     svc #0x80
