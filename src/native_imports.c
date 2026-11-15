@@ -397,6 +397,37 @@ static uintptr_t unresolved_return_zero(void)
 	return 0;
 }
 
+static volatile int skipped_framework_called;
+
+static int detect_skip_calls_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* value = getenv("MACHGATE_DETECT_SKIP_CALLS");
+		cached = value && *value && strcmp(value, "0") != 0;
+	}
+	return cached;
+}
+
+static uintptr_t unresolved_skip_return_zero(void)
+{
+	if (!skipped_framework_called) {
+		skipped_framework_called = 1;
+		fprintf(stderr, "MACHGATE_REQUIRES_NATIVE_HARDWARE\n");
+	}
+	return 0;
+}
+
+void machgate_reset_skip_detection(void)
+{
+	skipped_framework_called = 0;
+}
+
+int machgate_skipped_framework_was_called(void)
+{
+	return skipped_framework_called;
+}
+
 static void compiler_clear_cache(void* start, void* end)
 {
 	__builtin___clear_cache(start, end);
@@ -608,6 +639,7 @@ enum unresolved_import_action {
 	UNRESOLVED_IMPORT_ZERO,
 	UNRESOLVED_IMPORT_TRAP,
 	UNRESOLVED_IMPORT_RETURN_ZERO,
+	UNRESOLVED_IMPORT_SKIP_RETURN_ZERO,
 	UNRESOLVED_IMPORT_DATA,
 };
 
@@ -877,11 +909,14 @@ static enum unresolved_import_action unresolved_import_action(
 	    (size_t)state->provider_ordinal <= context->provider_count) {
 		enum machgate_provider_decision_kind decision =
 			context->providers[state->provider_ordinal - 1].decision;
-		if (decision == MACHGATE_PROVIDER_SKIP)
-			return direct_function_target || stubbed_function ||
-			       bind_pointer_is_called(context, state)
-				       ? UNRESOLVED_IMPORT_RETURN_ZERO
-				       : UNRESOLVED_IMPORT_DATA;
+		if (decision == MACHGATE_PROVIDER_SKIP) {
+			if (direct_function_target || stubbed_function ||
+			    bind_pointer_is_called(context, state))
+				return detect_skip_calls_enabled()
+					       ? UNRESOLVED_IMPORT_SKIP_RETURN_ZERO
+					       : UNRESOLVED_IMPORT_RETURN_ZERO;
+			return UNRESOLVED_IMPORT_DATA;
+		}
 		if (decision == MACHGATE_PROVIDER_PARTIAL)
 			return direct_function_target || stubbed_function
 				       ? UNRESOLVED_IMPORT_TRAP
@@ -953,6 +988,8 @@ static int write_pointer(struct import_context* context,
 			symbol = unresolved_stub_binder;
 		else if (action == UNRESOLVED_IMPORT_RETURN_ZERO)
 			symbol = unresolved_return_zero;
+		else if (action == UNRESOLVED_IMPORT_SKIP_RETURN_ZERO)
+			symbol = unresolved_skip_return_zero;
 		else if (action == UNRESOLVED_IMPORT_ZERO)
 			bind_zero = 1;
 		else if (action == UNRESOLVED_IMPORT_DATA) {
@@ -1265,6 +1302,8 @@ static int resolve_chained_bind(struct import_context* context,
 			symbol = unresolved_stub_binder;
 		else if (action == UNRESOLVED_IMPORT_RETURN_ZERO)
 			symbol = unresolved_return_zero;
+		else if (action == UNRESOLVED_IMPORT_SKIP_RETURN_ZERO)
+			symbol = unresolved_skip_return_zero;
 		else if (action == UNRESOLVED_IMPORT_ZERO)
 			bind_zero = 1;
 		else if (action == UNRESOLVED_IMPORT_DATA) {

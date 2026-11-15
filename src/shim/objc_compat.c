@@ -52,6 +52,28 @@ static int objc_trace_enabled(void)
 	return cached;
 }
 
+static volatile int objc_skip_call_detected;
+
+static int detect_skip_calls_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* value = getenv("MACHGATE_DETECT_SKIP_CALLS");
+		cached = value && *value && strcmp(value, "0") != 0;
+	}
+	return cached;
+}
+
+void machgate_shim_reset_skip_detection(void)
+{
+	objc_skip_call_detected = 0;
+}
+
+int machgate_shim_skipped_framework_was_called(void)
+{
+	return objc_skip_call_detected;
+}
+
 void* objc_msgSend(void* receiver, void* selector, ...)
 {
 	if (!receiver || !selector)
@@ -81,9 +103,23 @@ void* objc_msgSend(void* receiver, void* selector, ...)
 	if (strcmp(name, "countByEnumeratingWithState:objects:count:") == 0)
 		return (void*)0;
 
-	if (objc_trace_enabled())
+	if (detect_skip_calls_enabled()) {
+		objc_skip_call_detected = 1;
+		static const char* seen[64];
+		static int seen_count;
+		int already = 0;
+		for (int i = 0; i < seen_count; i++) {
+			if (seen[i] == name) { already = 1; break; }
+		}
+		if (!already) {
+			if (seen_count < 64)
+				seen[seen_count++] = name;
+			fprintf(stderr, "MACHGATE_SKIP_CALL: %s\n", name);
+		}
+	} else if (objc_trace_enabled()) {
 		fprintf(stderr, "objc_compat: unhandled selector '%s' on %p\n",
 			name, receiver);
+	}
 
 	return NULL;
 }
