@@ -905,7 +905,9 @@ static enum unresolved_import_action unresolved_import_action(
 	if (context->allow_unresolved_stubs &&
 	    (direct_function_target || stubbed_function ||
 	     bind_pointer_is_called(context, state)))
-		return UNRESOLVED_IMPORT_RETURN_ZERO;
+		return detect_skip_calls_enabled()
+			       ? UNRESOLVED_IMPORT_SKIP_RETURN_ZERO
+			       : UNRESOLVED_IMPORT_RETURN_ZERO;
 	if (state->provider_ordinal > 0 &&
 	    (size_t)state->provider_ordinal <= context->provider_count) {
 		enum machgate_provider_decision_kind decision =
@@ -916,26 +918,41 @@ static enum unresolved_import_action unresolved_import_action(
 				return detect_skip_calls_enabled()
 					       ? UNRESOLVED_IMPORT_SKIP_RETURN_ZERO
 					       : UNRESOLVED_IMPORT_RETURN_ZERO;
+			if (detect_skip_calls_enabled() &&
+			    !skipped_framework_called) {
+				skipped_framework_called = 1;
+				fprintf(stderr,
+					"MACHGATE_REQUIRES_NATIVE_HARDWARE\n");
+			}
 			return UNRESOLVED_IMPORT_DATA;
 		}
 		if (decision == MACHGATE_PROVIDER_PARTIAL)
 			return direct_function_target || stubbed_function
 				       ? UNRESOLVED_IMPORT_TRAP
 				       : UNRESOLVED_IMPORT_ZERO;
-		if (decision == MACHGATE_PROVIDER_STUB)
-			return context->allow_unresolved_stubs
-				       ? UNRESOLVED_IMPORT_RETURN_ZERO
-				       : UNRESOLVED_IMPORT_TRAP;
+		if (decision == MACHGATE_PROVIDER_STUB) {
+			if (!context->allow_unresolved_stubs)
+				return UNRESOLVED_IMPORT_TRAP;
+			return detect_skip_calls_enabled()
+				       ? UNRESOLVED_IMPORT_SKIP_RETURN_ZERO
+				       : UNRESOLVED_IMPORT_RETURN_ZERO;
+		}
 
-		if (decision == MACHGATE_PROVIDER_MAP && stubbed_function)
-			return context->allow_unresolved_stubs
-				       ? UNRESOLVED_IMPORT_RETURN_ZERO
-				       : UNRESOLVED_IMPORT_TRAP;
+		if (decision == MACHGATE_PROVIDER_MAP && stubbed_function) {
+			if (!context->allow_unresolved_stubs)
+				return UNRESOLVED_IMPORT_TRAP;
+			return detect_skip_calls_enabled()
+				       ? UNRESOLVED_IMPORT_SKIP_RETURN_ZERO
+				       : UNRESOLVED_IMPORT_RETURN_ZERO;
+		}
 	}
-	if (direct_function_target || stubbed_function)
-		return context->allow_unresolved_stubs
-		       ? UNRESOLVED_IMPORT_RETURN_ZERO
-		       : UNRESOLVED_IMPORT_TRAP;
+	if (direct_function_target || stubbed_function) {
+		if (!context->allow_unresolved_stubs)
+			return UNRESOLVED_IMPORT_TRAP;
+		return detect_skip_calls_enabled()
+			       ? UNRESOLVED_IMPORT_SKIP_RETURN_ZERO
+			       : UNRESOLVED_IMPORT_RETURN_ZERO;
+	}
 	if (state->provider_ordinal > 0 &&
 	    (size_t)state->provider_ordinal <= context->provider_count &&
 	    context->providers[state->provider_ordinal - 1].decision ==
