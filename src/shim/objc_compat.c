@@ -127,7 +127,7 @@ void* objc_msgSend(void* receiver, void* selector, ...)
 		if (!already) {
 			if (seen_count < 64)
 				seen[seen_count++] = name;
-			fprintf(stderr, "MACHGATE_SKIP_CALL: %s\n", name);
+			fprintf(stderr, "MACHGATE_SKIP: %s\n", name);
 		}
 	} else if (objc_trace_enabled()) {
 		fprintf(stderr, "objc_compat: unhandled selector '%s' on %p\n",

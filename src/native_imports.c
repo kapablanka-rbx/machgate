@@ -413,7 +413,7 @@ static uintptr_t unresolved_skip_return_zero(void)
 {
 	if (!skipped_framework_called) {
 		skipped_framework_called = 1;
-		fprintf(stderr, "MACHGATE_REQUIRES_NATIVE_HARDWARE\n");
+		fprintf(stderr, "MACHGATE_SKIP\n");
 	}
 	return 0;
 }
@@ -921,8 +921,7 @@ static enum unresolved_import_action unresolved_import_action(
 			if (detect_skip_calls_enabled() &&
 			    !skipped_framework_called) {
 				skipped_framework_called = 1;
-				fprintf(stderr,
-					"MACHGATE_REQUIRES_NATIVE_HARDWARE\n");
+				fprintf(stderr, "MACHGATE_SKIP\n");
 			}
 			return UNRESOLVED_IMPORT_DATA;
 		}
